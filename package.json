@@ -1,0 +1,44 @@
+{
+  "name": "anycode",
+  "version": "0.1.0",
+  "description": "AnyCode — a Claude Code–style agentic coding CLI (framework skeleton).",
+  "type": "module",
+  "bin": {
+    "anycode": "dist/cli.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "tsx src/cli.tsx",
+    "build": "tsup",
+    "start": "node dist/cli.js",
+    "typecheck": "tsc --noEmit",
+    "clean": "rm -rf dist"
+  },
+  "keywords": [
+    "cli",
+    "ai",
+    "agent",
+    "ink",
+    "coding-assistant"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "ink": "~5.1.0",
+    "marked": "^12.0.2",
+    "marked-terminal": "^7.1.0",
+    "react": "~18.3.1",
+    "string-width": "^7.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/react": "^18.3.12",
+    "tsup": "^8.3.5",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}
