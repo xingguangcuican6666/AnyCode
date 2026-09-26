@@ -3,6 +3,7 @@ import { Box, Text } from 'ink'
 import { symbols, useTheme } from '../theme'
 import { starFrames } from '../lib/spinner'
 import { formatTokens } from '../lib/tokens'
+import { useT } from '../lib/i18n'
 
 interface Props {
   word: string
@@ -17,10 +18,11 @@ interface Props {
 
 export function StatusLine({ word, elapsed, tokens, dir = 'up', suffix }: Props): React.ReactElement {
   const colors = useTheme()
+  const tr = useT()
   const [frame, setFrame] = useState(0)
   useEffect(() => {
-    const t = setInterval(() => setFrame((f) => f + 1), 120)
-    return () => clearInterval(t)
+    const id = setInterval(() => setFrame((f) => f + 1), 120)
+    return () => clearInterval(id)
   }, [])
   const star = starFrames[frame % starFrames.length]
   const arrow = dir === 'down' ? symbols.arrowDown : symbols.arrowUp
@@ -29,7 +31,7 @@ export function StatusLine({ word, elapsed, tokens, dir = 'up', suffix }: Props)
       <Text color={colors.accent}>{star} </Text>
       <Text color={colors.accent}>{word}… </Text>
       <Text color={colors.dim}>
-        ({elapsed}s · {arrow} {formatTokens(tokens)} tokens{suffix ? ` · ${suffix}` : ''} · esc to interrupt)
+        {tr('statusline.meter', { elapsed, arrow, tokens: formatTokens(tokens), suffix: suffix ? ` · ${suffix}` : '' })}
       </Text>
     </Box>
   )

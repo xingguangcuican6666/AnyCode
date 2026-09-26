@@ -5,7 +5,7 @@ import fsp from 'node:fs/promises'
 import path from 'node:path'
 import { spawn } from 'node:child_process'
 import type { SpawnOpts, SpawnResult, ToolContext, ToolDef, ToolResult } from './types'
-import type { WorkflowAgent } from '../types'
+import type { AgentEvent, AgentSnapshot, DiffLine, WorkflowAgent } from '../types'
 
 const MAX_OUT = 30000 // hard cap on any single tool's returned text
 
@@ -39,6 +39,56 @@ function lineDiff(oldText: string, newText: string): { added: number; removed: n
   }
   const lcs = prev[n]
   return { added: n - lcs, removed: m - lcs }
+}
+
+// A unified diff (context + / - rows) between two texts, for the write/edit diff
+// view. Full LCS backtrack → per-line ops, then unchanged runs longer than
+// 2×context are collapsed to a "⋯ N unchanged lines" hunk marker. Guards: bails
+// (returns []) when the O(m×n) table would be huge, and caps total emitted rows
+// so a massive rewrite can't flood the transcript.
+const DIFF_CONTEXT = 3
+const DIFF_MAX_ROWS = 200
+function diffLines(oldText: string, newText: string): DiffLine[] {
+  const a = oldText === '' ? [] : oldText.split('\n')
+  const b = newText === '' ? [] : newText.split('\n')
+  const m = a.length, n = b.length
+  if (m === 0 && n === 0) return []
+  if (m * n > 1_000_000) return [] // too big to diff line-by-line; skip the view
+  // LCS table, then backtrack into an ordered op list.
+  const dp: number[][] = Array.from({ length: m + 1 }, () => new Array<number>(n + 1).fill(0))
+  for (let i = m - 1; i >= 0; i--)
+    for (let j = n - 1; j >= 0; j--)
+      dp[i][j] = a[i] === b[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1])
+  type Op = { tag: 'context' | 'add' | 'del'; text: string; oldNo?: number; newNo?: number }
+  const ops: Op[] = []
+  let i = 0, j = 0
+  while (i < m && j < n) {
+    if (a[i] === b[j]) { ops.push({ tag: 'context', text: a[i], oldNo: i + 1, newNo: j + 1 }); i++; j++ }
+    else if (dp[i + 1][j] >= dp[i][j + 1]) { ops.push({ tag: 'del', text: a[i], oldNo: i + 1 }); i++ }
+    else { ops.push({ tag: 'add', text: b[j], newNo: j + 1 }); j++ }
+  }
+  while (i < m) { ops.push({ tag: 'del', text: a[i], oldNo: i + 1 }); i++ }
+  while (j < n) { ops.push({ tag: 'add', text: b[j], newNo: j + 1 }); j++ }
+  // Collapse long unchanged runs, keeping DIFF_CONTEXT lines around each change.
+  const keep = new Array<boolean>(ops.length).fill(false)
+  for (let k = 0; k < ops.length; k++) {
+    if (ops[k].tag === 'context') continue
+    for (let d = -DIFF_CONTEXT; d <= DIFF_CONTEXT; d++) {
+      const idx = k + d
+      if (idx >= 0 && idx < ops.length) keep[idx] = true
+    }
+  }
+  const out: DiffLine[] = []
+  let skipped = 0
+  const flushHunk = () => { if (skipped > 0) { out.push({ tag: 'hunk', text: `⋯ ${skipped} unchanged line${skipped === 1 ? '' : 's'}` }); skipped = 0 } }
+  for (let k = 0; k < ops.length; k++) {
+    if (!keep[k]) { skipped++; continue }
+    flushHunk()
+    out.push(ops[k])
+    if (out.length >= DIFF_MAX_ROWS) { out.push({ tag: 'hunk', text: '⋯ diff truncated' }); return out }
+  }
+  flushHunk()
+  return out
 }
 
 // Shared shell runner used by the bash + grep tools. Streams nothing; collects
@@ -128,7 +178,8 @@ const writeFile: ToolDef = {
       await fsp.mkdir(path.dirname(file), { recursive: true })
       await fsp.writeFile(file, content, 'utf8')
       const { added, removed } = lineDiff(before, content)
-      return { content: `wrote ${file} (${content.length} bytes)`, linesAdded: added, linesRemoved: removed }
+      const diff = diffLines(before, content)
+      return { content: `wrote ${file} (${content.length} bytes)`, linesAdded: added, linesRemoved: removed, diff: diff.length ? diff : undefined }
     } catch (e) {
       return { content: `cannot write ${file}: ${(e as Error).message}`, isError: true }
     }
@@ -160,11 +211,15 @@ const editFile: ToolDef = {
       const next = input.replace_all ? raw.split(oldStr).join(newStr) : raw.replace(oldStr, newStr)
       await fsp.writeFile(file, next, 'utf8')
       const reps = input.replace_all ? count : 1
-      const per = lineDiff(oldStr, newStr)
+      // Whole-file diff gives accurate counts and a proper context view; the
+      // per-hunk multiply (below) was only a heuristic when we lacked the file.
+      const whole = lineDiff(raw, next)
+      const diff = diffLines(raw, next)
       return {
         content: `edited ${file} (${reps} replacement${reps === 1 ? '' : 's'})`,
-        linesAdded: per.added * reps,
-        linesRemoved: per.removed * reps,
+        linesAdded: whole.added,
+        linesRemoved: whole.removed,
+        diff: diff.length ? diff : undefined,
       }
     } catch (e) {
       return { content: `cannot edit ${file}: ${(e as Error).message}`, isError: true }
@@ -325,9 +380,15 @@ export function renderWorkflowReport(title: string, agents: WorkflowAgent[], tex
   return `# ${title}\n\n_generated ${when}_\n\n${rows.join('\n\n')}\n`
 }
 
+// Appended to every sub-agent's system prompt. Sub-agents that only make tool
+// calls and then stop leave the orchestrator with an empty result ("(no output)"
+// in the report) — this forces them to finish with prose, which IS their result.
+const REPORT_RULE =
+  ' When you finish, ALWAYS end your turn with a concise written report — a short paragraph summarizing what you found or changed. Your final message is captured verbatim as your result and shown to the orchestrator, so never stop after only tool calls: a run with no closing summary is treated as producing no output.'
+
 function spawnHint(kind: unknown): string | undefined {
   const key = String(kind ?? 'general').toLowerCase()
-  return SUBAGENT_ROLES[key] ?? SUBAGENT_ROLES.general
+  return (SUBAGENT_ROLES[key] ?? SUBAGENT_ROLES.general) + REPORT_RULE
 }
 
 interface BatchTask { prompt: string; label: string; type?: unknown }
@@ -391,6 +452,51 @@ async function runAgentBatch(
   return results
 }
 
+// Run ONE sub-agent (`task`/`plan`) as a SWITCHABLE transcript view. Unlike a
+// `workflow` (a collapsed line + an expandable progress tree), a switchable agent
+// streams its OWN events, which we accumulate and push to the UI via ctx.onAgent
+// so the user can pick it in the bottom switcher (○ main / ● <type> <activity>)
+// and swap the main viewport to its chat. The sub-agent's transcript IS the view;
+// there is no tree. Returns the final SpawnResult for the tool's inline report.
+async function runSwitchableAgent(
+  ctx: ToolContext,
+  task: { prompt: string; label: string; type?: unknown },
+  idPrefix: string,
+): Promise<SpawnResult> {
+  const spawn = ctx.spawnAgent!
+  const id = `${idPrefix}-${Date.now().toString(36)}`
+  const type = String(task.type ?? 'general')
+  const startedAt = Date.now()
+  const events: AgentEvent[] = []
+  let steps = 0
+  let activity = 'starting'
+  const emit = (state: AgentSnapshot['state'], done = false, error?: string): void => {
+    ctx.onAgent?.({
+      id, type, label: task.label, activity, state,
+      events: events.slice(), steps, startedAt,
+      elapsedMs: done ? Date.now() - startedAt : undefined,
+      error, done,
+    })
+  }
+  emit('running')
+  const r = await spawn({
+    prompt: task.prompt,
+    system: spawnHint(task.type),
+    label: task.label,
+    // Each sub-agent event feeds the live transcript + the switcher's activity word.
+    onEvent: (ev) => {
+      events.push(ev)
+      if (ev.type === 'tool_use') { steps++; activity = ev.name }
+      else if (ev.type === 'text' && activity === 'starting') activity = 'responding'
+      else if (ev.type === 'error') activity = 'error'
+      emit('running')
+    },
+  })
+  activity = r.error ? 'error' : 'done'
+  emit(r.error ? 'error' : 'done', true, r.error)
+  return r
+}
+
 const task: ToolDef = {
   name: 'task',
   description:
@@ -411,11 +517,10 @@ const task: ToolDef = {
     const prompt = String(input.prompt ?? '').trim()
     if (!prompt) return { content: 'task requires a `prompt`.', isError: true }
     const label = String(input.description ?? 'task').trim() || 'task'
-    // A single sub-task is a workflow of one: routing it through runAgentBatch
-    // gives it the live collapsed line + expandable view, same as `workflow`.
-    const [r] = await runAgentBatch(ctx, [{ prompt, label, type: input.subagent_type }], {
-      title: `task · ${label}`, idPrefix: 'task', concurrency: 1,
-    })
+    // A `task` is a single switchable sub-agent: it streams its own transcript
+    // through ctx.onAgent so the user can switch the viewport to it (distinct
+    // from `workflow`, which shows a progress tree).
+    const r = await runSwitchableAgent(ctx, { prompt, label, type: input.subagent_type }, 'task')
     const head = `▸ sub-agent "${label}" · ${r.steps} tool call${r.steps === 1 ? '' : 's'}${r.error ? ` · error: ${r.error}` : ''}`
     return { content: clip(`${head}\n\n${r.text || '(no output)'}`), isError: Boolean(r.error) && !r.text }
   },
@@ -440,9 +545,7 @@ const plan: ToolDef = {
     const prompt = String(input.prompt ?? '').trim()
     if (!prompt) return { content: 'plan requires a `prompt` describing what to plan.', isError: true }
     const label = String(input.description ?? 'plan').trim() || 'plan'
-    const [r] = await runAgentBatch(ctx, [{ prompt, label, type: 'plan' }], {
-      title: `plan · ${label}`, idPrefix: 'plan', concurrency: 1,
-    })
+    const r = await runSwitchableAgent(ctx, { prompt, label, type: 'plan' }, 'plan')
     const head = `▸ plan "${label}" · ${r.steps} tool call${r.steps === 1 ? '' : 's'}${r.error ? ` · error: ${r.error}` : ''}`
     return { content: clip(`${head}\n\n${r.text || '(no plan produced)'}`), isError: Boolean(r.error) && !r.text }
   },

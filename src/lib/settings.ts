@@ -6,6 +6,8 @@
 // line each. The live values live in AppConfig.settings (a keyed bag), so they
 // persist through saveConfig for free; core fields (provider/model/theme/system)
 // keep their own typed slots and are handled directly by /config.
+import { t } from './i18n'
+
 export type SettingValue = boolean | string | number
 
 export type SettingType = 'boolean' | 'enum' | 'number' | 'string'
@@ -43,7 +45,7 @@ export const SETTINGS: SettingSpec[] = [
   { key: 'timeFormat', label: 'Time format', group: 'Interface', type: 'enum', values: ['24h', '12h'], default: '24h', description: 'Clock format for timestamps' },
   { key: 'autoScroll', label: 'Auto-scroll', group: 'Interface', type: 'boolean', default: true, description: 'Follow output as it streams' },
   { key: 'outputStyle', label: 'Output style', group: 'Interface', type: 'enum', values: ['default', 'concise', 'explanatory'], default: 'default', description: 'How much explanation responses include' },
-  { key: 'language', label: 'Language', group: 'Interface', type: 'string', default: 'auto', description: 'Preferred response language (auto = match the user)' },
+  { key: 'language', label: 'Language', group: 'Interface', type: 'enum', values: ['auto', 'zh', 'en'], default: 'auto', description: 'UI language (auto = match your shell locale)' },
   { key: 'prStatusFooter', label: 'Show PR status footer', group: 'Interface', type: 'boolean', default: true, description: 'Footer line with the current PR status' },
   { key: 'openAgentsView', label: 'Open agents view by default', group: 'Interface', type: 'boolean', default: false, description: 'Start with the agents panel open' },
   // Workflow
@@ -125,19 +127,19 @@ export function coerceSetting(spec: SettingSpec, raw: string): CoerceResult {
       const low = v.toLowerCase()
       if (TRUEY.has(low)) return { ok: true, value: true }
       if (FALSEY.has(low)) return { ok: true, value: false }
-      return { ok: false, error: `expected on/off (got \`${v}\`)` }
+      return { ok: false, error: t('set.errOnOff', { v }) }
     }
     case 'enum': {
       const low = v.toLowerCase()
       const match = (spec.values ?? []).find((o) => o.toLowerCase() === low)
-      if (!match) return { ok: false, error: `expected one of ${(spec.values ?? []).join(', ')}` }
+      if (!match) return { ok: false, error: t('set.errOneOf', { values: (spec.values ?? []).join(', ') }) }
       return { ok: true, value: match }
     }
     case 'number': {
       const n = Number(v)
-      if (!Number.isFinite(n)) return { ok: false, error: `expected a number (got \`${v}\`)` }
-      if (spec.min !== undefined && n < spec.min) return { ok: false, error: `must be ≥ ${spec.min}` }
-      if (spec.max !== undefined && n > spec.max) return { ok: false, error: `must be ≤ ${spec.max}` }
+      if (!Number.isFinite(n)) return { ok: false, error: t('set.errNumber', { v }) }
+      if (spec.min !== undefined && n < spec.min) return { ok: false, error: t('set.errMin', { min: spec.min }) }
+      if (spec.max !== undefined && n > spec.max) return { ok: false, error: t('set.errMax', { max: spec.max }) }
       return { ok: true, value: n }
     }
     default:
@@ -147,14 +149,14 @@ export function coerceSetting(spec: SettingSpec, raw: string): CoerceResult {
 
 // A short hint of the accepted input for a setting, shown when it's queried alone.
 export function settingHint(spec: SettingSpec): string {
-  if (spec.type === 'boolean') return 'on | off'
+  if (spec.type === 'boolean') return t('set.hintOnOff')
   if (spec.type === 'enum') return (spec.values ?? []).join(' | ')
   if (spec.type === 'number') {
     const lo = spec.min ?? 0
     const hi = spec.max !== undefined ? spec.max : '∞'
-    return `number ${lo}–${hi}${spec.unit ? ` (${spec.unit})` : ''}`
+    return t('set.hintNumber', { lo, hi, unit: spec.unit ? ` (${spec.unit})` : '' })
   }
-  return 'text'
+  return t('set.hintText')
 }
 
 // Reasoning-effort levels, ordered low→high, and the one-line behavioral

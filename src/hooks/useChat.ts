@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import type { AppConfig, LoopSpec, Message, MessageMeta, PanelTab, Role, WorkflowSnapshot } from '../types'
+import type { AgentSnapshot, AppConfig, LoopSpec, Message, MessageMeta, PanelTab, Role, WorkflowSnapshot } from '../types'
 import { getProvider } from '../providers'
 import { isCommand, runCommand } from '../commands'
 import { saveConfig } from '../config'
 import { loadMemory, goalPreamble } from '../lib/memory'
+import { changeSummary } from '../lib/transcript'
 import { effortDirective, getSetting, thinkingBudgetFor } from '../lib/settings'
 import { randomStatusWord } from '../lib/spinner'
 import { summarizeToolCall } from '../tools'
@@ -20,7 +21,7 @@ const BANNER: Message = { id: 'banner', role: 'system', content: '__banner__' }
 // Base instructions so a real model behaves like a coding agent: lean on the
 // tools, and actually finish (verify) rather than narrate a plan and stop.
 const AGENT_SYSTEM =
-  'You are AnyCode, a coding agent working in the user\'s project directory. ' +
+  'You are MeowCode, a coding agent working in the user\'s project directory. ' +
   'Use the provided tools (bash, read_file, write_file, edit_file, grep, glob, list_dir) to inspect and change the project yourself instead of only describing what to do. ' +
   'For a self-contained sub-task, delegate it with the `task` tool (a fresh sub-agent with the same file/search/shell tools); to fan several independent sub-tasks out in parallel, use the `workflow` tool. ' +
   'For any non-trivial or multi-file change, first call the `plan` tool to have a read-only sub-agent produce a concrete step-by-step implementation plan, then follow it. ' +
@@ -45,6 +46,7 @@ export interface ChatActions {
   exit: () => void
   clear: () => void
   openThemePicker?: () => void
+  openModelPicker?: () => void
   startLoop?: (spec: LoopSpec) => void
   stopLoop?: () => void
   loopStatus?: () => string | null
@@ -54,6 +56,8 @@ export interface ChatActions {
   send?: (text: string) => void
   compact?: () => number
   openPanel?: (tab: PanelTab) => void
+  openLogin?: () => void
+  openResume?: () => void
 }
 
 export interface Chat {
@@ -70,6 +74,11 @@ export interface Chat {
   // One entry per running workflow — a turn can fan out several, so the UI shows
   // one collapsed line each (↓ to select, ↵ to expand). Empty when none run.
   workflows: WorkflowSnapshot[]
+  // Live switchable sub-agents from `task`/`plan` calls this turn — each is a
+  // selectable transcript view in the bottom agent switcher (distinct from the
+  // workflow tree). Kept until the NEXT turn starts, so a finished sub-agent's
+  // chat can still be browsed after the turn ends.
+  agents: AgentSnapshot[]
   status: ChatStatus
   statusWord: string
   config: AppConfig
@@ -105,6 +114,10 @@ export function useChat(initialConfig: AppConfig, initialMessages?: Message[], i
   // arriving snapshot is upserted by id, so several workflows in one turn each
   // keep their own collapsed line; the whole list is cleared when the turn ends.
   const [workflows, setWorkflows] = useState<WorkflowSnapshot[]>([])
+  // Live switchable sub-agents (`task`/`plan`). Upserted by id as each streams;
+  // unlike workflows these survive turn end and are cleared when the NEXT turn
+  // begins, so a completed sub-agent's transcript remains browsable.
+  const [agents, setAgents] = useState<AgentSnapshot[]>([])
   const [status, setStatus] = useState<ChatStatus>('idle')
   const [statusWord, setStatusWord] = useState<string>('Working')
   // Cumulative session token/turn accounting (drives /usage, /status, warnings).
@@ -167,6 +180,7 @@ export function useChat(initialConfig: AppConfig, initialMessages?: Message[], i
         exit: actions.exit,
         print,
         openThemePicker: actions.openThemePicker,
+        openModelPicker: actions.openModelPicker,
         startLoop: actions.startLoop,
         stopLoop: actions.stopLoop,
         loopStatus: actions.loopStatus,
@@ -177,6 +191,8 @@ export function useChat(initialConfig: AppConfig, initialMessages?: Message[], i
         send: actions.send,
         compact: actions.compact,
         openPanel: actions.openPanel,
+        openLogin: actions.openLogin,
+        openResume: actions.openResume,
       })
       return
     }
@@ -185,6 +201,9 @@ export function useChat(initialConfig: AppConfig, initialMessages?: Message[], i
     abortRef.current = controller
     setStatusWord(randomStatusWord())
     setStatus('streaming')
+    // Clear the prior turn's switchable sub-agents as a fresh turn begins (they
+    // persist AFTER a turn so they stay browsable, unlike the workflow tree).
+    setAgents([])
 
     // A single assistant turn can interleave text and tool calls. `assistantId`
     // is the id of the text chunk currently streaming; when a tool call arrives
@@ -224,6 +243,17 @@ export function useChat(initialConfig: AppConfig, initialMessages?: Message[], i
       onWorkflow: (snap: WorkflowSnapshot) =>
         setWorkflows((prev) => {
           const i = prev.findIndex((w) => w.id === snap.id)
+          if (i < 0) return [...prev, snap]
+          const next = prev.slice()
+          next[i] = snap
+          return next
+        }),
+      // Live switchable sub-agents (`task`/`plan`) → React state, upserted by id
+      // so each keeps its own row in the bottom switcher and its transcript
+      // updates in place. NOT cleared at turn end (see setAgents above).
+      onAgent: (snap: AgentSnapshot) =>
+        setAgents((prev) => {
+          const i = prev.findIndex((a) => a.id === snap.id)
           if (i < 0) return [...prev, snap]
           const next = prev.slice()
           next[i] = snap
@@ -288,7 +318,13 @@ export function useChat(initialConfig: AppConfig, initialMessages?: Message[], i
           else if (ev.type === 'tool_result') {
             turnLinesAdded += ev.linesAdded ?? 0
             turnLinesRemoved += ev.linesRemoved ?? 0
-            print(formatToolResult(ev.content, ev.isError), 'tool', ev.isError ? { error: true } : undefined)
+            if (ev.diff && ev.diff.length && !ev.isError) {
+              // A write/edit diff: show a one-line change summary carrying the
+              // diff rows in meta, so the transcript can render the diff view.
+              print(`⎿ ${changeSummary(ev.linesAdded ?? 0, ev.linesRemoved ?? 0)}`, 'tool', { diff: ev.diff })
+            } else {
+              print(formatToolResult(ev.content, ev.isError), 'tool', ev.isError ? { error: true } : undefined)
+            }
           }
           else if (ev.type === 'usage') {
             sawUsage = true
@@ -359,5 +395,5 @@ export function useChat(initialConfig: AppConfig, initialMessages?: Message[], i
     abortRef.current = null
   }, [status, commitMessages, setConfig, print, bumpUsage])
 
-  return { messages, streaming, thinking, live, workflows, status, statusWord, config, usage, setConfig, print, submit, interrupt }
+  return { messages, streaming, thinking, live, workflows, agents, status, statusWord, config, usage, setConfig, print, submit, interrupt }
 }

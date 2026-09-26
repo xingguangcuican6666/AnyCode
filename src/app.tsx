@@ -5,14 +5,22 @@ import { useChat, type ChatActions } from './hooks/useChat'
 import { StatusLine } from './components/StatusLine'
 import { PromptInput } from './components/PromptInput'
 import { ThemePicker } from './components/ThemePicker'
+import { ModelPicker } from './components/ModelPicker'
+import { LoginPanel } from './components/LoginPanel'
+import { SessionPicker } from './components/SessionPicker'
 import { SettingsPanel } from './components/SettingsPanel'
 import { WorkflowView, WorkflowCollapsed } from './components/WorkflowView'
+import { AgentSwitcher } from './components/AgentSwitcher'
 import { getSetting } from './lib/settings'
 import { contextState, contextLevel, AUTO_COMPACT_RATIO, fmtTokens, bar } from './lib/usage'
 import { compactMessages } from './lib/compact'
-import { flattenMessages, thinkingLines, type LineKind } from './lib/transcript'
+import { flattenMessages, thinkingLines, messagesFromEvents, type LineKind, type FlatLine } from './lib/transcript'
+import { type Selection, lineSpan, splitByCols, stripAnsi, isEmpty, selectedText } from './lib/selection'
+import { copyToClipboard } from './lib/clipboard'
+import { loadSession } from './lib/sessions'
 import { registry } from './commands'
 import { ThemeProvider, getTheme } from './theme'
+import { LangProvider, resolveLang, setLang, translate } from './lib/i18n'
 import { setGoal } from './lib/memory'
 import { judgeGoal } from './lib/goalJudge'
 
@@ -61,11 +69,16 @@ interface Props {
   // auto-compaction to re-seed a shorter transcript.
   onRepaint: (snapshot: SessionSnapshot) => void
   // Report the latest live session state so the CLI can dump the transcript to
-  // the normal buffer on exit (the alternate screen is otherwise discarded).
+  // the normal buffer on exit (the alternate screen is otherwise discarded) and
+  // autosave it for /resume.
   onSnapshot?: (snapshot: SessionSnapshot) => void
+  // Reopen a saved session picked in the /resume overlay: remounts a fresh Ink
+  // instance seeded with that snapshot and adopts its session id so continued
+  // autosaves keep updating the same file.
+  onResume?: (snapshot: SessionSnapshot, sessionId: string) => void
 }
 
-export function App({ config, initial, onClear, onRepaint, onSnapshot }: Props): React.ReactElement {
+export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume }: Props): React.ReactElement {
   const { exit } = useApp()
   const { stdout } = useStdout()
   const { stdin } = useStdin()
@@ -73,6 +86,16 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot }: Props):
   const [elapsed, setElapsed] = useState(0)
   const [exitArmed, setExitArmed] = useState(false)
   const [pickerOpen, setPickerOpen] = useState(false)
+  // The interactive model picker overlay (opened by bare /model). Search box +
+  // API-pulled selector with optional group tabs; owns the keyboard while open.
+  const [modelOpen, setModelOpen] = useState(false)
+  // The interactive new-api login overlay (opened by /login). Like ThemePicker it
+  // renders in place of the input cluster and owns the keyboard while open;
+  // credentials typed here never reach the chat transcript.
+  const [loginOpen, setLoginOpen] = useState(false)
+  // The /resume session picker overlay (opened by /resume). Lists saved sessions;
+  // selecting one remounts the app seeded with that transcript (see onResume).
+  const [resumeOpen, setResumeOpen] = useState(false)
   // The interactive settings/status overlay (Settings/Status/Config/Usage/Stats),
   // opened by /config /status /usage /stats. Null when closed. Like ThemePicker it
   // renders in place of the input cluster and owns the keyboard while open.
@@ -84,6 +107,17 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot }: Props):
   // wheel (SGR events parsed below) and ctrl+End all move THIS, with the input
   // bar staying fixed at the bottom.
   const [scrollTop, setScrollTop] = useState<number | null>(null)
+  // In-viewport mouse text selection. `sel` is an (anchor, head) pair in absolute
+  // line-index + display-column space (see lib/selection). null = nothing
+  // selected. A left press starts it, a left-drag extends the head, release
+  // finalizes; because the coordinates are absolute, the highlight stays put as
+  // the transcript scrolls. Auto-copy on release is a deferred config
+  // (`copyOnSelect`, default off) — we render the highlight, not the clipboard.
+  const [sel, setSel] = useState<Selection | null>(null)
+  // Ids of collapsed activity groups / diff views the user has toggled from their
+  // default state (see lib/transcript FlattenOpts.expanded). A no-drag click on a
+  // grouped row flips its membership; the transcript re-flattens accordingly.
+  const [expanded, setExpanded] = useState<Set<string>>(new Set())
   // Workflow overlay state. `wfExpanded` is the id of the workflow whose full
   // tree is open (null = none); it renders in the live region and owns the
   // keyboard while open. `wfSel` is the index of the collapsed line under the
@@ -92,6 +126,14 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot }: Props):
   // when the workflows clear at turn end.
   const [wfExpanded, setWfExpanded] = useState<string | null>(null)
   const [wfSel, setWfSel] = useState<number | null>(null)
+  // Switchable sub-agent view (`task`/`plan`). `viewingAgent` is the id of the
+  // sub-agent whose OWN transcript the main viewport is showing (null = the main
+  // conversation) — this is what makes a sub-agent a *switchable view*, unlike a
+  // workflow's progress tree. `agentSel` is the row under the ↑↓ selection cursor
+  // in the bottom switcher ([main, ...agents]); null = the input owns the
+  // keyboard. Entered with a single ↓ past the input (onOverflowDown).
+  const [viewingAgent, setViewingAgent] = useState<string | null>(null)
+  const [agentSel, setAgentSel] = useState<number | null>(null)
   const [loop, setLoop] = useState<ActiveLoop | null>(initial?.loop ?? null)
   const [goal, setGoalRun] = useState<ActiveGoal | null>(initial?.goal ?? null)
   const [goalElapsed, setGoalElapsed] = useState(0)
@@ -111,6 +153,8 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot }: Props):
   const scrollTopRef = useRef<number | null>(scrollTop); scrollTopRef.current = scrollTop
   const wfExpandedRef = useRef(wfExpanded); wfExpandedRef.current = wfExpanded
   const wfSelRef = useRef(wfSel); wfSelRef.current = wfSel
+  const viewingAgentRef = useRef(viewingAgent); viewingAgentRef.current = viewingAgent
+  const agentSelRef = useRef(agentSel); agentSelRef.current = agentSel
   // Timestamp of the last time the workflow tree was dismissed. The global esc
   // handler ignores esc for a short window afterwards so "esc to go back" from
   // the tree can never also interrupt the running turn — whether via a rapid
@@ -121,6 +165,23 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot }: Props):
   // closures: maxTop = furthest-up first-visible line, pageStep = a page's worth.
   const maxTopRef = useRef(0)
   const pageStepRef = useRef(1)
+  // Live view extents the mouse listener reads to map a click's terminal (x,y)
+  // to an absolute transcript point, and to ignore clicks while a modal overlay
+  // owns the screen. `curRef` is the first visible line index; `selectingRef`
+  // tracks whether a left-drag is in progress; `selRef` exposes the current
+  // selection to the (esc-clears-it) key handler.
+  const curRef = useRef(0)
+  const modalOpenRef = useRef(false)
+  const selectingRef = useRef(false)
+  const selRef = useRef<Selection | null>(sel); selRef.current = sel
+  // Click-to-expand support: `linesRef` mirrors the rendered flat lines (so the
+  // mouse handler can read the group id under a click), `pressPtRef` records
+  // where a left press landed, and `draggedRef` marks whether motion occurred —
+  // a release with no drag is a click (toggle), a release after drag is a
+  // selection (leave the highlight).
+  const linesRef = useRef<FlatLine[]>([])
+  const pressPtRef = useRef<{ line: number; col: number } | null>(null)
+  const draggedRef = useRef(false)
 
   const streaming = chat.status === 'streaming'
 
@@ -176,21 +237,57 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot }: Props):
     return () => { stdout.off('resize', onResize) }
   }, [stdout])
 
-  // Mouse wheel → scroll the transcript. cli.tsx enables SGR mouse reporting
-  // (\x1b[?1000h\x1b[?1006h); wheel up/down arrive as button 64/65 in the
-  // \x1b[<b;x;y(M|m) form. Ink's useInput doesn't surface mouse events, so we
-  // read them off stdin directly and move the viewport a few lines per notch.
+  // Mouse events → scroll the transcript (wheel) or drive text selection
+  // (left press/drag/release). cli.tsx enables SGR mouse reporting
+  // (\x1b[?1000h\x1b[?1002h\x1b[?1006h); events arrive as \x1b[<b;x;y(M|m):
+  // wheel up/down are button 64/65; a left press is button 0 + 'M', a left-drag
+  // (motion with the button held) is button 32 + 'M', and release is 'm'. Ink's
+  // useInput doesn't surface mouse events, so we read them off stdin directly.
+  // SGR x,y are 1-based; the viewport's top row is screen row 1, so the absolute
+  // transcript point is { line: cur + (y-1), col: x-1 }.
   useEffect(() => {
     if (!stdin) return
     const onData = (data: Buffer): void => {
       const s = data.toString('utf8')
-      const re = /\x1b\[<(\d+);\d+;\d+[Mm]/g
+      const re = /\x1b\[<(\d+);(\d+);(\d+)([Mm])/g
       let m: RegExpExecArray | null
       let delta = 0
       while ((m = re.exec(s)) !== null) {
         const b = Number(m[1])
-        if (b === 64) delta -= 3
-        else if (b === 65) delta += 3
+        const x = Number(m[2])
+        const y = Number(m[3])
+        const release = m[4] === 'm'
+        // A modal overlay owns the mouse entirely (it runs its own stdin listener
+        // for hover/click/wheel); don't scroll or select the transcript behind it.
+        if (modalOpenRef.current) continue
+        if (b === 64) { delta -= 3; continue }
+        if (b === 65) { delta += 3; continue }
+        const pt = { line: curRef.current + (y - 1), col: Math.max(0, x - 1) }
+        if (b === 0 && !release) {
+          // Left press: begin (or restart) a selection anchored here. An
+          // immediate release with no drag leaves anchor===head (empty) → the
+          // prior highlight is cleared and nothing new is shown.
+          selectingRef.current = true
+          pressPtRef.current = pt
+          draggedRef.current = false
+          setSel({ anchor: pt, head: pt })
+        } else if (b === 32 && !release) {
+          // Left-drag: extend the head to the current cell.
+          draggedRef.current = true
+          if (selectingRef.current) setSel((cur) => (cur ? { anchor: cur.anchor, head: pt } : { anchor: pt, head: pt }))
+        } else if (release) {
+          // Release: a no-drag click on a grouped row toggles it expanded/
+          // collapsed; otherwise stop tracking and keep any highlight.
+          const wasSelecting = selectingRef.current
+          selectingRef.current = false
+          if (wasSelecting && !draggedRef.current) {
+            const grp = linesRef.current[pressPtRef.current?.line ?? -1]?.group
+            if (grp) {
+              setExpanded((prev) => { const next = new Set(prev); if (next.has(grp)) next.delete(grp); else next.add(grp); return next })
+              setSel(null)
+            }
+          }
+        }
       }
       if (delta !== 0) applyScroll(delta)
     }
@@ -202,6 +299,14 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot }: Props):
   const width = dims.cols
   // Resolve the active palette from config and hand it to the whole tree.
   const colors = getTheme(chat.config.theme).colors
+  // Active UI language, from the `language` setting (auto → shell locale). Handed
+  // to the tree via <LangProvider>; the module-level mirror is kept in sync below
+  // so non-React code (commands, lib helpers) translates in the same language.
+  const lang = resolveLang(getSetting(chat.config.settings, 'language') as string)
+  useEffect(() => { setLang(lang) }, [lang])
+  // App renders <LangProvider>, so it sits above its own context — translate with
+  // the resolved `lang` directly (correct on the same render the setting changes).
+  const t = (key: Parameters<typeof translate>[1], params?: Parameters<typeof translate>[2]): string => translate(lang, key, params)
 
   // Live context-window fill, used for the warning line and auto-compaction.
   const ctx = contextState(chat.messages, chat.config.model)
@@ -211,7 +316,8 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot }: Props):
 
   // A modal overlay (theme picker / settings / workflow tree) replaces the whole
   // content area — you operate it rather than read the transcript behind it.
-  const modalOpen = pickerOpen || !!panel || !!expandedWf
+  const modalOpen = pickerOpen || modelOpen || loginOpen || resumeOpen || !!panel || !!expandedWf
+  modalOpenRef.current = modalOpen
   const scrolled = scrollTop !== null
 
   // Report the latest transcript so the CLI can dump it to the normal buffer on
@@ -235,6 +341,7 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot }: Props):
     (ctxLevel !== 'ok' ? 1 : 0) +
     INPUT_ROWS +
     chat.workflows.length +
+    (chat.agents.length > 0 ? chat.agents.length + 2 : 0) + // switcher: header + main row + agents
     1 + // footer
     (scrolled ? 1 : 0)
   const viewportH = Math.max(1, dims.rows - clusterH)
@@ -244,7 +351,8 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot }: Props):
   // changes only when a message is appended) so scrolling a long transcript
   // doesn't re-render every message's markdown per keystroke; the live tail
   // changes each frame while streaming.
-  const committed = useMemo(() => flattenMessages(chat.messages, width, { banner: true }), [chat.messages, width])
+  const expandAll = getSetting(chat.config.settings, 'verbose') === true
+  const committed = useMemo(() => flattenMessages(chat.messages, width, { banner: true, expanded, expandAll }), [chat.messages, width, expanded, expandAll])
   const liveThink = useMemo(
     () => (chat.thinking && chat.thinking.content.trim() ? thinkingLines(chat.thinking, width) : []),
     [chat.thinking, width],
@@ -253,7 +361,22 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot }: Props):
     () => (chat.streaming && chat.streaming.content.trim() ? flattenMessages([chat.streaming], width) : []),
     [chat.streaming, width],
   )
-  const lines = useMemo(() => committed.concat(liveThink, liveStream), [committed, liveThink, liveStream])
+  const mainLines = useMemo(() => committed.concat(liveThink, liveStream), [committed, liveThink, liveStream])
+  // When a sub-agent is selected in the switcher, the viewport shows ITS OWN
+  // transcript (flattened from its event stream) instead of the main one, headed
+  // by a divider naming the agent and its state. This is the "switch to another
+  // agent and see its chat" behavior — falls back to main when nothing is viewed
+  // or the viewed agent has vanished (turn cleared it).
+  const viewedAgent = viewingAgent ? chat.agents.find((a) => a.id === viewingAgent) ?? null : null
+  const agentLines = useMemo<FlatLine[] | null>(() => {
+    if (!viewedAgent) return null
+    const st = viewedAgent.state === 'done' ? 'done' : viewedAgent.state === 'error' ? `error: ${viewedAgent.error ?? 'failed'}` : `${viewedAgent.activity}…`
+    const header: FlatLine = { text: `  ── sub-agent · ${viewedAgent.type} · ${viewedAgent.label} · ${st} ──`, kind: 'tool-header' }
+    const body = flattenMessages(messagesFromEvents(viewedAgent.events), width)
+    return [header, { text: '', kind: 'blank' }, ...(body.length ? body : [{ text: '  (no output yet)', kind: 'system' } as FlatLine])]
+  }, [viewedAgent, width])
+  const lines = agentLines ?? mainLines
+  linesRef.current = lines
   const total = lines.length
 
   // Windowing: `scrollTop === null` follows the bottom (the common case — new
@@ -265,6 +388,7 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot }: Props):
   maxTopRef.current = maxTop
   pageStepRef.current = pageStep
   const cur = scrollTop === null ? maxTop : Math.min(scrollTop, maxTop)
+  curRef.current = cur
   const visible = lines.slice(cur, cur + viewportH)
   const below = Math.max(0, total - (cur + viewportH))
   // Fresh / short session → banner sits at the TOP, input at the BOTTOM, an empty
@@ -278,6 +402,8 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot }: Props):
       case 'error': return colors.error
       case 'retry': return colors.warning
       case 'tool-header': return colors.accent
+      case 'diff-add': return colors.success
+      case 'diff-del': return colors.error
       default: return colors.dim
     }
   }
@@ -323,6 +449,22 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot }: Props):
     if (wfSel !== null && wfSel > wfs.length - 1) setWfSel(wfs.length - 1)
   }, [chat.workflows, wfExpanded, wfSel])
 
+  // Switching which agent the viewport shows resets scroll to the live bottom and
+  // clears any text selection (it indexed the previous transcript's lines).
+  useEffect(() => { setScrollTop(null); setSel(null) }, [viewingAgent])
+
+  // Keep the switcher consistent with the live agent list: if the viewed agent
+  // vanishes (a new turn cleared the list) fall back to main; clamp/drop the
+  // selection cursor when the list shrinks or empties.
+  useEffect(() => {
+    const ags = chat.agents
+    if (viewingAgent !== null && !ags.some((a) => a.id === viewingAgent)) setViewingAgent(null)
+    if (agentSel !== null) {
+      if (ags.length === 0) setAgentSel(null)
+      else if (agentSel > ags.length) setAgentSel(ags.length)
+    }
+  }, [chat.agents, viewingAgent, agentSel])
+
   // Global keys: esc interrupts a stream and stops autonomous goal work; ctrl+c
   // twice exits. Esc handles the goal even between turns (when not streaming), so
   // it's a reliable "stop working on this" — /goal clear also forgets the goal.
@@ -358,6 +500,31 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot }: Props):
       }
       return // swallow other keys while selecting
     }
+    // Agent switcher selection mode: a cursor runs across [main, ...agents]. ↑↓
+    // move it, ↵ swaps the viewport to the selected agent's OWN transcript (row 0
+    // = main = the conversation), x stops a running sub-agent (interrupts the
+    // turn — sub-agents share its abort signal, no per-agent cancel), esc cancels.
+    // PromptInput is inactive while this is on (its `active` requires agentSel===null).
+    if (agentSelRef.current !== null) {
+      const ags = chatRef.current.agents
+      if (ags.length === 0) { setAgentSel(null); return }
+      const listLen = ags.length + 1
+      if (key.escape) { setAgentSel(null); return }
+      if (key.upArrow) { setAgentSel((s) => ((s ?? 0) <= 0 ? null : (s as number) - 1)); return }
+      if (key.downArrow) { setAgentSel((s) => Math.min(listLen - 1, (s ?? 0) + 1)); return }
+      if (key.return) {
+        const idx = Math.min(agentSelRef.current ?? 0, listLen - 1)
+        setViewingAgent(idx === 0 ? null : ags[idx - 1].id)
+        setAgentSel(null)
+        return
+      }
+      if (input === 'x') {
+        const idx = Math.min(agentSelRef.current ?? 0, listLen - 1)
+        if (idx > 0 && streaming) chat.interrupt()
+        return
+      }
+      return // swallow other keys while selecting
+    }
     // Transcript scrolling. The owned viewport windows the flattened transcript
     // in place, so PageUp/PageDown move the first-visible line while the input bar
     // stays fixed at the bottom — even mid-stream (scrolling pins the view while
@@ -368,6 +535,9 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot }: Props):
     // ctrl+End (best-effort ctrl+F/~, since terminals surface End inconsistently)
     // jumps back to the live bottom and resumes following.
     if (key.ctrl && /F|~/.test(input)) { resumeFollow(); return }
+    // esc clears an active text selection first — before it snaps scroll back or
+    // interrupts the turn — so dismissing a highlight is a distinct, cheap step.
+    if (key.escape && selRef.current && !isEmpty(selRef.current)) { setSel(null); return }
     // esc while scrolled up snaps back to the bottom first, so a scrolled esc
     // never doubles as interrupting the running turn.
     if (key.escape && scrollTopRef.current !== null) { resumeFollow(); return }
@@ -380,6 +550,16 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot }: Props):
       return
     }
     if (key.ctrl && input === 'c') {
+      // With an active text selection, ctrl+c COPIES it (like a terminal) rather
+      // than interrupting the turn or arming exit — the highlight is the user's
+      // intent here. Clearing the selection is the visual "copied" feedback and
+      // restores plain ctrl+c (interrupt/exit) on the next press.
+      const cur = selRef.current
+      if (cur && !isEmpty(cur)) {
+        copyToClipboard(selectedText(cur, linesRef.current), stdout)
+        setSel(null)
+        return
+      }
       if (streaming) { chat.interrupt(); return }
       if (exitArmed) { exit(); return }
       setExitArmed(true)
@@ -393,6 +573,7 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot }: Props):
     exit,
     clear: () => onClear(chatRef.current.config),
     openThemePicker: () => setPickerOpen(true),
+    openModelPicker: () => setModelOpen(true),
     startLoop: (spec) => setLoop({ ...spec, runs: 0 }),
     stopLoop: () => setLoop(null),
     loopStatus: () => (loopRef.current ? formatLoop(loopRef.current) : null),
@@ -406,6 +587,8 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot }: Props):
     send: (text: string) => setQueued((q) => [...q, text]),
     compact: () => doCompact(),
     openPanel: (tab) => setPanel(tab),
+    openLogin: () => setLoginOpen(true),
+    openResume: () => setResumeOpen(true),
   })
 
   // Submitting while a response streams queues the line (type-ahead) rather than
@@ -487,6 +670,7 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot }: Props):
     // nothing. History survives via the exit-time dump to the normal buffer (see
     // cli.tsx). The middle is "一个容器" with self-managed scroll.
     <ThemeProvider value={colors}>
+      <LangProvider value={lang}>
       <Box flexDirection="column" width={width} height={dims.rows}>
         {modalOpen ? (
           <Box flexGrow={1} justifyContent="flex-end">
@@ -496,6 +680,36 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot }: Props):
                 width={width}
                 onSelect={(name) => { chat.setConfig({ theme: name }); setPickerOpen(false) }}
                 onCancel={() => setPickerOpen(false)}
+              />
+            ) : modelOpen ? (
+              <ModelPicker
+                current={chat.config.model}
+                width={width}
+                rows={dims.rows}
+                onSelect={(name) => { chat.setConfig({ model: name }); setModelOpen(false); chat.print(`模型已切换为 \`${name}\`。`, 'system') }}
+                onCancel={() => setModelOpen(false)}
+              />
+            ) : loginOpen ? (
+              <LoginPanel
+                width={width}
+                onSuccess={(baseUrl) => {
+                  chat.setConfig({ provider: 'newapi' })
+                  setLoginOpen(false)
+                  chat.print(`✓ 已登录 MeowArch API（${baseUrl}），已切换到 \`newapi\` 提供商。`, 'system')
+                }}
+                onCancel={() => setLoginOpen(false)}
+              />
+            ) : resumeOpen ? (
+              <SessionPicker
+                width={width}
+                rows={dims.rows}
+                onSelect={(id) => {
+                  const snap = loadSession(id)
+                  setResumeOpen(false)
+                  if (snap && onResume) onResume(snap, id)
+                  else chat.print('无法加载该会话（可能已被删除或损坏）。', 'system', { error: true })
+                }}
+                onCancel={() => setResumeOpen(false)}
               />
             ) : panel ? (
               <SettingsPanel
@@ -523,9 +737,26 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot }: Props):
           </Box>
         ) : (
           <Box flexGrow={1} flexDirection="column" overflow="hidden" justifyContent={anchor}>
-            {visible.map((ln, i) => (
-              <Text key={cur + i} color={colorFor(ln.kind)} wrap="truncate">{ln.text === '' ? ' ' : ln.text}</Text>
-            ))}
+            {visible.map((ln, i) => {
+              const absIdx = cur + i
+              // A selected line is re-rendered as before/highlight/after spans.
+              // We strip ANSI on it and re-color plainly (the highlight uses
+              // `inverse`), losing markdown color on that one line while it's
+              // selected — an accepted trade so the SGR codes never tear.
+              const plain = stripAnsi(ln.text)
+              const span = sel && !isEmpty(sel) ? lineSpan(sel, absIdx, plain) : null
+              if (span) {
+                const [before, mid, after] = splitByCols(plain, span.a, span.b)
+                return (
+                  <Text key={absIdx} color={colorFor(ln.kind)} wrap="truncate">
+                    {before}<Text inverse>{mid}</Text>{after}
+                  </Text>
+                )
+              }
+              return (
+                <Text key={absIdx} color={colorFor(ln.kind)} wrap="truncate">{ln.text === '' ? ' ' : ln.text}</Text>
+              )
+            })}
           </Box>
         )}
 
@@ -555,7 +786,7 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot }: Props):
             {queued.length > 0 ? (
               <Box flexDirection="column" paddingLeft={1}>
                 {queued.map((q, i) => (
-                  <Text key={i} color={colors.dim} wrap="truncate">⏳ queued · {q}</Text>
+                  <Text key={i} color={colors.dim} wrap="truncate">{t('app.queued', { q })}</Text>
                 ))}
               </Box>
             ) : null}
@@ -566,31 +797,48 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot }: Props):
                 elapsed={elapsed}
                 tokens={chat.live?.tokens ?? 0}
                 dir={chat.live?.dir ?? 'up'}
-                suffix={chat.live?.thinking ? `deep in thought with ${String(getSetting(chat.config.settings, 'effort'))} effort` : undefined}
+                suffix={chat.live?.thinking ? t('app.thinkingSuffix', { effort: String(getSetting(chat.config.settings, 'effort')) }) : undefined}
               />
             ) : null}
 
             {ctxLevel !== 'ok' ? (
               <Box paddingLeft={1}>
                 <Text color={ctxLevel === 'danger' ? colors.error : colors.warning} wrap="truncate">
-                  {`⚠ Context ${Math.round(ctx.ratio * 100)}% full ${bar(ctx.ratio, 12)} · ${fmtTokens(ctx.used)}/${fmtTokens(ctx.limit)} · ${ctxLevel === 'danger' ? 'compacting soon — run /compact now' : '/compact to reclaim space'}`}
+                  {t('app.ctxWarn', {
+                    pct: Math.round(ctx.ratio * 100),
+                    bar: bar(ctx.ratio, 12),
+                    used: fmtTokens(ctx.used),
+                    limit: fmtTokens(ctx.limit),
+                    tail: ctxLevel === 'danger' ? t('app.ctxCompactSoon') : t('app.ctxCompactHint'),
+                  })}
                 </Text>
               </Box>
             ) : null}
 
             <PromptInput
-              active={wfSel === null}
+              active={wfSel === null && agentSel === null}
               width={width}
               commands={registry}
-              placeholder="Ask AnyCode to build something…  (/help for commands)"
+              placeholder={t('app.placeholder')}
               onSubmit={handleSubmit}
               onOverflowDown={() => {
+                // A single ↓ past the input drops into a selectable region below
+                // it. Prefer the agent switcher (switchable transcripts) when
+                // sub-agents exist, else the collapsed workflow lines.
+                if (chatRef.current.agents.length > 0) { setAgentSel(0); return true }
                 const wfs = chatRef.current.workflows
                 if (wfs.length === 0) return false
                 setWfSel(0)
                 return true
               }}
             />
+
+            {/* The switchable agent list sits below the input, so a single ↓ past
+                the input lands on it (see onOverflowDown). Selecting a row swaps
+                the viewport above to that agent's own transcript. */}
+            {chat.agents.length > 0 ? (
+              <AgentSwitcher agents={chat.agents} sel={agentSel} viewing={viewingAgent} width={width} />
+            ) : null}
 
             {/* Collapsed workflow lines sit BELOW the input box, so a single ↓
                 past the input naturally lands on them (see onOverflowDown). */}
@@ -605,21 +853,30 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot }: Props):
             <Box paddingLeft={1}>
               <Text color={colors.dim} wrap="truncate">
                 {exitArmed
-                  ? 'press ctrl+c again to exit'
+                  ? t('footer.exitArmed')
                   : scrolled
-                    ? 'PgUp/PgDn page · wheel scroll · esc/ctrl+End to resume'
-                    : wfSel !== null
-                      ? '↑↓ select · ↵ expand · esc cancel'
-                      : streaming
-                        ? chat.workflows.length > 0
-                          ? '↓ select workflow · PgUp scroll · esc to interrupt'
-                          : '↵ queue a message while working · PgUp scroll · esc to interrupt'
-                        : '↵ send · ↑↓ history · PgUp scroll · /help commands · ctrl+c to exit'}
+                    ? t('footer.scrolled')
+                    : agentSel !== null
+                      ? t('footer.agentSel')
+                      : wfSel !== null
+                        ? t('footer.wfSel')
+                        : viewingAgent
+                          ? t(streaming ? 'footer.viewingStreaming' : 'footer.viewingIdle')
+                          : streaming
+                            ? chat.agents.length > 0
+                              ? t('footer.streamAgents')
+                              : chat.workflows.length > 0
+                                ? t('footer.streamWorkflows')
+                                : t('footer.streaming')
+                            : chat.agents.length > 0
+                              ? t('footer.idleAgents')
+                              : t('footer.idle')}
               </Text>
             </Box>
           </Box>
         ) : null}
       </Box>
+      </LangProvider>
     </ThemeProvider>
   )
 }

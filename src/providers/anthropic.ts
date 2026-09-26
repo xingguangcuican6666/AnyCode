@@ -34,12 +34,30 @@ function parseRetryAfter(h: string | null): number | undefined {
 
 // How a given Anthropic-protocol provider resolves its endpoint + key. The env
 // default (id 'anthropic') leaves baseUrl/apiKeyEnv unset; custom providers set
-// both. Costs are always billed at official rates regardless (see lib/pricing).
+// both. A logged-in provider (id 'newapi') instead supplies dynamic resolvers +
+// bearer auth (see providers/index.ts). Costs are always billed at official
+// rates regardless (see lib/pricing).
 export interface AnthropicOpts {
   id: string
   label: string
   baseUrl?: string     // host base; env ANTHROPIC_BASE_URL used when unset
   apiKeyEnv?: string   // env var holding the key; default resolution when unset
+  // Dynamic resolution (used by the logged-in `newapi` provider): when set these
+  // win over baseUrl/apiKeyEnv, so a runtime credential (a login on disk) reaches
+  // the request without ever touching settings.json. Read fresh on every call so
+  // /login and /logout take effect immediately.
+  resolveBaseUrl?: () => string | undefined
+  resolveKey?: () => string | undefined
+  // Async token resolution for OAuth logins: the at_ access token is refreshed
+  // (a network call) when it's expired, so the resolver is async. Wins over
+  // resolveKey/apiKeyEnv when set.
+  resolveKeyAsync?: () => Promise<string | undefined>
+  // Force-refresh hook, invoked once per turn when the server answers 401 (the
+  // at_ token expired or was rotated out from under us). Returns a fresh token to
+  // retry with, or undefined when nothing can be refreshed (→ surface the error).
+  refreshKey?: () => Promise<string | undefined>
+  auth?: 'x-api-key' | 'bearer'   // request auth header style; default 'x-api-key'
+  noKeyHint?: string   // message shown when no key resolves (overrides the default)
 }
 
 // Normalize a host base to the Messages endpoint — "/v1/messages" is appended
@@ -50,18 +68,20 @@ function toMessagesUrl(base: string): string {
 }
 
 function resolveUrl(opts: AnthropicOpts): string {
-  return toMessagesUrl(opts.baseUrl || process.env.ANTHROPIC_BASE_URL || 'https://api.anthropic.com')
+  return toMessagesUrl(opts.resolveBaseUrl?.() || opts.baseUrl || process.env.ANTHROPIC_BASE_URL || 'https://api.anthropic.com')
 }
 
-// Custom providers read their key from a named env var (never persisted); the
-// env default falls back to config.apiKey (itself env-sourced) then the standard
-// ANTHROPIC_API_KEY.
+// Custom providers read their key from a named env var (never persisted); a
+// logged-in provider resolves it from the credentials file; the env default
+// falls back to config.apiKey (itself env-sourced) then ANTHROPIC_API_KEY.
 function resolveKey(opts: AnthropicOpts): string | undefined {
+  if (opts.resolveKey) return opts.resolveKey()
   if (opts.apiKeyEnv) return process.env[opts.apiKeyEnv]
   return loadConfig().apiKey || process.env.ANTHROPIC_API_KEY
 }
 
 function keyHint(opts: AnthropicOpts): string {
+  if (opts.noKeyHint) return opts.noKeyHint
   const envName = opts.apiKeyEnv || 'ANTHROPIC_API_KEY'
   return `⚠️  No \`${envName}\` found. Set it, or run \`/provider mock\` for the offline demo.`
 }
@@ -86,10 +106,19 @@ function toApiMessages(messages: Message[]): ApiMsg[] {
     .map((m) => ({ role: m.role as 'user' | 'assistant', content: m.content }))
 }
 
-async function post(url: string, body: unknown, apiKey: string, signal?: AbortSignal): Promise<Response> {
+// A bearer-auth provider (new-api relay) sends `Authorization: Bearer <key>`;
+// the Anthropic default uses `x-api-key`. Both still send anthropic-version so
+// the relay routes to the Messages protocol.
+function authHeaders(apiKey: string, auth: 'x-api-key' | 'bearer' | undefined): Record<string, string> {
+  return auth === 'bearer'
+    ? { authorization: `Bearer ${apiKey}` }
+    : { 'x-api-key': apiKey }
+}
+
+async function post(url: string, body: unknown, apiKey: string, auth: 'x-api-key' | 'bearer' | undefined, signal?: AbortSignal): Promise<Response> {
   return fetch(url, {
     method: 'POST',
-    headers: { 'content-type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': API_VERSION },
+    headers: { 'content-type': 'application/json', ...authHeaders(apiKey, auth), 'anthropic-version': API_VERSION },
     body: JSON.stringify(body),
     signal,
   })
@@ -168,7 +197,7 @@ async function* parseStream(res: Response, signal?: AbortSignal): AsyncGenerator
 // `sub` marks a nested sub-agent run: it is offered no orchestration tools and
 // gets no spawnAgent in its tool context, so nesting is capped at one level.
 async function* agent(messages: Message[], opts: StreamOpts, cfg: AnthropicOpts, sub = false): AsyncGenerator<AgentEvent, void, unknown> {
-  const apiKey = resolveKey(cfg)
+  let apiKey = cfg.resolveKeyAsync ? await cfg.resolveKeyAsync() : resolveKey(cfg)
   if (!apiKey) { yield { type: 'text', text: keyHint(cfg) }; return }
   const url = resolveUrl(cfg)
   const convo = toApiMessages(messages)
@@ -183,16 +212,26 @@ async function* agent(messages: Message[], opts: StreamOpts, cfg: AnthropicOpts,
         const subMessages: Message[] = [{ id: 'sub-user', role: 'user', content: sp.prompt }]
         const subOpts: StreamOpts = { model: opts.model, system: sp.system, signal: opts.signal }
         let text = ''
+        let lastText = ''
         let steps = 0
         let error: string | undefined
         for await (const ev of agent(subMessages, subOpts, cfg, true)) {
-          if (ev.type === 'text') text += ev.text
-          else if (ev.type === 'tool_use') steps++
+          sp.onEvent?.(ev) // forward the sub-agent's live events for the switchable view
+          if (ev.type === 'text') { text += ev.text; lastText += ev.text }
+          else if (ev.type === 'tool_use') { steps++; lastText = '' } // reset so we keep only the FINAL text block
           else if (ev.type === 'error') error = ev.message
         }
-        return { text: text.trim(), steps, error }
+        // Prefer the sub-agent's final prose block; fall back to all its prose,
+        // and finally to a synthesized note so a summary-less run reports what it
+        // did instead of a bare "(no output)".
+        const summary = lastText.trim() || text.trim() ||
+          (error ? '' : `Completed ${steps} tool call${steps === 1 ? '' : 's'} but returned no written summary.`)
+        return { text: summary, steps, error }
       }
 
+  // At most one forced token refresh per turn (on a 401), so an unrecoverable
+  // auth failure surfaces as an error instead of looping. OAuth logins only.
+  let refreshedAuth = false
   for (let step = 0; step < MAX_STEPS; step++) {
     // Extended thinking is opt-in via /effort (high+). Never for sub-agents (keep
     // them lean). max_tokens must exceed the thinking budget, so add headroom.
@@ -207,59 +246,103 @@ async function* agent(messages: Message[], opts: StreamOpts, cfg: AnthropicOpts,
       messages: convo,
     }
 
-    // Send with bounded exponential-backoff retries on transient failures
-    // (network errors + 408/409/429/5xx/529). Each wait is announced as a
-    // `retry` event; a fatal or exhausted failure ends the turn via `error`.
-    let res: Response | null = null
-    for (let attempt = 0; ; attempt++) {
+    // One request + SSE stream per step, wrapped in bounded backoff retries that
+    // cover BOTH the connection and the streaming read, so a transient failure is
+    // retried (announced via `retry`) and a fatal one ends the turn via `error`.
+    let blocks: ApiBlock[] = []
+    let stopReason = 'end_turn'
+    let streamed = false
+    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+      let res: Response
       try {
-        res = await post(url, body, apiKey, opts.signal)
+        res = await post(url, body, apiKey, cfg.auth, opts.signal)
       } catch (e) {
         if (opts.signal?.aborted) return
         const reason = (e as Error).message || 'network error'
         if (attempt >= MAX_ATTEMPTS - 1) { yield { type: 'error', message: `network error after ${MAX_ATTEMPTS} attempts: ${reason}` }; return }
         const delay = backoffMs(attempt)
         yield { type: 'retry', attempt: attempt + 1, max: MAX_ATTEMPTS, delayMs: delay, reason }
-        await sleep(delay, opts.signal)
-        if (opts.signal?.aborted) return
+        await sleep(delay, opts.signal); if (opts.signal?.aborted) return
         continue
       }
-      if (res.ok && res.body) break
-      const status = res.status
-      const errText = await res.text().catch(() => '')
-      if (!RETRY_STATUS.has(status) || attempt >= MAX_ATTEMPTS - 1) {
-        yield { type: 'error', message: `API error ${status}: ${errText.slice(0, 400)}` }
-        return
+      if (!res.ok || !res.body) {
+        const status = res.status
+        // An OAuth at_ token that expired mid-session: refresh once and retry the
+        // same request immediately (doesn't count as a transient-status retry).
+        if (status === 401 && cfg.refreshKey && !refreshedAuth) {
+          refreshedAuth = true
+          const nk = await cfg.refreshKey()
+          if (opts.signal?.aborted) return
+          if (nk && nk !== apiKey) { apiKey = nk; attempt--; continue }
+        }
+        const errText = await res.text().catch(() => '')
+        // A 401/403 on the logged-in provider is almost always an expired/invalid or
+        // insufficiently-scoped login rather than a transient fault — say so clearly.
+        if ((status === 401 || status === 403) && cfg.refreshKey) {
+          yield { type: 'error', message: `登录已失效或权限不足（HTTP ${status}）。请运行 /login 重新登录（OAuth 应用需具备 models.invoke 权限）。` }
+          return
+        }
+        if (!RETRY_STATUS.has(status) || attempt >= MAX_ATTEMPTS - 1) { yield { type: 'error', message: `API error ${status}: ${errText.slice(0, 400)}` }; return }
+        const delay = backoffMs(attempt, parseRetryAfter(res.headers.get('retry-after')))
+        yield { type: 'retry', attempt: attempt + 1, max: MAX_ATTEMPTS, delayMs: delay, reason: `HTTP ${status}` }
+        await sleep(delay, opts.signal); if (opts.signal?.aborted) return
+        continue
       }
-      const delay = backoffMs(attempt, parseRetryAfter(res.headers.get('retry-after')))
-      yield { type: 'retry', attempt: attempt + 1, max: MAX_ATTEMPTS, delayMs: delay, reason: `HTTP ${status}` }
-      await sleep(delay, opts.signal)
-      if (opts.signal?.aborted) return
+      blocks = []; stopReason = 'end_turn'
+      let stepStreamed = false
+      try {
+        for await (const ev of parseStream(res, opts.signal)) {
+          if (ev.type === 'text') { stepStreamed = true; yield { type: 'text', text: ev.text } }
+          else if (ev.type === 'thinking') { stepStreamed = true; yield { type: 'thinking', text: ev.text } }
+          else {
+            blocks = ev.blocks; stopReason = ev.stopReason
+            yield { type: 'usage', inputTokens: ev.usage.input, outputTokens: ev.usage.output, cacheReadTokens: ev.usage.cacheRead, cacheCreationTokens: ev.usage.cacheCreation }
+          }
+        }
+      } catch (e) {
+        if (opts.signal?.aborted) return
+        const reason = (e as Error).message || 'stream interrupted'
+        if (stepStreamed || attempt >= MAX_ATTEMPTS - 1) { yield { type: 'error', message: `stream error: ${reason}` }; return }
+        const delay = backoffMs(attempt)
+        yield { type: 'retry', attempt: attempt + 1, max: MAX_ATTEMPTS, delayMs: delay, reason }
+        await sleep(delay, opts.signal); if (opts.signal?.aborted) return
+        continue
+      }
+      // A clean EOF carrying no content (truncated/empty upstream): retry while
+      // nothing was shown, else surface it rather than returning a blank turn.
+      if (!stepStreamed && blocks.length === 0) {
+        if (attempt >= MAX_ATTEMPTS - 1) { yield { type: 'error', message: 'empty response from API (no content) after retries' }; return }
+        const delay = backoffMs(attempt)
+        yield { type: 'retry', attempt: attempt + 1, max: MAX_ATTEMPTS, delayMs: delay, reason: 'empty response' }
+        await sleep(delay, opts.signal); if (opts.signal?.aborted) return
+        continue
+      }
+      streamed = stepStreamed
+      break
     }
 
-    let blocks: ApiBlock[] = []
-    let stopReason = 'end_turn'
-    for await (const ev of parseStream(res!, opts.signal)) {
-      if (ev.type === 'text') yield { type: 'text', text: ev.text }
-      else if (ev.type === 'thinking') yield { type: 'thinking', text: ev.text }
-      else {
-        blocks = ev.blocks; stopReason = ev.stopReason
-        yield { type: 'usage', inputTokens: ev.usage.input, outputTokens: ev.usage.output, cacheReadTokens: ev.usage.cacheRead, cacheCreationTokens: ev.usage.cacheCreation }
-      }
-    }
     if (opts.signal?.aborted) return
     convo.push({ role: 'assistant', content: blocks })
 
     const toolUses = blocks.filter((b): b is Extract<ApiBlock, { type: 'tool_use' }> => b.type === 'tool_use')
-    if (stopReason !== 'tool_use' || toolUses.length === 0) return
+    if (stopReason !== 'tool_use' || toolUses.length === 0) {
+      // Never end a turn with a blank transcript: if the model produced no answer
+      // text and no tool call, say why (stop reason) instead of stopping silently.
+      const hadText = blocks.some((b) => b.type === 'text' && b.text.trim().length > 0)
+      if (!hadText && !streamed) {
+        const why = stopReason && stopReason !== 'end_turn' ? ` (stop reason: ${stopReason})` : ''
+        yield { type: 'text', text: `(no reply — the model ended the turn without output${why})` }
+      }
+      return
+    }
 
     // Execute every requested tool, then feed all results back as one user turn.
     const results: ApiBlock[] = []
     for (const tu of toolUses) {
       yield { type: 'tool_use', id: tu.id, name: tu.name, input: tu.input }
-      const r = await runTool(tu.name, tu.input, { cwd, signal: opts.signal, spawnAgent, onWorkflow: opts.onWorkflow })
+      const r = await runTool(tu.name, tu.input, { cwd, signal: opts.signal, spawnAgent, onWorkflow: opts.onWorkflow, onAgent: opts.onAgent })
       if (opts.signal?.aborted) return
-      yield { type: 'tool_result', id: tu.id, name: tu.name, content: r.content, isError: r.isError, linesAdded: r.linesAdded, linesRemoved: r.linesRemoved }
+      yield { type: 'tool_result', id: tu.id, name: tu.name, content: r.content, isError: r.isError, linesAdded: r.linesAdded, linesRemoved: r.linesRemoved, diff: r.diff }
       results.push({ type: 'tool_result', tool_use_id: tu.id, content: r.content, is_error: r.isError })
     }
     convo.push({ role: 'user', content: results })
@@ -268,7 +351,7 @@ async function* agent(messages: Message[], opts: StreamOpts, cfg: AnthropicOpts,
 }
 
 async function complete(messages: Message[], opts: StreamOpts, cfg: AnthropicOpts): Promise<string> {
-  const apiKey = resolveKey(cfg)
+  const apiKey = cfg.resolveKeyAsync ? await cfg.resolveKeyAsync() : resolveKey(cfg)
   if (!apiKey) throw new Error(`no ${cfg.apiKeyEnv || 'ANTHROPIC_API_KEY'}`)
   const body = {
     model: opts.model,
@@ -276,7 +359,7 @@ async function complete(messages: Message[], opts: StreamOpts, cfg: AnthropicOpt
     ...(opts.system ? { system: opts.system } : {}),
     messages: toApiMessages(messages),
   }
-  const res = await post(resolveUrl(cfg), body, apiKey, opts.signal)
+  const res = await post(resolveUrl(cfg), body, apiKey, cfg.auth, opts.signal)
   if (!res.ok) throw new Error(`API error ${res.status}`)
   const json: any = await res.json()
   return (json.content ?? []).filter((b: any) => b.type === 'text').map((b: any) => b.text).join('')

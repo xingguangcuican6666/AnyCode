@@ -1,10 +1,10 @@
 {
-  "name": "anycode",
+  "name": "meowcode",
   "version": "0.1.0",
-  "description": "AnyCode — a Claude Code–style agentic coding CLI (framework skeleton).",
+  "description": "MeowCode — a Claude Code–style agentic coding CLI (framework skeleton).",
   "type": "module",
   "bin": {
-    "anycode": "dist/cli.js"
+    "meowcode": "dist/cli.js"
   },
   "files": [
     "dist"
