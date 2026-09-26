@@ -186,6 +186,7 @@ export const messages = {
   'login.footerMethod': { zh: '↑↓/滚轮/悬停 切换 · ↵/点击 确认 · esc 取消', en: '↑↓/wheel/hover to switch · ↵/click to confirm · esc to cancel' },
   'login.footerOAuth': { zh: 'esc 取消授权', en: 'esc to cancel authorization' },
   'login.footerDefault': { zh: '↵ 下一步 · esc 取消', en: '↵ next · esc to cancel' },
+  'login.oauthManualHint': { zh: '（若无法唤起浏览器，请手动打开授权链接）', en: "(If the browser doesn't open, open the authorization link manually)" },
   // __I18N_APPEND2__
   // Message
   'message.thinking': { zh: '思考中…', en: 'Thinking…' },

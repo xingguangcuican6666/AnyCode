@@ -89,7 +89,13 @@ function openBrowser(url: string): void {
   const p = process.platform
   const cmd = p === 'darwin' ? 'open' : p === 'win32' ? 'cmd' : 'xdg-open'
   const args = p === 'win32' ? ['/c', 'start', '', url] : [url]
-  try { spawn(cmd, args, { stdio: 'ignore', detached: true }).unref() } catch { /* manual open */ }
+  try {
+    const child = spawn(cmd, args, { stdio: 'ignore', detached: true })
+    // 唤起失败（如无 xdg-open）走的是异步 'error' 事件而非同步抛错；不挂监听器它会
+    // 冒泡成未处理错误、拖垮进程。静默吞掉即可 —— 登录页已提示可手动打开授权链接。
+    child.on('error', () => { /* binary missing / 无法唤起 → 静默，用户手动打开 */ })
+    child.unref()
+  } catch { /* 同步失败也静默 */ }
 }
 
 const SUCCESS_HTML =
