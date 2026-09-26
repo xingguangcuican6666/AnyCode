@@ -1,0 +1,28 @@
+# CI: type-check and build MeowCode on every push / PR.
+# The CLI ships as an ESM bundle (tsup → dist/cli.js); there is no
+# `bun build --compile` standalone-binary step, so we stop at the bundle.
+name: build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Type-check
+        run: bun run typecheck
+
+      - name: Build
+        run: bun run build
