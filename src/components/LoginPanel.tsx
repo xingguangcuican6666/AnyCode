@@ -251,6 +251,7 @@ export function LoginPanel({ width, onSuccess, onCancel }: Props): React.ReactEl
       <Text> </Text>
       {busy ? <Text color={colors.warning}>{status || t('login.processing')}</Text> : null}
       {error ? <Text color={colors.error}>✗ {error}</Text> : null}
+      {step === 'oauth' ? <Text color={colors.dim}>{t('login.oauthManualHint')}</Text> : null}
       <Text color={colors.dim}>
         {step === 'method' ? t('login.footerMethod')
           : step === 'oauth' ? t('login.footerOAuth')
