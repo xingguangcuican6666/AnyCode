@@ -1,4 +1,4 @@
-import type { AgentEvent, Message, Provider, StreamOpts, WorkflowAgent } from '../types'
+import type { AgentEvent, AgentSnapshot, DiffLine, Message, Provider, StreamOpts, WorkflowAgent } from '../types'
 import path from 'node:path'
 import fsp from 'node:fs/promises'
 import { runTool, renderWorkflowReport } from '../tools'
@@ -15,7 +15,7 @@ function buildReply(userText: string): string {
   const quoted = (userText.trim() || '(nothing yet)')
     .split('\n').map((l) => '> ' + l).join('\n')
   return [
-    "I'm **AnyCode** on the built-in `mock` provider — no API key required, so this is a canned reply that *streams* like the real thing.",
+    "I'm **MeowCode** on the built-in `mock` provider — no API key required, so this is a canned reply that *streams* like the real thing.",
     '',
     'You said:',
     quoted,
@@ -65,6 +65,11 @@ function makeMockWorkflow(gi: number, names: string[], opts: StreamOpts, cwd: st
   const id = `${kind?.idPrefix ?? 'wf'}-mock-${gi}-${now().toString(36)}`
   const title = kind?.title ?? `workflow · ${names.length} sub-agent${names.length === 1 ? '' : 's'}`
   const agents: WorkflowAgent[] = names.map((label) => ({ label, state: 'queued', steps: 0 }))
+  // Synthetic per-agent prose so the offline demo's reports/expanded view show
+  // real-looking findings instead of "(no output)". Filled as each agent lands.
+  const texts: Array<string | undefined> = new Array(names.length)
+  const fakeReport = (label: string, steps: number): string =>
+    `Reviewed **${label}** across ${steps} tool call${steps === 1 ? '' : 's'}: read the relevant files, traced the main paths, and checked the edges. No blocking issues found; a couple of minor cleanups noted. (offline mock report)`
   let paused = false
   let waiters: Array<() => void> = []
   const wake = (): void => { const w = waiters; waiters = []; w.forEach((fn) => fn()) }
@@ -76,7 +81,7 @@ function makeMockWorkflow(gi: number, names: string[], opts: StreamOpts, cwd: st
     save: async (): Promise<string> => {
       const file = path.join(cwd, '.anycode', 'workflows', `${id}.md`)
       await fsp.mkdir(path.dirname(file), { recursive: true })
-      await fsp.writeFile(file, renderWorkflowReport(title, agents), 'utf8')
+      await fsp.writeFile(file, renderWorkflowReport(title, agents, texts), 'utf8')
       return file
     },
   }
@@ -94,13 +99,72 @@ function makeMockWorkflow(gi: number, names: string[], opts: StreamOpts, cwd: st
         agents[i].state = 'running'; agents[i].startedAt = now(); emit()
         await sleep(700 + (i % 3) * 150, opts.signal)
         if (opts.signal?.aborted) return
-        agents[i].state = 'done'; agents[i].steps = 2 + (i % 4); agents[i].elapsedMs = now() - (agents[i].startedAt ?? now()); emit()
+        agents[i].state = 'done'; agents[i].steps = 2 + (i % 4); agents[i].elapsedMs = now() - (agents[i].startedAt ?? now())
+        texts[i] = fakeReport(agents[i].label, agents[i].steps); emit()
       }
     }
     await Promise.all(Array.from({ length: Math.min(2, agents.length) }, worker))
     emit(true) // final
   }
-  return { id, names, drive, report: () => renderWorkflowReport(title, agents) }
+  return { id, names, drive, report: () => renderWorkflowReport(title, agents, texts) }
+}
+
+// Offline driver for a SWITCHABLE sub-agent (`task`/`plan`): pushes AgentSnapshot
+// updates through opts.onAgent with a synthetic own-transcript (text → tool_use →
+// tool_result → final report), so the bottom agent switcher lists it and the
+// viewport can swap to its chat with no API key. Distinct from makeMockWorkflow,
+// which drives the workflow *tree*. Returns the final report for the tool result.
+async function driveMockAgent(opts: StreamOpts, kind: 'task' | 'plan', label: string): Promise<string> {
+  const id = `${kind}-mock-${(Date.now?.() ?? 0).toString(36)}`
+  const type = kind === 'plan' ? 'plan' : 'general'
+  const startedAt = Date.now?.() ?? 0
+  const events: AgentEvent[] = []
+  let steps = 0
+  let activity = 'starting'
+  const emit = (state: AgentSnapshot['state'], done = false): void => {
+    opts.onAgent?.({
+      id, type, label, activity, state, events: events.slice(), steps, startedAt,
+      elapsedMs: done ? (Date.now?.() ?? 0) - startedAt : undefined, done,
+    })
+  }
+  const say = async (text: string): Promise<void> => {
+    activity = 'responding'
+    for (const tok of text.match(/\s+|\S+/g) ?? [text]) {
+      if (opts.signal?.aborted) return
+      const last = events[events.length - 1]
+      if (last && last.type === 'text') last.text += tok
+      else events.push({ type: 'text', text: tok })
+      emit('running')
+      await sleep(12 + Math.random() * 22, opts.signal)
+    }
+  }
+  const call = async (name: string, input: Record<string, unknown>, result: string): Promise<void> => {
+    steps++; activity = name
+    events.push({ type: 'tool_use', id: `${id}-t${steps}`, name, input })
+    emit('running')
+    await sleep(300 + Math.random() * 250, opts.signal)
+    events.push({ type: 'tool_result', id: `${id}-t${steps}`, name, content: result })
+    emit('running')
+    await sleep(120, opts.signal)
+  }
+  emit('running')
+  await sleep(250, opts.signal)
+  if (kind === 'plan') {
+    await say(`Investigating "${label}" read-only before proposing a plan.`)
+    await call('list_dir', { path: '.' }, 'src/\npackage.json\nREADME.md')
+    await call('read_file', { path: 'src/app.tsx' }, '    1\timport React from "react"\n    …')
+    const report = `**Plan for ${label}**\n\n1. Read the relevant modules and map the data flow.\n2. Make the change in the smallest cohesive unit.\n3. Verify with a typecheck + build before reporting.\n\n(offline mock plan)`
+    await say(`\n\n${report}`)
+    activity = 'done'; emit('done', true)
+    return report
+  }
+  await say(`Working on "${label}". Let me look around first.`)
+  await call('read_file', { path: 'package.json' }, '{ "name": "meowcode", "version": "…" }')
+  await call('grep', { pattern: label.split(' ')[0] || 'TODO' }, 'src/app.tsx:42: // …\nsrc/tools/impl.ts:100: // …')
+  const report = `Reviewed **${label}**: read the entry points, traced the main path, and checked the edges. No blocking issues; a couple of minor cleanups noted. (offline mock sub-agent)`
+  await say(`\n\n${report}`)
+  activity = 'done'; emit('done', true)
+  return report
 }
 
 // A deterministic mini-agent so the tool-use loop + UI can be exercised with no
@@ -155,26 +219,46 @@ async function* agent(messages: Message[], opts: StreamOpts): AsyncGenerator<Age
     return
   }
 
-  // Demo a SINGLE sub-agent getting the same live collapsed line + expandable
-  // tree as a workflow (Feature: subagent 同样处理). `task: <label>` and
-  // `plan: <label>` each drive a one-agent snapshot through the same channel, so
-  // esc-return-doesn't-interrupt / below-input placement all apply identically.
+  // Demo a SINGLE switchable sub-agent (Feature: subagent = 可切换的 agent 视图).
+  // `task: <label>` / `plan: <label>` drive a synthetic own-transcript through
+  // opts.onAgent, so the bottom agent switcher lists it and ↓→↵ swaps the viewport
+  // to the sub-agent's OWN chat — conceptually distinct from the workflow tree.
   {
     const m = /^(task|plan):\s*([\s\S]*)/i.exec(trimmed)
     if (m) {
       const kind = m[1].toLowerCase() as 'task' | 'plan'
       const label = m[2].trim() || (kind === 'plan' ? 'draft a plan' : 'a sub-task')
-      const wf = makeMockWorkflow(0, [label], opts, cwd, { title: `${kind} · ${label}`, idPrefix: kind })
-      yield { type: 'tool_use', id: wf.id, name: kind, input: { description: label } }
-      await wf.drive()
+      const id = `${kind}-mock-call-${Date.now?.() ?? 0}`
+      yield { type: 'tool_use', id, name: kind, input: { description: label } }
+      const report = await driveMockAgent(opts, kind, label)
       if (opts.signal?.aborted) return
-      yield { type: 'tool_result', id: wf.id, name: kind, content: wf.report() }
+      const head = kind === 'plan' ? `▸ plan "${label}"` : `▸ sub-agent "${label}"`
+      yield { type: 'tool_result', id, name: kind, content: `${head}\n\n${report}` }
       const hint = kind === 'plan'
-        ? 'Plan ready. Press ↓ then ↵ to expand the plan sub-agent; esc returns without interrupting.'
-        : 'Sub-agent finished. Press ↓ then ↵ to expand it; esc returns without interrupting.'
+        ? "Plan ready. Press ↓ to open the agent switcher, ↵ to view the plan sub-agent's OWN transcript; esc switches back."
+        : 'Sub-agent finished. Press ↓ to open the agent switcher, ↵ to view its OWN transcript; x stops a running one.'
       for await (const ev of streamText(`\n\n${hint}`, opts)) yield ev
       return
     }
+  }
+
+  // `diff:` — demo the write/edit diff view without touching the filesystem:
+  // synthesize an edit_file tool call + a canned unified diff so the transcript
+  // renders "⏺ Update(path)" + a line-numbered +/- view.
+  if (/^diff:/i.test(trimmed)) {
+    for await (const ev of streamText(`Editing \`src/greeter.ts\` to demo the diff view:`, opts)) yield ev
+    if (opts.signal?.aborted) return
+    const id = `mock_${Date.now?.() ?? '0'}`
+    yield { type: 'tool_use', id, name: 'edit_file', input: { path: 'src/greeter.ts', old_string: 'Hello', new_string: 'Hi there' } }
+    const demoDiff: DiffLine[] = [
+      { tag: 'context', text: 'export function greet(name: string) {', oldNo: 1, newNo: 1 },
+      { tag: 'del', text: '  return `Hello, ${name}!`', oldNo: 2 },
+      { tag: 'add', text: '  return `Hi there, ${name}!`', newNo: 2 },
+      { tag: 'context', text: '}', oldNo: 3, newNo: 3 },
+    ]
+    yield { type: 'tool_result', id, name: 'edit_file', content: 'edited src/greeter.ts (1 replacement)', linesAdded: 1, linesRemoved: 1, diff: demoDiff }
+    for await (const ev of streamText(`\n\nThat's the diff view above.`, opts)) yield ev
+    return
   }
 
   const triggers: Array<[RegExp, string, (v: string) => Record<string, unknown>]> = [
@@ -192,7 +276,7 @@ async function* agent(messages: Message[], opts: StreamOpts): AsyncGenerator<Age
     yield { type: 'tool_use', id, name: tool, input }
     const r = await runTool(tool, input, { cwd, signal: opts.signal })
     if (opts.signal?.aborted) return
-    yield { type: 'tool_result', id, name: tool, content: r.content, isError: r.isError }
+    yield { type: 'tool_result', id, name: tool, content: r.content, isError: r.isError, linesAdded: r.linesAdded, linesRemoved: r.linesRemoved, diff: r.diff }
     for await (const ev of streamText(`\n\nThat's the \`${tool}\` output above.`, opts)) yield ev
     return
   }

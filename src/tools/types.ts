@@ -2,7 +2,7 @@
 // file, run a shell command, search by content or by name). A ToolDef couples
 // the model-facing schema (name/description/JSON schema, in Anthropic's tool
 // format) with a `run` that actually performs the action and returns text.
-import type { WorkflowSnapshot } from '../types'
+import type { AgentSnapshot, DiffLine, WorkflowSnapshot } from '../types'
 
 export interface ToolResult {
   content: string
@@ -11,6 +11,10 @@ export interface ToolResult {
   // file-mutating tools (write_file/edit_file); absent for read-only tools.
   linesAdded?: number
   linesRemoved?: number
+  // A unified diff of the change (line numbers + context/+/- rows), set by
+  // write_file/edit_file so the UI can render a collapsible diff view. Absent
+  // for read-only tools, or when the file is too large to diff.
+  diff?: DiffLine[]
 }
 
 export interface ToolContext {
@@ -27,6 +31,10 @@ export interface ToolContext {
   // render a live tree. Threaded from StreamOpts.onWorkflow by the agent loop.
   // Absent = no live reporting (the workflow still runs and returns its report).
   onWorkflow?: (snap: WorkflowSnapshot) => void
+  // Live sink for `task`/`plan` sub-agents surfaced as switchable transcripts:
+  // called with a fresh snapshot each time the sub-agent emits an event. Threaded
+  // from StreamOpts.onAgent by the agent loop. Absent = no switchable view.
+  onAgent?: (snap: AgentSnapshot) => void
 }
 
 export interface SpawnOpts {
@@ -35,6 +43,10 @@ export interface SpawnOpts {
   system?: string
   // Short human label for the sub-task (shown in the returned report).
   label?: string
+  // Called with each event the sub-agent emits (text/tool_use/tool_result/…), so
+  // the orchestrating tool can accumulate the sub-agent's live transcript and
+  // surface it through ctx.onAgent. Absent = the caller only wants the final result.
+  onEvent?: (ev: import('../types').AgentEvent) => void
 }
 
 export interface SpawnResult {

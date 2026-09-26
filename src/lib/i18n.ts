@@ -1,0 +1,497 @@
+/**
+ * Lightweight internationalization for MeowCode — a feature Claude Code lacks.
+ *
+ * Design mirrors ./theme.ts: a React context carries the active language down the
+ * tree so a language switch re-renders the whole UI, and a module-level mirror
+ * (`getLang`/`setLang`) lets non-React code (commands, lib helpers) translate too.
+ * No external dependency — the catalog is a plain object of `{ zh, en }` pairs and
+ * `t()` does simple `{name}` interpolation, matching the project's dependency-light
+ * style. See [[anycode-project]].
+ *
+ * The active language comes from the `language` setting (auto | zh | en); `auto`
+ * resolves from the shell locale (LANG/LC_ALL). app.tsx wires the provider and
+ * keeps the module mirror in sync.
+ */
+import { createContext, useContext } from 'react'
+
+export type Lang = 'zh' | 'en'
+export type LangSetting = 'auto' | Lang
+export const AUTO_LANG: LangSetting = 'auto'
+export const LANG_VALUES: LangSetting[] = ['auto', 'zh', 'en']
+
+// Best-effort locale sniff for `auto`: a zh* locale → Chinese, otherwise English.
+export function detectLang(): Lang {
+  const env = (process.env.LC_ALL || process.env.LC_MESSAGES || process.env.LANG || '').toLowerCase()
+  return env.startsWith('zh') ? 'zh' : 'en'
+}
+
+// Map the stored setting to a concrete language ('auto'/unknown → locale sniff).
+export function resolveLang(setting: string | undefined): Lang {
+  return setting === 'zh' || setting === 'en' ? setting : detectLang()
+}
+
+export type Params = Record<string, string | number>
+
+function interpolate(s: string, params?: Params): string {
+  if (!params) return s
+  return s.replace(/\{(\w+)\}/g, (whole, k: string) => (k in params ? String(params[k]) : whole))
+}
+
+// The message catalog. One entry per id, both languages required so a missing
+// translation is a compile error rather than a runtime fallback to a raw key.
+export const messages = {
+  // ThemePicker
+  'theme.title': { zh: '主题', en: 'Theme' },
+  'theme.subtitle': { zh: '选择最适合你终端的配色', en: 'Choose the palette that looks best with your terminal' },
+  'theme.autoOption': { zh: '自动（匹配终端）', en: 'Auto (match terminal)' },
+  'theme.footer': { zh: '↑↓/滚轮 选择 · 1-{n} 跳转 · ↵/点击 确认 · esc 取消', en: '↑↓/wheel select · 1-{n} jump · ↵/click confirm · esc cancel' },
+  // SessionPicker (/resume)
+  'resume.title': { zh: '恢复会话', en: 'Resume session' },
+  'resume.subtitle': { zh: '选择一个此前保存的会话继续', en: 'Pick a saved session to continue' },
+  'resume.empty': { zh: '暂无已保存的会话 —— 对话产生内容后会自动保存。', en: 'No saved sessions yet — they autosave once a conversation has content.' },
+  'resume.footer': { zh: '↑↓/滚轮 选择 · 1-9 跳转 · ↵/点击 恢复 · esc 取消', en: '↑↓/wheel select · 1-9 jump · ↵/click resume · esc cancel' },
+  'resume.meta': { zh: '{n} 条 · {age}', en: '{n} msgs · {age}' },
+  'resume.justNow': { zh: '刚刚', en: 'just now' },
+  'resume.minsAgo': { zh: '{n} 分钟前', en: '{n}m ago' },
+  'resume.hoursAgo': { zh: '{n} 小时前', en: '{n}h ago' },
+  'resume.daysAgo': { zh: '{n} 天前', en: '{n}d ago' },
+  // Footer hint line (app.tsx bottom row) — one variant per input/scroll/stream state
+  'footer.exitArmed': { zh: '再次按 ctrl+c 退出', en: 'press ctrl+c again to exit' },
+  'footer.scrolled': { zh: 'PgUp/PgDn 翻页 · 滚轮滚动 · esc/ctrl+End 回到底部', en: 'PgUp/PgDn page · wheel scroll · esc/ctrl+End to resume' },
+  'footer.agentSel': { zh: '↑↓ 选择 · ↵ 查看子智能体 · x 停止 · esc 取消', en: '↑↓ select · ↵ view agent · x stop · esc cancel' },
+  'footer.wfSel': { zh: '↑↓ 选择 · ↵ 展开 · esc 取消', en: '↑↓ select · ↵ expand · esc cancel' },
+  'footer.viewingStreaming': { zh: '正在查看子智能体 · ↓ 切回 · esc 中断', en: 'viewing sub-agent · ↓ switch back · esc interrupt' },
+  'footer.viewingIdle': { zh: '正在查看子智能体 · ↓ 切回 · esc 返回', en: 'viewing sub-agent · ↓ switch back · esc' },
+  'footer.streamAgents': { zh: '↓ 切换智能体 · PgUp 滚动 · esc 中断', en: '↓ switch agent · PgUp scroll · esc to interrupt' },
+  'footer.streamWorkflows': { zh: '↓ 选择工作流 · PgUp 滚动 · esc 中断', en: '↓ select workflow · PgUp scroll · esc to interrupt' },
+  'footer.streaming': { zh: '↵ 边处理边排队消息 · PgUp 滚动 · esc 中断', en: '↵ queue a message while working · PgUp scroll · esc to interrupt' },
+  'footer.idleAgents': { zh: '↓ 切换智能体 · ↵ 发送 · PgUp 滚动 · ctrl+c 退出', en: '↓ switch agent · ↵ send · PgUp scroll · ctrl+c to exit' },
+  'footer.idle': { zh: '↵ 发送 · ↑↓ 历史 · PgUp 滚动 · /help 命令 · ctrl+c 退出', en: '↵ send · ↑↓ history · PgUp scroll · /help commands · ctrl+c to exit' },
+  // PromptInput command menu
+  'menu.footer': { zh: '↑↓ 选择 · ↵ 运行 · tab 补全 · esc 关闭', en: '↑↓ select · ↵ run · tab complete · esc dismiss' },
+  // StatsView
+  'stats.tab.overview': { zh: '总览', en: 'Overview' },
+  'stats.tab.models': { zh: '模型', en: 'Models' },
+  'stats.empty': { zh: '暂无累计统计 —— 随着你使用 MeowCode 会逐渐积累。', en: 'No lifetime stats yet — they accrue as you use MeowCode.' },
+  'stats.range': { zh: '范围', en: 'Range' },
+  'stats.cost': { zh: '花费（范围）', en: 'Cost (range)' },
+  'stats.tokens': { zh: 'Token（范围）', en: 'Tokens (range)' },
+  'stats.tokensValue': { zh: '{tokens}  ·  {turns} 轮', en: '{tokens}  ·  {turns} turns' },
+  'stats.activeDays': { zh: '活跃天数', en: 'Active days' },
+  'stats.sessions': { zh: '会话数', en: 'Sessions' },
+  'stats.streak': { zh: '连续天数', en: 'Streak' },
+  'stats.streakValue': { zh: '{cur} 天 · 最长 {longest}', en: '{cur} days · longest {longest}' },
+  'stats.longestSession': { zh: '最长会话', en: 'Longest session' },
+  'stats.mostActiveDay': { zh: '最活跃的一天', en: 'Most active day' },
+  'stats.topModel': { zh: '常用模型', en: 'Top model' },
+  'stats.heatLess': { zh: '少', en: 'Less' },
+  'stats.heatMore': { zh: '多', en: 'More' },
+  'stats.modelsTitle': { zh: '各模型 Token 占比（全部时间）', en: 'Models by tokens (all-time)' },
+  'stats.noModels': { zh: '尚未记录任何模型用量。', en: 'No model usage recorded yet.' },
+  // SettingsPanel — tabs
+  'tab.status': { zh: '状态', en: 'Status' },
+  'tab.config': { zh: '配置', en: 'Config' },
+  'tab.usage': { zh: '用量', en: 'Usage' },
+  'tab.stats': { zh: '统计', en: 'Stats' },
+  // SettingsPanel — chrome
+  'panel.title': { zh: '设置', en: 'Settings' },
+  'panel.searchSettings': { zh: '搜索设置…', en: 'Search settings…' },
+  'panel.searchOptions': { zh: '搜索选项…', en: 'Search options…' },
+  'panel.noMatch': { zh: '没有匹配的设置', en: 'no matching settings' },
+  'panel.moreAbove': { zh: '↑ 上面还有 {n} 项', en: '↑ {n} more above' },
+  'panel.moreBelow': { zh: '↓ 下面还有 {n} 项', en: '↓ {n} more below' },
+  // SettingsPanel — core row labels
+  'core.provider': { zh: '提供方', en: 'Provider' },
+  'core.model': { zh: '模型', en: 'Model' },
+  'core.theme': { zh: '主题', en: 'Theme' },
+  'core.system': { zh: '系统提示词', en: 'System prompt' },
+  'core.apiKey': { zh: 'API 密钥', en: 'API key' },
+  // SettingsPanel — value column
+  'val.setFromEnv': { zh: '已设置（来自环境变量）', en: 'set (from env)' },
+  'val.notSet': { zh: '未设置', en: 'not set' },
+  'val.custom': { zh: '自定义', en: 'custom' },
+  'val.default': { zh: '默认', en: 'default' },
+  'val.withDefault': { zh: '{base}（默认）', en: '{base} (default)' },
+  // SettingsPanel — focused-row hints
+  'hint.setting': { zh: '{desc}。可选：{hint}。', en: '{desc}. Accepts: {hint}.' },
+  'hint.apikey': { zh: '从 ANTHROPIC_API_KEY 读取——不会在此设置或存储。', en: 'Read from ANTHROPIC_API_KEY — never set or stored here.' },
+  'hint.enum': { zh: '用 Enter/空格 循环切换。可选：{opts}。', en: 'Cycle with Enter/Space. Options: {opts}.' },
+  'hint.text': { zh: '按 Enter 编辑，留空则清除。', en: 'Press Enter to edit. Empty value clears it.' },
+  // SettingsPanel — footers
+  'footer.editing': { zh: '输入 · ↵ 保存 · esc 取消', en: 'type · ↵ save · esc cancel' },
+  'footer.stats': { zh: '↑↓ 移动 · ↵/空格 修改 · ←→ 切换标签 · esc 关闭', en: '↑↓ move · ↵/space change · ←→ tabs · esc close' },
+  'footer.readonly': { zh: '←→ 切换标签 · esc 关闭', en: '←→ tabs · esc close' },
+  'footer.searchClear': { zh: '输入以筛选 · ↓/↵ 进入列表 · esc 清空 · ←→ 切换标签', en: 'type to filter · ↓/↵ list · esc clear · ←→ tabs' },
+  'footer.searchClose': { zh: '输入以筛选 · ↓/↵ 进入列表 · esc 关闭 · ←→ 切换标签', en: 'type to filter · ↓/↵ list · esc close · ←→ tabs' },
+  'footer.list': { zh: '↑↓ 移动 · ↵/空格 修改 · / 搜索 · ←→ 切换标签 · esc 关闭', en: '↑↓ move · ↵/space change · / search · ←→ tabs · esc close' },
+  // SettingsPanel — Status tab labels (padded by display width at render)
+  'status.cwd': { zh: '工作目录', en: 'cwd' },
+  'status.providerModel': { zh: '提供方/模型', en: 'provider/model' },
+  'status.apiKey': { zh: 'API 密钥', en: 'api key' },
+  'status.context': { zh: '上下文', en: 'context' },
+  'status.session': { zh: '会话', en: 'session' },
+  'status.goal': { zh: '目标', en: 'goal' },
+  'status.loop': { zh: '循环', en: 'loop' },
+  'status.set': { zh: '已设置', en: 'set' },
+  'status.notSet': { zh: '未设置', en: 'not set' },
+  'status.sessionValue': { zh: '{turns} 轮 · {tokens} token · {tools} 次工具调用 · {compactions} 次压缩', en: '{turns} turns · {tokens} tokens · {tools} tool calls · {compactions} compactions' },
+  'status.countsLine': { zh: '笔记 {notes} · 技能 {skills} · 自定义命令 {custom}', en: 'notes {notes} · skills {skills} · custom commands {custom}' },
+  // SettingsPanel — Usage tab
+  'usage.sectionSession': { zh: '会话', en: 'Session' },
+  'usage.sectionUsage': { zh: '用量', en: 'Usage' },
+  'usage.sectionContext': { zh: '上下文窗口', en: 'Context window' },
+  'usage.totalCost': { zh: '总花费', en: 'Total cost' },
+  'usage.durationApi': { zh: '总耗时（API）', en: 'Total duration (API)' },
+  'usage.durationWall': { zh: '总耗时（实际）', en: 'Total duration (wall)' },
+  'usage.codeChanges': { zh: '代码改动', en: 'Total code changes' },
+  'usage.codeChangesValue': { zh: '+{added} · -{removed}', en: '{added} added · {removed} removed' },
+  'usage.turnsTools': { zh: '轮次 · 工具调用', en: 'Turns · tool calls' },
+  'usage.input': { zh: '输入', en: 'Input' },
+  'usage.output': { zh: '输出', en: 'Output' },
+  'usage.cacheRead': { zh: '缓存读取', en: 'Cache read' },
+  'usage.cacheWrite': { zh: '缓存写入', en: 'Cache write' },
+  'usage.totalTokens': { zh: 'Token 合计', en: 'Total tokens' },
+  'usage.ctxUsed': { zh: '已用 {used} / {limit}  ·  剩余 {remaining}', en: 'used {used} / {limit}  ·  remaining {remaining}' },
+  // __I18N_APPEND__
+  // LoginPanel
+  'login.oauthStarting': { zh: '正在启动浏览器授权…', en: 'Starting browser authorization…' },
+  'login.oauthFailed': { zh: 'OAuth 登录失败', en: 'OAuth login failed' },
+  'login.fetchingRelayKey': { zh: '正在获取中转密钥…', en: 'Fetching relay key…' },
+  'login.noRelayToken': { zh: '登录成功，但账号下没有可用的中转令牌。请在面板创建一个令牌，或改用「粘贴密钥」方式。', en: 'Login succeeded, but this account has no available relay token. Create one in the panel, or use the "Paste key" method instead.' },
+  'login.loggingIn': { zh: '正在登录…', en: 'Logging in…' },
+  'login.loginFailed': { zh: '登录失败', en: 'Login failed' },
+  'login.loginResponseError': { zh: '登录响应异常', en: 'Unexpected login response' },
+  'login.verifying2FA': { zh: '正在校验验证码…', en: 'Verifying code…' },
+  'login.verify2FAFailed': { zh: '验证码校验失败', en: 'Verification code check failed' },
+  'login.errBaseRequired': { zh: '请填写面板地址', en: 'Please enter the panel URL' },
+  'login.errClientIdRequired': { zh: '请填写应用 Client ID', en: 'Please enter the app Client ID' },
+  'login.errKeyRequired': { zh: '请粘贴中转密钥', en: 'Please paste the relay key' },
+  'login.errUsernameRequired': { zh: '请填写用户名', en: 'Please enter a username' },
+  'login.title': { zh: '登录 MeowArch API', en: 'Log in to MeowArch API' },
+  'login.subtitle': { zh: '凭据只写入 ~/.anycode/credentials.json（0600），不会出现在对话记录里', en: 'Credentials are written only to ~/.anycode/credentials.json (0600), never shown in the conversation log' },
+  'login.fieldBase': { zh: '面板地址', en: 'Panel URL' },
+  'login.methodLabel': { zh: '登录方式', en: 'Login method' },
+  'login.methodOAuth': { zh: '1. 浏览器登录 (OAuth · 推荐)', en: '1. Browser login (OAuth · recommended)' },
+  'login.methodKey': { zh: '2. 粘贴中转密钥 (sk-…)', en: '2. Paste relay key (sk-…)' },
+  'login.methodPassword': { zh: '3. 用户名 + 密码', en: '3. Username + password' },
+  'login.fieldClientId': { zh: '应用 Client ID', en: 'App Client ID' },
+  'login.clientIdPlaceholder': { zh: 'cli_…（在 MeowArch API「注册应用」创建后获得）', en: 'cli_… (obtained after creating an app via "Register App" in MeowArch API)' },
+  'login.fieldKey': { zh: '中转密钥', en: 'Relay key' },
+  'login.fieldUsername': { zh: '用户名', en: 'Username' },
+  'login.usernamePlaceholder': { zh: '你的用户名', en: 'Your username' },
+  'login.fieldPassword': { zh: '密码', en: 'Password' },
+  'login.field2FA': { zh: '两步验证码', en: 'Two-factor code' },
+  'login.twofaPlaceholder': { zh: '6 位验证码', en: '6-digit code' },
+  'login.processing': { zh: '处理中…', en: 'Processing…' },
+  'login.footerMethod': { zh: '↑↓/滚轮/悬停 切换 · ↵/点击 确认 · esc 取消', en: '↑↓/wheel/hover to switch · ↵/click to confirm · esc to cancel' },
+  'login.footerOAuth': { zh: 'esc 取消授权', en: 'esc to cancel authorization' },
+  'login.footerDefault': { zh: '↵ 下一步 · esc 取消', en: '↵ next · esc to cancel' },
+  // __I18N_APPEND2__
+  // Message
+  'message.thinking': { zh: '思考中…', en: 'Thinking…' },
+  'message.lineAbove': { zh: '⋮ +{count} 行以上', en: '⋮ +{count} line above' },
+  'message.linesAbove': { zh: '⋮ +{count} 行以上', en: '⋮ +{count} lines above' },
+  'message.thought': { zh: '已思考', en: 'Thought' },
+  'message.thoughtFor': { zh: '已思考 {seconds}s', en: 'Thought for {seconds}s' },
+  'message.lineAboveScrollback': { zh: '⋮ +{count} 行以上（在回滚缓冲区中）', en: '⋮ +{count} line above (in scrollback)' },
+  'message.linesAboveScrollback': { zh: '⋮ +{count} 行以上（在回滚缓冲区中）', en: '⋮ +{count} lines above (in scrollback)' },
+  'message.interrupted': { zh: '⎿ 已中断', en: '⎿ interrupted' },
+  // WorkflowView
+  'workflow.pausedSuffix': { zh: ' · 已暂停', en: ' · paused' },
+  'workflow.doneSuffix': { zh: ' · 已完成', en: ' · done' },
+  'workflow.expandHint': { zh: '  ·  ↵ 展开', en: '  ·  ↵ expand' },
+  'workflow.selectHint': { zh: '  ·  ↓ 选择', en: '  ·  ↓ select' },
+  'workflow.complete': { zh: '{completed}/{total} 已完成', en: '{completed}/{total} complete' },
+  'workflow.saveUnavailable': { zh: '无法保存', en: 'save unavailable' },
+  'workflow.saving': { zh: '保存中…', en: 'saving…' },
+  'workflow.saved': { zh: '已保存 → {path}', en: 'saved → {path}' },
+  'workflow.saveFailed': { zh: '保存失败：{error}', en: 'save failed: {error}' },
+  'workflow.detailRunning': { zh: '运行中 {seconds}s', en: 'running {seconds}s' },
+  'workflow.detailDone': { zh: '已完成', en: 'done' },
+  'workflow.detailDoneIn': { zh: '，用时 {seconds}s', en: ' in {seconds}s' },
+  'workflow.detailToolCall': { zh: ' · {steps} 次工具调用', en: ' · {steps} tool call' },
+  'workflow.detailToolCalls': { zh: ' · {steps} 次工具调用', en: ' · {steps} tool calls' },
+  'workflow.detailError': { zh: '错误：{error}', en: 'error: {error}' },
+  'workflow.detailFailed': { zh: '失败', en: 'failed' },
+  'workflow.detailQueued': { zh: '排队中', en: 'queued' },
+  'workflow.pause': { zh: '暂停', en: 'pause' },
+  'workflow.resume': { zh: '恢复', en: 'resume' },
+  'workflow.help': { zh: '  ↑↓ 选择 · p {action} · s 保存 · x 停止 · esc 返回', en: '  ↑↓ select · p {action} · s save · x stop · esc back' },
+  // ModelPicker
+  'model.title': { zh: '选择模型', en: 'Select model' },
+  'model.subtitle': { zh: '从 API 拉取的可用模型中选择 · 输入可搜索', en: 'Choose from models fetched via the API · type to search' },
+  'model.searchLabel': { zh: '❯ 搜索: ', en: '❯ Search: ' },
+  'model.searchPlaceholder': { zh: '输入模型名筛选…', en: 'Type a model name to filter…' },
+  'model.loading': { zh: '正在拉取模型列表…', en: 'Fetching model list…' },
+  'model.fetchError': { zh: '拉取模型列表失败', en: 'Failed to fetch model list' },
+  'model.noMatch': { zh: '没有匹配的模型', en: 'No matching models' },
+  'model.noMatchHint': { zh: '（↵ 直接设置输入的名称）', en: ' (↵ set the typed name directly)' },
+  'model.allGroups': { zh: '所有分组', en: 'All groups' },
+  'model.descPrefix': { zh: '说明：{desc}', en: 'Description: {desc}' },
+  'model.hintSelect': { zh: '↑↓/滚轮 选择', en: '↑↓/wheel select' },
+  'model.hintSwitchGroup': { zh: ' · ←→ 换分组', en: ' · ←→ switch group' },
+  'model.hintConfirm': { zh: ' · ↵/点击 确认 · esc 取消', en: ' · ↵/click confirm · esc cancel' },
+  // StatusLine / Banner / AgentSwitcher
+  'statusline.meter': { zh: '({elapsed}s · {arrow} {tokens} tokens{suffix} · 按 esc 中断)', en: '({elapsed}s · {arrow} {tokens} tokens{suffix} · esc to interrupt)' },
+  'banner.welcome': { zh: '欢迎使用 {name}', en: 'Welcome to {name}' },
+  'banner.tagline': { zh: '一个 Claude Code 风格的编码智能体', en: 'a Claude Code–style coding agent' },
+  'banner.cwd': { zh: '工作目录  {cwd}', en: 'cwd  {cwd}' },
+  'banner.help': { zh: ' 命令 · ', en: ' commands · ' },
+  'banner.model': { zh: ' 切换模型 · ', en: ' switch models · ' },
+  'banner.exit': { zh: ' 退出', en: ' quit' },
+  'agentsw.title': { zh: '代理', en: 'agents' },
+  'agentsw.hintSelecting': { zh: ' · ↑↓ 选择 · ↵ 查看 · x 停止', en: ' · ↑↓ select · ↵ view · x stop' },
+  'agentsw.hintSwitch': { zh: ' · ↓ 切换', en: ' · ↓ to switch' },
+  'agentsw.steps': { zh: ' · {n} 步', en: ' · {n} step{s}' },
+  // __I18N_APPEND3__
+  // commands (src/commands/index.ts)
+  'cmd.helpDesc': { zh: '显示可用命令', en: 'Show available commands' },
+  'cmd.helpTitle': { zh: '**MeowCode 命令**', en: '**MeowCode commands**' },
+  'cmd.clearDesc': { zh: '清空对话和屏幕', en: 'Clear the conversation and screen' },
+  'cmd.modelDesc': { zh: '查看或设置模型 —— /model 打开选择器，/model <name> 直接设置', en: 'Show or set the model — /model opens the picker, /model <name> sets it directly' },
+  'cmd.modelCurrent': { zh: '当前模型：`{model}` · 服务商 `{provider}`', en: 'Current model: `{model}` · provider `{provider}`' },
+  'cmd.modelSet': { zh: '模型已设为 `{model}`。', en: 'Model set to `{model}`.' },
+  'cmd.effortDesc': { zh: '查看或设置推理投入 —— 例如 /effort high（{levels}）', en: 'Show or set reasoning effort — e.g. /effort high ({levels})' },
+  'cmd.effortCurrent': { zh: '推理投入：`{cur}`。用 `/effort <level>` 设置 —— {levels}。', en: 'Reasoning effort: `{cur}`. Set with `/effort <level>` — {levels}.' },
+  'cmd.effortUnknown': { zh: '未知的推理投入 `{effort}`。请从以下选择：{levels}。', en: 'Unknown effort `{effort}`. Choose one of: {levels}.' },
+  'cmd.effortSet': { zh: '推理投入已设为 `{effort}`。', en: 'Reasoning effort set to `{effort}`.' },
+  'cmd.providerDesc': { zh: '查看或切换服务商（mock | anthropic | default | custom）', en: 'Show or switch provider (mock | anthropic | default | custom)' },
+  'cmd.providerCurrent': { zh: '当前服务商：`{provider}`。可用：{names}。', en: 'Current provider: `{provider}`. Available: {names}.' },
+  'cmd.providerUnknown': { zh: '未知服务商 `{provider}`。可用：{names}。', en: 'Unknown provider `{provider}`. Available: {names}.' },
+  'cmd.providerSet': { zh: '服务商已设为 `{provider}`。', en: 'Provider set to `{provider}`.' },
+  'cmd.configDesc': { zh: '查看或设置配置 —— /config、/config <key> [value]', en: 'Show or set configuration — /config, /config <key> [value]' },
+  'cmd.configTitle': { zh: '**配置**', en: '**Configuration**' },
+  'cmd.configCore': { zh: '**核心**', en: '**Core**' },
+  'cmd.configSystemCustom': { zh: '`自定义`', en: '`custom`' },
+  'cmd.configSystemDefault': { zh: '`默认`', en: '`default`' },
+  'cmd.configApiKeySet': { zh: '`已设置（来自环境变量）`', en: '`set (from env)`' },
+  'cmd.configApiKeyUnset': { zh: '`未设置`', en: '`not set`' },
+  'cmd.configReadonly': { zh: '_(只读)_', en: '_(read-only)_' },
+  'cmd.configFooter': { zh: '用 `/config <key> <value>` 设置 · 用 `/config <key>` 查看单项。', en: 'Set with `/config <key> <value>` · inspect one with `/config <key>`.' },
+  'cmd.settingInfo': { zh: '`{key}`：`{value}` —— {label}。可接受：{hint}。', en: '`{key}`: `{value}` — {label}. Accepts: {hint}.' },
+  'cmd.settingInvalid': { zh: '`{key}` 的值无效 —— {error}。', en: 'Invalid value for `{key}` — {error}.' },
+  'cmd.settingSet': { zh: '`{key}` 已设为 `{value}`。', en: '`{key}` set to `{value}`.' },
+  'cmd.configProviderInfo': { zh: 'provider：`{provider}`。可用：{names}。', en: 'provider: `{provider}`. Available: {names}.' },
+  'cmd.configProviderSet': { zh: 'provider 已设为 `{provider}`。', en: 'provider set to `{provider}`.' },
+  'cmd.configModelInfo': { zh: 'model：`{model}`。', en: 'model: `{model}`.' },
+  'cmd.configModelSet': { zh: 'model 已设为 `{model}`。', en: 'model set to `{model}`.' },
+  'cmd.configThemeInfo': { zh: 'theme：`{theme}`。', en: 'theme: `{theme}`.' },
+  'cmd.configThemeSet': { zh: 'theme 已设为 `{theme}`。', en: 'theme set to `{theme}`.' },
+  'cmd.configSystemSet': { zh: '已设置自定义系统提示词。', en: 'Custom system prompt set.' },
+  'cmd.configSystemCleared': { zh: '已清除自定义系统提示词。', en: 'Custom system prompt cleared.' },
+  'cmd.configApiKeyReadonly': { zh: '`apiKey` 从 `ANTHROPIC_API_KEY` 环境变量读取，不会在此设置或存储。', en: '`apiKey` is read from the `ANTHROPIC_API_KEY` environment variable and is never set or stored here.' },
+  'cmd.configUnknownKey': { zh: '未知配置项 `{key}`。运行 `/config` 查看所有配置项。', en: 'Unknown config key `{key}`. Run `/config` to see all keys.' },
+  'cmd.themeUnknown': { zh: '未知主题 `{theme}`。可用：{names}。', en: 'Unknown theme `{theme}`. Available: {names}.' },
+  'cmd.usageDesc': { zh: '显示本次会话的 token 用量和上下文窗口占用', en: 'Show session token usage and context-window fill' },
+  'cmd.usageTitle': { zh: '**会话用量**', en: '**Session usage**' },
+  'cmd.usageTurns': { zh: '- 轮次：`{n}`', en: '- turns: `{n}`' },
+  'cmd.usageInput': { zh: '- 输入 token：`{n}`', en: '- input tokens: `{n}`' },
+  'cmd.usageOutput': { zh: '- 输出 token：`{n}`', en: '- output tokens: `{n}`' },
+  'cmd.usageTotal': { zh: '- 总 token：`{n}`', en: '- total tokens: `{n}`' },
+  'cmd.usageToolCalls': { zh: '- 工具调用：`{n}`', en: '- tool calls: `{n}`' },
+  'cmd.usageCompactions': { zh: '- 压缩次数：`{n}`', en: '- compactions: `{n}`' },
+  'cmd.usageContextWindow': { zh: '**上下文窗口**', en: '**Context window**' },
+  'cmd.usageUsed': { zh: '- 已用：`{used}` / `{limit}` · 剩余 `{remaining}`', en: '- used: `{used}` / `{limit}` · remaining `{remaining}`' },
+  // __I18N_APPEND4__
+  'cmd.statusDesc': { zh: '显示状态面板（版本、配置、上下文、目标、笔记）', en: 'Show a status panel (version, config, context, goal, notes)' },
+  'cmd.statusCwd': { zh: '- 当前目录：`{cwd}`', en: '- cwd: `{cwd}`' },
+  'cmd.statusProviderModel': { zh: '- 服务商 / 模型：`{provider}` / `{model}`', en: '- provider / model: `{provider}` / `{model}`' },
+  'cmd.statusApiTheme': { zh: '- API 密钥：{apiKey} · 主题：`{theme}`', en: '- api key: {apiKey} · theme: `{theme}`' },
+  'cmd.statusSet': { zh: '`已设置`', en: '`set`' },
+  'cmd.statusNotSet': { zh: '`未设置`', en: '`not set`' },
+  'cmd.statusContext': { zh: '- 上下文：{bar} {pct}%（{level}）', en: '- context: {bar} {pct}% ({level})' },
+  'cmd.statusSession': { zh: '- 会话：`{turns}` 轮 · `{tokens}` token · `{toolCalls}` 次工具调用 · `{compactions}` 次压缩', en: '- session: `{turns}` turns · `{tokens}` tokens · `{toolCalls}` tool calls · `{compactions}` compactions' },
+  'cmd.statusGoal': { zh: '- 目标：{goal}', en: '- goal: {goal}' },
+  'cmd.statusLoop': { zh: '- 循环：{loop}', en: '- loop: {loop}' },
+  'cmd.statusNotes': { zh: '- 笔记：`{notes}` · 技能：`{skills}` · 自定义命令：`{custom}`', en: '- notes: `{notes}` · skills: `{skills}` · custom commands: `{custom}`' },
+  'cmd.statusGoalIdle': { zh: '{goal} _(未激活)_', en: '{goal} _(idle)_' },
+  'cmd.statusNone': { zh: '无', en: 'none' },
+  'cmd.statsDesc': { zh: '显示会话统计（轮次、token、工具调用、平均值）', en: 'Show session statistics (turns, tokens, tool calls, averages)' },
+  'cmd.statsTitle': { zh: '**会话统计**', en: '**Session stats**' },
+  'cmd.statsTurns': { zh: '- 轮次：`{n}`', en: '- turns: `{n}`' },
+  'cmd.statsToolCalls': { zh: '- 工具调用：`{n}`', en: '- tool calls: `{n}`' },
+  'cmd.statsCompactions': { zh: '- 压缩次数：`{n}`', en: '- compactions: `{n}`' },
+  'cmd.statsTotalTokens': { zh: '- 总 token：`{n}`', en: '- total tokens: `{n}`' },
+  'cmd.statsAvgTokens': { zh: '- 平均 token/轮：`{n}`', en: '- avg tokens / turn: `{n}`' },
+  'cmd.statsAvgTools': { zh: '- 平均工具调用/轮：`{n}`', en: '- avg tools / turn: `{n}`' },
+  'cmd.statsRatio': { zh: '- 输入:输出 比：`{n}`', en: '- input:output ratio: `{n}`' },
+  'cmd.compactDesc': { zh: '总结较早的消息以释放上下文窗口', en: 'Summarize older messages to free up the context window' },
+  'cmd.compactNothing': { zh: '暂无可压缩内容 —— 对话记录还很短。', en: 'Nothing to compact yet — the transcript is still short.' },
+  'cmd.tuiOnly': { zh: '`{cmd}` 仅在交互式 TUI 中可用。', en: '`{cmd}` is only available in the interactive TUI.' },
+  'cmd.skillDesc': { zh: '列出技能或运行某个技能 —— /skill、/skill <name> [args]', en: 'List skills or run one — /skill, /skill <name> [args]' },
+  'cmd.skillNone': { zh: '未找到技能。可在 `~/.anycode/skills/<name>/SKILL.md` 或 `./.anycode/skills/<name>/SKILL.md` 添加。', en: 'No skills found. Add one at `~/.anycode/skills/<name>/SKILL.md` or `./.anycode/skills/<name>/SKILL.md`.' },
+  'cmd.skillTitle': { zh: '**技能**', en: '**Skills**' },
+  'cmd.skillRunHint': { zh: '用 `/skill <name> [args]` 运行某个技能。', en: 'Run one with `/skill <name> [args]`.' },
+  'cmd.skillUnknown': { zh: '未知技能 `{name}`。输入 `/skill` 查看列表。', en: 'Unknown skill `{name}`. Type `/skill` to list.' },
+  'cmd.skillRunning': { zh: '▸ 正在运行技能 `{name}`。', en: '▸ Running skill `{name}`.' },
+  'cmd.versionDesc': { zh: '显示 MeowCode 版本', en: 'Show the MeowCode version' },
+  'cmd.exitDesc': { zh: '退出 MeowCode', en: 'Exit MeowCode' },
+  'cmd.resumeDesc': { zh: '恢复此前保存的会话 —— 打开会话选择器', en: 'Resume a saved session — opens the session picker' },
+  'cmd.resumeNonInteractive': { zh: '仅在交互式会话中可用 —— 请运行 `meowcode` 后使用 /resume，或用 `meowcode --continue` 恢复最近一次会话。', en: 'Only available in an interactive session — run `meowcode` then use /resume, or `meowcode --continue` to resume the latest.' },
+  'cmd.themeDesc': { zh: '查看或切换配色主题 —— 例如 /theme light', en: 'Show or switch the color theme — e.g. /theme light' },
+  'cmd.themeTitle': { zh: '**主题**', en: '**Themes**' },
+  'cmd.themeCurrentMark': { zh: ' ← 当前', en: ' ← current' },
+  'cmd.themeSwitchHint': { zh: '用 `/theme <name>` 切换。', en: 'Switch with `/theme <name>`.' },
+  'cmd.themeAlready': { zh: '当前已在使用 `{theme}` 主题。', en: 'Already using the `{theme}` theme.' },
+  'cmd.themeSet': { zh: '主题已设为 `{theme}`。', en: 'Theme set to `{theme}`.' },
+  // __I18N_APPEND5__
+  'cmd.goalDesc': { zh: '设置一个 MeowCode 会持续推进直到达成的目标 —— /goal <text>、/goal clear', en: 'Set a goal MeowCode works toward until it is satisfied — /goal <text>, /goal clear' },
+  'cmd.goalInactive': { zh: '**目标：** {goal} _(未激活 —— 再次设置以继续推进)_', en: '**Goal:** {goal} _(not active — set it again to resume working)_' },
+  'cmd.goalNone': { zh: '尚未设置目标。用 `/goal <text>` 设置一个。', en: 'No goal set. Use `/goal <text>` to set one.' },
+  'cmd.goalCleared': { zh: '目标已清除。', en: 'Goal cleared.' },
+  'cmd.goalSet': { zh: '已设置目标：{goal}', en: 'Goal set: {goal}' },
+  'cmd.planDesc': { zh: '在动手编码前先起草实现方案 —— /plan <要构建的内容>', en: 'Draft an implementation plan before coding — /plan <what to build>' },
+  'cmd.planUsage': { zh: '用法：`/plan <要构建的内容>` —— 我会以只读方式调研，并在改动任何内容前返回一份分步方案。', en: "Usage: `/plan <what to build>` — I'll investigate read-only and return a step-by-step plan before changing anything." },
+  'cmd.planPlanning': { zh: '▸ 正在规划：{task}', en: '▸ Planning: {task}' },
+  'cmd.planNonInteractive': { zh: '规划仅在交互式会话中可用。已记下任务：{task}', en: 'Planning is only available in an interactive session. Task noted: {task}' },
+  'cmd.loopDesc': { zh: '按固定间隔重复运行某个提示或斜杠命令 —— 例如 /loop 5m /foo（省略间隔则自定节奏）；/loop stop 取消', en: 'Run a prompt or slash command on a recurring interval — e.g. /loop 5m /foo (omit interval to self-pace); /loop stop to cancel' },
+  'cmd.loopNoneStatus': { zh: '没有正在运行的循环。用 `/loop [interval] <提示或 /命令>` 启动一个。', en: 'No loop is active. Start one with `/loop [interval] <prompt or /command>`.' },
+  'cmd.loopCancelled': { zh: '循环已取消。', en: 'Loop cancelled.' },
+  'cmd.loopNone': { zh: '没有正在运行的循环。', en: 'No loop is active.' },
+  'cmd.loopUsage': { zh: '用法：`/loop [interval] <提示或 /命令>` —— 例如 `/loop 5m /foo`。', en: 'Usage: `/loop [interval] <prompt or /command>` — e.g. `/loop 5m /foo`.' },
+  'cmd.loopNoSelf': { zh: '循环不能运行 `/loop` 本身。', en: "A loop can't run `/loop` itself." },
+  'cmd.loopStarted': { zh: '正在循环运行 `{payload}`，{cadence}。发送 `/loop stop` 取消。', en: 'Looping `{payload}` {cadence}. Send `/loop stop` to cancel.' },
+  'cmd.loopCadenceEvery': { zh: '每 {interval} 一次', en: 'every {interval}' },
+  'cmd.loopCadenceSelf': { zh: '自定节奏（背靠背连续运行）', en: 'self-paced (back-to-back)' },
+  'cmd.memoryDesc': { zh: '查看或编辑跨会话记住的笔记 —— /memory add <text> · rm <n> · clear', en: 'Show or edit remembered notes across sessions — /memory add <text> · rm <n> · clear' },
+  'cmd.memoryAddUsage': { zh: '用法：`/memory add <text>`', en: 'Usage: `/memory add <text>`' },
+  'cmd.memoryAdded': { zh: '笔记已加入记忆。', en: 'Note added to memory.' },
+  'cmd.memoryRmUsage': { zh: '用法：`/memory rm <n>` —— 从 1 开始的笔记编号。', en: 'Usage: `/memory rm <n>` — 1-based note number.' },
+  'cmd.memoryRemoved': { zh: '已删除笔记 {n}。', en: 'Removed note {n}.' },
+  'cmd.memoryCleared': { zh: '笔记已清空。', en: 'Notes cleared.' },
+  'cmd.memoryGoalMoved': { zh: '目标现在有了独立命令 —— 用 `/goal <text>` 设置。', en: 'The goal has its own command now — set it with `/goal <text>`.' },
+  'cmd.memoryUnknown': { zh: '未知的 `/memory` 操作 `{action}`。请使用 `add`、`rm` 或 `clear`（目标请用 `/goal` 设置）。', en: 'Unknown `/memory` action `{action}`. Use `add`, `rm`, or `clear` (set the goal with `/goal`).' },
+  'cmd.loginDesc': { zh: '登录你的 MeowArch API 服务商（浏览器 OAuth / 中转密钥 / 用户名密码）', en: 'Sign in to your MeowArch API provider (browser OAuth / relay key / username+password)' },
+  'cmd.loginAlready': { zh: '已登录到 `{url}`{as}。正在打开登录面板以切换……', en: 'Already logged in to `{url}`{as}. Opening login to switch…' },
+  'cmd.loginAs': { zh: ' 用户 `{username}`', en: ' as `{username}`' },
+  'cmd.logoutDesc': { zh: '退出 MeowArch API 并撤销已保存的登录', en: 'Sign out of MeowArch API and revoke the saved login' },
+  'cmd.logoutNotLoggedIn': { zh: '尚未登录。', en: 'Not logged in.' },
+  'cmd.logoutServerFailed': { zh: '⚠️  服务端注销失败（{error}）；仍将清除本地凭据。', en: '⚠️  Server logout failed ({error}); clearing local credential anyway.' },
+  'cmd.logoutOauthFailed': { zh: '⚠️  OAuth 撤销失败（{error}）；仍将清除本地凭据。', en: '⚠️  OAuth revoke failed ({error}); clearing local credential anyway.' },
+  'cmd.logoutUnknownError': { zh: '未知', en: 'unknown' },
+  'cmd.logoutOauthNote': { zh: '已撤销 OAuth 令牌，本设备上的访问随即失效（at_ 访问令牌本身就是 /v1 的调用凭据，无需再清理中转密钥）。', en: 'Revoked the OAuth tokens; this device\'s access ends immediately (the at_ access token is itself the /v1 credential now — there is no relay key left to clean up).' },
+  'cmd.logoutSwitched': { zh: '已退出登录。服务商已切换为 `{provider}`。', en: 'Logged out. Provider switched to `{provider}`.' },
+  'cmd.logoutDone': { zh: '已退出登录。', en: 'Logged out.' },
+  'cmd.unknownCommand': { zh: '未知命令 `/{name}`。输入 `/help` 查看列表。', en: 'Unknown command `/{name}`. Type `/help` for a list.' },
+  // app.tsx — prompt cluster
+  'app.queued': { zh: '⏳ 排队中 · {q}', en: '⏳ queued · {q}' },
+  'app.thinkingSuffix': { zh: '正以 {effort} 强度深入思考', en: 'deep in thought with {effort} effort' },
+  'app.placeholder': { zh: '让 MeowCode 构建点什么…（输入 /help 查看命令）', en: 'Ask MeowCode to build something…  (/help for commands)' },
+  'app.ctxWarn': { zh: '⚠ 上下文已用 {pct}% {bar} · {used}/{limit} · {tail}', en: '⚠ Context {pct}% full {bar} · {used}/{limit} · {tail}' },
+  'app.ctxCompactSoon': { zh: '即将压缩 —— 现在可运行 /compact', en: 'compacting soon — run /compact now' },
+  'app.ctxCompactHint': { zh: '运行 /compact 回收空间', en: '/compact to reclaim space' },
+  // ThemePicker — palette preview caption (colored per palette role)
+  'theme.previewAccent': { zh: '陶土色强调, ', en: 'the terracotta accent, ' },
+  'theme.previewHints': { zh: '柔和提示, ', en: 'muted hints, ' },
+  'theme.previewWarnings': { zh: '警告', en: 'warnings' },
+  // settings.ts — /config validation errors & input hints
+  'set.errOnOff': { zh: '需要 on/off（收到 `{v}`）', en: 'expected on/off (got `{v}`)' },
+  'set.errOneOf': { zh: '需要以下之一：{values}', en: 'expected one of {values}' },
+  'set.errNumber': { zh: '需要一个数字（收到 `{v}`）', en: 'expected a number (got `{v}`)' },
+  'set.errMin': { zh: '必须 ≥ {min}', en: 'must be ≥ {min}' },
+  'set.errMax': { zh: '必须 ≤ {max}', en: 'must be ≤ {max}' },
+  'set.hintOnOff': { zh: 'on | off', en: 'on | off' },
+  'set.hintNumber': { zh: '数字 {lo}–{hi}{unit}', en: 'number {lo}–{hi}{unit}' },
+  'set.hintText': { zh: '文本', en: 'text' },
+  'panel.overflowMore': { zh: '… 还有 {n} 项 —— 请调整终端大小', en: '… +{n} more — resize terminal' },
+  // transcript.ts — collapsed run summary verbs & write/edit headers
+  'run.thought': { zh: '思考了 {s}s', en: 'thought for {s}s' },
+  'run.thoughtNoTime': { zh: '思考', en: 'thought' },
+  'run.readOne': { zh: '读取 {name}', en: 'read {name}' },
+  'run.readMany': { zh: '读取 {count} 个文件', en: 'read {count} files' },
+  'run.listedOne': { zh: '列出 {name}', en: 'listed {name}' },
+  'run.listedMany': { zh: '列出 {count} 个目录', en: 'listed {count} directories' },
+  'run.ranOne': { zh: '运行 {cmd}', en: 'ran {cmd}' },
+  'run.ranMany': { zh: '运行 {count} 条命令', en: 'ran {count} commands' },
+  'run.searchedOne': { zh: '搜索 {pat}', en: 'searched {pat}' },
+  'run.searchedMany': { zh: '搜索 {count} 个模式', en: 'searched {count} patterns' },
+  'run.globbedOne': { zh: '匹配 {pat}', en: 'globbed {pat}' },
+  'run.globbedMany': { zh: '匹配 {count} 个模式', en: 'globbed {count} patterns' },
+  'run.update': { zh: '更新', en: 'Update' },
+  'run.write': { zh: '写入', en: 'Write' },
+  'run.noChanges': { zh: '无改动', en: 'No changes' },
+  'run.changeSummary': { zh: '新增 {added} 行，删除 {removed} 行', en: 'Added {added} line{al}, removed {removed} line{rl}' },
+} as const
+
+export type MessageKey = keyof typeof messages
+
+export function translate(lang: Lang, key: MessageKey, params?: Params): string {
+  const entry = messages[key] as { zh: string; en: string }
+  return interpolate(entry ? (entry[lang] ?? entry.en) : key, params)
+}
+
+// Module-level mirror for code outside the React tree (commands, lib helpers).
+let currentLang: Lang = detectLang()
+export function getLang(): Lang { return currentLang }
+export function setLang(l: Lang): void { currentLang = l }
+export function t(key: MessageKey, params?: Params): string { return translate(currentLang, key, params) }
+
+// Per-setting label/description translations for the Config list. Kept out of
+// `messages` because they're a bulk table keyed by the setting key from
+// lib/settings, not ad-hoc UI ids. Only the zh string is stored; en falls back
+// to the English already carried on each SettingSpec, so there's one source of
+// truth for English and no risk of the two drifting.
+const settingZh: Record<string, { label: string; desc: string }> = {
+  autoCompact: { label: '自动压缩', desc: '上下文窗口填满时自动总结较早的消息' },
+  continueAtUsageLimit: { label: '达到用量上限时自动继续', desc: '触发用量上限时继续运行而不是停止' },
+  switchModelOnFlag: { label: '消息被标记时切换模型', desc: '当某条消息被标记时回退到另一个模型' },
+  thinkingMode: { label: '思考模式', desc: '回复前进行扩展思考' },
+  effort: { label: '推理强度', desc: '智能体投入多少推理/验证（用 /effort 设置）' },
+  showTips: { label: '显示提示', desc: '在页脚偶尔显示使用提示' },
+  draftedFeedback: { label: 'Claude 起草反馈', desc: '反馈时提供一条起草好的消息' },
+  reduceMotion: { label: '减少动态效果', desc: '尽量减少加载动画' },
+  promptSuggestions: { label: '提示建议', desc: '推荐后续提示词' },
+  sessionRecap: { label: '会话回顾', desc: '恢复会话时回顾发生过的事' },
+  verbose: { label: '详细输出', desc: '显示完整、未截断的工具输出' },
+  progressBar: { label: '终端进度条', desc: '在终端标题中绘制进度条' },
+  showTurnDuration: { label: '显示每轮耗时', desc: '显示每一轮耗费的时长' },
+  timeFormat: { label: '时间格式', desc: '时间戳的时钟格式' },
+  autoScroll: { label: '自动滚动', desc: '随输出流式滚动跟随' },
+  outputStyle: { label: '输出风格', desc: '回复中包含多少解释' },
+  language: { label: '语言', desc: '界面语言（auto = 跟随 shell 区域设置）' },
+  prStatusFooter: { label: '显示 PR 状态页脚', desc: '用一行页脚显示当前 PR 状态' },
+  openAgentsView: { label: '默认打开代理视图', desc: '启动时默认打开代理面板' },
+  rewindCode: { label: '回退代码（检查点）', desc: '保留检查点以便回退编辑' },
+  dynamicWorkflows: { label: '动态工作流', desc: '允许智能体编排多步工作流' },
+  ultracodeTrigger: { label: 'Ultracode 关键词触发', desc: '启用 “ultracode” 关键词以进行大规模并行' },
+  dynamicWorkflowSize: { label: '动态工作流规模', desc: '工作流可生成多少个代理的指导值' },
+  artifacts: { label: 'Artifacts', desc: '允许渲染独立的 artifact' },
+  permissionMode: { label: '默认权限模式', desc: '新会话启动时的权限模式' },
+  worktreeBaseRef: { label: '工作树基准引用', desc: '新工作树基于 origin 默认分支（fresh）还是本地 HEAD' },
+  autoModeInPlan: { label: '计划时使用自动模式', desc: '计划时自动运行只读工具' },
+  questionTimeout: { label: '问题自动继续超时', desc: '未回答的问题自动继续前的秒数（0 = 永不）' },
+  editorMode: { label: '编辑器模式', desc: '提示输入的按键绑定' },
+  respectGitignore: { label: '文件选择器遵循 .gitignore', desc: '在选择器中隐藏被忽略的文件' },
+  skipCopyPicker: { label: '跳过 /copy 选择器', desc: '不经选择器直接复制' },
+  copyOnSelect: { label: '选中即复制', desc: '自动将选中的文本复制到剪贴板' },
+  leftArrowOpensAgents: { label: '← 打开代理', desc: '在第 0 列按左箭头打开代理视图' },
+  lastResponseInEditor: { label: '在外部编辑器中显示上一条回复', desc: '在 $EDITOR 中打开上一条回复' },
+  localNotifications: { label: '本地通知', desc: '终端失去焦点时发送桌面通知' },
+  otherSessionMessages: { label: '来自你其他会话的消息', desc: '如何呈现来自你其他会话的消息' },
+  dialogExpiry: { label: '对话框过期', desc: '空闲对话框过期前的秒数（0 = 永不）' },
+  autoUpdateChannel: { label: '自动更新渠道', desc: '从哪个发布渠道自动更新' },
+  autoConnectIde: { label: '自动连接 IDE（外部终端）', desc: '从外部终端连接到运行中的 IDE' },
+  chromeEnabled: { label: '默认启用 Claude in Chrome', desc: '为新会话启用 Chrome 集成' },
+}
+
+// Localized label/description for a setting. `en` is the English carried on the
+// SettingSpec (passed as fallback); zh comes from the table above, falling back
+// to English when a key is untranslated.
+export function settingLabel(lang: Lang, key: string, fallbackEn: string): string {
+  return lang === 'zh' ? (settingZh[key]?.label ?? fallbackEn) : fallbackEn
+}
+export function settingDesc(lang: Lang, key: string, fallbackEn: string): string {
+  return lang === 'zh' ? (settingZh[key]?.desc ?? fallbackEn) : fallbackEn
+}
+
+const LangContext = createContext<Lang>(currentLang)
+export const LangProvider = LangContext.Provider
+
+/** The active language from the nearest <LangProvider> above. */
+export function useLang(): Lang { return useContext(LangContext) }
+
+/** A translator bound to the active language; re-renders on a language switch. */
+export function useT(): (key: MessageKey, params?: Params) => string {
+  const lang = useLang()
+  return (key, params) => translate(lang, key, params)
+}

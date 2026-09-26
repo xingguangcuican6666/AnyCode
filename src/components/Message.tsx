@@ -2,6 +2,7 @@ import React from 'react'
 import { Box, Text } from 'ink'
 import type { Message as Msg } from '../types'
 import { symbols, useTheme } from '../theme'
+import { useT } from '../lib/i18n'
 import { renderMarkdown } from '../lib/markdown'
 import { Banner } from './Banner'
 
@@ -40,6 +41,7 @@ function toVisualLines(text: string, width: number): string[] {
 
 export function Message({ message, width, live, maxLines }: Props): React.ReactElement | null {
   const colors = useTheme()
+  const t = useT()
   const { role, content, meta } = message
 
   if (role === 'system' && content === '__banner__') {
@@ -63,15 +65,15 @@ export function Message({ message, width, live, maxLines }: Props): React.ReactE
       }
       return (
         <Box marginBottom={1} paddingLeft={2} flexDirection="column">
-          <Text color={colors.accent}>{symbols.star} Thinking…</Text>
-          {clipped > 0 ? <Text color={colors.dim}>{`⋮ +${clipped} line${clipped === 1 ? '' : 's'} above`}</Text> : null}
+          <Text color={colors.accent}>{symbols.star} {t('message.thinking')}</Text>
+          {clipped > 0 ? <Text color={colors.dim}>{clipped === 1 ? t('message.lineAbove', { count: clipped }) : t('message.linesAbove', { count: clipped })}</Text> : null}
           <Text color={colors.dim} italic wrap="wrap">{shown}</Text>
         </Box>
       )
     }
     return (
       <Box marginBottom={1} paddingLeft={2}>
-        <Text color={colors.dim}>{symbols.star} Thought{meta.thinkingSeconds ? ` for ${meta.thinkingSeconds}s` : ''}</Text>
+        <Text color={colors.dim}>{symbols.star} {meta.thinkingSeconds ? t('message.thoughtFor', { seconds: meta.thinkingSeconds }) : t('message.thought')}</Text>
       </Box>
     )
   }
@@ -127,10 +129,10 @@ export function Message({ message, width, live, maxLines }: Props): React.ReactE
         <Text color={colors.accent}>{symbols.assistant}</Text>
       </Box>
       <Box flexDirection="column" flexGrow={1}>
-        {clipped > 0 ? <Text color={colors.dim}>{`⋮ +${clipped} line${clipped === 1 ? '' : 's'} above (in scrollback)`}</Text> : null}
+        {clipped > 0 ? <Text color={colors.dim}>{clipped === 1 ? t('message.lineAboveScrollback', { count: clipped }) : t('message.linesAboveScrollback', { count: clipped })}</Text> : null}
         <Text wrap="wrap">{shownBody || (live ? '' : ' ')}</Text>
         {meta?.interrupted ? (
-          <Text color={colors.warning}>⎿ interrupted</Text>
+          <Text color={colors.warning}>{t('message.interrupted')}</Text>
         ) : null}
       </Box>
     </Box>

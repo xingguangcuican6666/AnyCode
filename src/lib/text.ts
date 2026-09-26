@@ -77,3 +77,16 @@ export function truncateToWidth(s: string, maxCols: number): string {
   }
   return out + '…'
 }
+
+/**
+ * Pad or truncate `s` to exactly `cols` display columns — the display-width
+ * analogue of `String.padEnd(n).slice(0, n)`, which miscounts CJK/wide glyphs.
+ * Over-long input is ellipsis-truncated; shorter input is right-padded with
+ * spaces so a column of labels aligns regardless of script.
+ */
+export function fitToWidth(s: string, cols: number): string {
+  const t = truncateToWidth(s, cols)
+  const pad = Math.max(0, cols - displayWidth(t))
+  return t + ' '.repeat(pad)
+}
+

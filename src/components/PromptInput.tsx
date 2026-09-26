@@ -1,8 +1,10 @@
 import React, { useRef, useState } from 'react'
 import { Box, Text, useInput } from 'ink'
 import { symbols, useTheme } from '../theme'
+import { useT } from '../lib/i18n'
 import type { CommandSpec } from '../types'
 import { toGraphemes, computeWindow, truncateToWidth } from '../lib/text'
+import { loadHistory, appendHistory } from '../lib/history'
 
 interface Props {
   active: boolean
@@ -52,7 +54,11 @@ export function PromptInput({ active, placeholder, width, commands, onSubmit, on
   // dismissed the menu for the current query (Esc). Any edit re-opens it.
   const [selected, setSelected] = useState(0)
   const [dismissed, setDismissed] = useState(false)
-  const history = useRef<string[]>([])
+  // Prompt history for ↑/↓ recall, newest-first. Loaded from disk once (lazy ref
+  // init) so recall spans restarts like a shell / Claude Code; `histIdx` is the
+  // browse cursor (-1 = editing a fresh line, not in history).
+  const history = useRef<string[] | null>(null)
+  if (history.current === null) history.current = loadHistory()
   const histIdx = useRef<number>(-1)
 
   // Derive the menu from the current line. Everything the key handler needs is
@@ -64,7 +70,9 @@ export function PromptInput({ active, placeholder, width, commands, onSubmit, on
 
   const submit = (v: string): void => {
     if (v.trim().length === 0) return
-    history.current.unshift(v)
+    const h = history.current ?? (history.current = [])
+    if (h[0] !== v) h.unshift(v) // in-memory recall (this session); no consecutive dupes
+    appendHistory(v)             // persist for future sessions (best-effort)
     histIdx.current = -1
     setValue('')
     setCursor(0)
@@ -100,7 +108,7 @@ export function PromptInput({ active, placeholder, width, commands, onSubmit, on
     if (key.leftArrow) { setCursor((c) => Math.max(0, c - 1)); return }
     if (key.rightArrow) { setCursor((c) => Math.min(g.length, c + 1)); return }
     if (key.upArrow) {
-      const h = history.current
+      const h = history.current ?? []
       if (h.length === 0) return
       histIdx.current = Math.min(h.length - 1, histIdx.current + 1)
       const v = h[histIdx.current] ?? ''
@@ -108,7 +116,7 @@ export function PromptInput({ active, placeholder, width, commands, onSubmit, on
       return
     }
     if (key.downArrow) {
-      const h = history.current
+      const h = history.current ?? []
       if (histIdx.current <= 0) {
         // At/below the newest history entry. When not browsing history, offer ↓
         // to the host first (enter workflow-selection mode); if it consumes the
@@ -218,6 +226,7 @@ function CommandMenu({
   width: number
 }): React.ReactElement {
   const colors = useTheme()
+  const t = useT()
   const total = matches.length
   const rows = Math.min(MENU_MAX_ROWS, total)
   // Scroll window: center the selection when the list is longer than the cap.
@@ -244,7 +253,7 @@ function CommandMenu({
       <Text color={colors.dim} wrap="truncate">
         {'  '}
         {total > rows ? `${selected + 1}/${total} · ` : ''}
-        ↑↓ select · ↵ run · tab complete · esc dismiss
+        {t('menu.footer')}
       </Text>
     </Box>
   )

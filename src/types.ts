@@ -1,5 +1,16 @@
 export type Role = 'user' | 'assistant' | 'system' | 'tool'
 
+// One row of a unified diff for the write/edit diff view. `context` is an
+// unchanged line (dimmed), `add`/`del` the +/- lines (green/red), `hunk` a
+// "⋯ N unchanged lines" separator between kept regions. Line numbers are 1-based
+// (old file for del, new file for add, both for context).
+export interface DiffLine {
+  tag: 'context' | 'add' | 'del' | 'hunk'
+  text: string
+  oldNo?: number
+  newNo?: number
+}
+
 export interface MessageMeta {
   interrupted?: boolean
   error?: boolean
@@ -11,6 +22,9 @@ export interface MessageMeta {
   thinkingSeconds?: number
   // A transient retry notice (rendered in the warning color, not as an error).
   retry?: boolean
+  // A write_file/edit_file result's unified diff, rendered as a line-numbered
+  // green/red diff view (collapsible on click). Absent for non-mutating tools.
+  diff?: DiffLine[]
 }
 
 export interface Message {
@@ -32,6 +46,11 @@ export interface StreamOpts {
   // context by the provider (see providers/anthropic). Optional; absent = no live
   // reporting (the workflow still runs and returns its final report).
   onWorkflow?: (snap: WorkflowSnapshot) => void
+  // Live callback for `task`/`plan` sub-agents: called as a switchable sub-agent
+  // streams its own events, so the UI can list it in the bottom agent switcher and
+  // swap the viewport to its transcript. Distinct from onWorkflow (a progress
+  // tree). Threaded by the provider; absent = no switchable view.
+  onAgent?: (snap: AgentSnapshot) => void
 }
 
 // One sub-agent inside a live `workflow` run, with its current state and timing
@@ -67,6 +86,28 @@ export interface WorkflowSnapshot {
   controls?: WorkflowControls
 }
 
+// A live sub-agent spawned by the `task`/`plan` tools, surfaced as a SWITCHABLE
+// transcript view — conceptually different from a `workflow` (which is a
+// collapsed line + an expandable progress TREE). Here the user selects the agent
+// in the bottom switcher (○ main / ● <type> <activity>) and the main viewport
+// swaps to render THAT agent's own chat. Its transcript is carried as the raw
+// event stream (`events`) so the UI flattens it exactly like the main one.
+// Emitted repeatedly through StreamOpts.onAgent as the sub-agent works; `done`
+// flips true on the final snapshot.
+export interface AgentSnapshot {
+  id: string
+  type: string          // sub-agent role, e.g. 'general' | 'explore' | 'plan'
+  label: string         // short human label ("review src/app.tsx")
+  activity: string      // current one-word activity ("starting"/"read_file"/"done")
+  state: 'running' | 'done' | 'error'
+  events: AgentEvent[]  // the sub-agent's own event stream → its transcript
+  steps: number         // tool calls made so far
+  startedAt?: number
+  elapsedMs?: number
+  error?: string
+  done: boolean
+}
+
 /**
  * Events emitted while an agentic turn runs. `text` is streamed model prose;
  * `thinking` is streamed reasoning from an extended-thinking block (shown
@@ -82,7 +123,7 @@ export type AgentEvent =
   | { type: 'text'; text: string }
   | { type: 'thinking'; text: string }
   | { type: 'tool_use'; id: string; name: string; input: Record<string, unknown> }
-  | { type: 'tool_result'; id: string; name: string; content: string; isError?: boolean; linesAdded?: number; linesRemoved?: number }
+  | { type: 'tool_result'; id: string; name: string; content: string; isError?: boolean; linesAdded?: number; linesRemoved?: number; diff?: DiffLine[] }
   | { type: 'usage'; inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreationTokens: number }
   | { type: 'retry'; attempt: number; max: number; delayMs: number; reason: string }
   | { type: 'error'; message: string }
@@ -174,6 +215,8 @@ export interface CommandContext {
   print: (content: string, role?: Role, meta?: MessageMeta) => void
   /** Open the interactive theme picker overlay (interactive sessions only). */
   openThemePicker?: () => void
+  /** Open the interactive model picker overlay (interactive sessions only). */
+  openModelPicker?: () => void
   /** Start a recurring/self-paced loop (interactive sessions only). */
   startLoop?: (spec: LoopSpec) => void
   /** Cancel the active loop, if any. */
@@ -194,6 +237,10 @@ export interface CommandContext {
   compact?: () => number
   /** Open the interactive settings overlay on a given tab (interactive sessions only). */
   openPanel?: (tab: PanelTab) => void
+  /** Open the interactive new-api login overlay (interactive sessions only). */
+  openLogin?: () => void
+  /** Open the interactive /resume session picker (interactive sessions only). */
+  openResume?: () => void
 }
 
 export interface SlashCommand {

@@ -1,4 +1,4 @@
-# AnyCode
+# MeowCode
 
 A Claude Code–style agentic coding CLI. This is the **framework skeleton** — the
 terminal UI, streaming loop, slash-command system, and a pluggable provider
@@ -16,7 +16,7 @@ Build a standalone CLI:
 
 ```bash
 npm run build      # bundles to dist/cli.js with a shebang
-node dist/cli.js   # or: npm link  → then run `anycode`
+node dist/cli.js   # or: npm link  → then run `meowcode`
 ```
 
 ## Using a real model
@@ -32,8 +32,8 @@ The Anthropic provider streams via the Messages API using the built-in `fetch`
 ## Non-interactive / scripting
 
 ```bash
-anycode -p "explain this repo"
-echo "write a haiku about tps reports" | anycode
+meowcode -p "explain this repo"
+echo "write a haiku about tps reports" | meowcode
 ```
 
 ## Commands

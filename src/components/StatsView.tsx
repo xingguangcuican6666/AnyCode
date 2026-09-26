@@ -1,12 +1,14 @@
 import React, { useMemo } from 'react'
 import { Box, Text } from 'ink'
 import { useTheme, type ThemeColors } from '../theme'
+import { useT } from '../lib/i18n'
 import {
   loadStats, overview, modelBreakdown, heatmap, rangeTotals,
   funFact, type Range, type StatsStore,
 } from '../lib/stats'
 import { fmtTokens, fmtDuration, bar } from '../lib/usage'
 import { fmtUsd } from '../lib/pricing'
+import { displayWidth } from '../lib/text'
 
 // The Stats tab body: a lifetime dashboard modeled on GitHub's contribution
 // graph. Two sub-views — Overview (headline numbers + an activity heatmap) and
@@ -22,6 +24,7 @@ interface Props {
   sub: StatsSub
   range: Range
   focusRow?: number  // which selector row has the ↑↓ focus cursor: 0 = view, 1 = range
+  hover?: string | null // selector token the mouse hovers ('overview'|'models'|'all'|'30d'|'7d')
 }
 
 // A heatmap bucket (0..4, or -1 for a future day) → a glyph + theme color: an
@@ -40,14 +43,17 @@ function bucketStyle(b: number, c: ThemeColors): { ch: string; color: string } {
 // Sun→Sat labels; only Mon/Wed/Fri are shown (like GitHub) to reduce noise.
 const WEEKDAYS = ['   ', 'Mon', '   ', 'Wed', '   ', 'Fri', '   ']
 
-// "label   value" line used throughout the overview column.
+// "label   value" line used throughout the overview column. Padding is measured
+// in display columns (not string length) so CJK labels align like ASCII ones.
 function Stat({ label, value, colors, w }: { label: string; value: string; colors: ThemeColors; w: number }): React.ReactElement {
+  const pad = ' '.repeat(Math.max(1, w - displayWidth(label)))
   return (
-    <Text wrap="truncate"><Text color={colors.dim}>{label.padEnd(w)}</Text><Text color={colors.text}>{value}</Text></Text>
+    <Text wrap="truncate"><Text color={colors.dim}>{label}{pad}</Text><Text color={colors.text}>{value}</Text></Text>
   )
 }
 
 function ActivityHeatmap({ store, width, colors }: { store: StatsStore; width: number; colors: ThemeColors }): React.ReactElement {
+  const t = useT()
   // Fit week-columns to the width (4-char row label + 1 char/week), max a year.
   const weeks = Math.max(8, Math.min(52, width - 8))
   const hm = useMemo(() => heatmap(store, weeks), [store, weeks])
@@ -68,18 +74,19 @@ function ActivityHeatmap({ store, width, colors }: { store: StatsStore; width: n
         </Text>
       ))}
       <Text>
-        <Text color={colors.dim}>Less </Text>
+        <Text color={colors.dim}>{t('stats.heatLess')} </Text>
         {[0, 1, 2, 3, 4].map((b) => {
           const s = bucketStyle(b, colors)
           return <Text key={b} color={s.color}>{s.ch}</Text>
         })}
-        <Text color={colors.dim}> More</Text>
+        <Text color={colors.dim}> {t('stats.heatMore')}</Text>
       </Text>
     </Box>
   )
 }
 
-function Overview({ store, width, rows, range, colors, focused }: { store: StatsStore; width: number; rows: number; range: Range; colors: ThemeColors; focused: boolean }): React.ReactElement {
+function Overview({ store, width, rows, range, colors, focused, hover }: { store: StatsStore; width: number; rows: number; range: Range; colors: ThemeColors; focused: boolean; hover?: string | null }): React.ReactElement {
+  const t = useT()
   const ov = overview(store)
   const rt = rangeTotals(store, range)
   const w = 18
@@ -93,20 +100,20 @@ function Overview({ store, width, rows, range, colors, focused }: { store: Stats
   return (
     <Box flexDirection="column">
       <Text>
-        <Text color={focused ? colors.accentBright : colors.dim}>{focused ? '❯ ' : '  '}Range </Text>
+        <Text color={focused ? colors.accentBright : colors.dim}>{focused ? '❯ ' : '  '}{t('stats.range')} </Text>
         {(['all', '30d', '7d'] as Range[]).map((rg) => (
-          <Text key={rg} inverse={rg === range} bold={rg === range} color={rg === range ? undefined : colors.dim}>{` ${rg} `}</Text>
+          <Text key={rg} inverse={rg === range} bold={rg === range} underline={hover === rg} color={rg === range ? undefined : colors.dim}>{` ${rg} `}</Text>
         ))}
       </Text>
       <Text> </Text>
-      <Stat label="Cost (range)" value={fmtUsd(rt.cost)} colors={colors} w={w} />
-      <Stat label="Tokens (range)" value={`${fmtTokens(rt.tokens)}  ·  ${rt.turns} turns`} colors={colors} w={w} />
-      <Stat label="Active days" value={String(rt.activeDays)} colors={colors} w={w} />
-      <Stat label="Sessions" value={String(ov.sessions)} colors={colors} w={w} />
-      <Stat label="Streak" value={`${ov.currentStreak} days · longest ${ov.longestStreak}`} colors={colors} w={w} />
-      <Stat label="Longest session" value={fmtDuration(ov.longestSessionMs)} colors={colors} w={w} />
-      <Stat label="Most active day" value={most} colors={colors} w={w} />
-      <Stat label="Top model" value={fav} colors={colors} w={w} />
+      <Stat label={t('stats.cost')} value={fmtUsd(rt.cost)} colors={colors} w={w} />
+      <Stat label={t('stats.tokens')} value={t('stats.tokensValue', { tokens: fmtTokens(rt.tokens), turns: rt.turns })} colors={colors} w={w} />
+      <Stat label={t('stats.activeDays')} value={String(rt.activeDays)} colors={colors} w={w} />
+      <Stat label={t('stats.sessions')} value={String(ov.sessions)} colors={colors} w={w} />
+      <Stat label={t('stats.streak')} value={t('stats.streakValue', { cur: ov.currentStreak, longest: ov.longestStreak })} colors={colors} w={w} />
+      <Stat label={t('stats.longestSession')} value={fmtDuration(ov.longestSessionMs)} colors={colors} w={w} />
+      <Stat label={t('stats.mostActiveDay')} value={most} colors={colors} w={w} />
+      <Stat label={t('stats.topModel')} value={fav} colors={colors} w={w} />
       {ff ? <Text color={colors.accentDim}>{ff}</Text> : null}
       {showHeat ? <Text> </Text> : null}
       {showHeat ? <ActivityHeatmap store={store} width={width} colors={colors} /> : null}
@@ -115,12 +122,13 @@ function Overview({ store, width, rows, range, colors, focused }: { store: Stats
 }
 
 function Models({ store, colors }: { store: StatsStore; colors: ThemeColors }): React.ReactElement {
+  const t = useT()
   const list = modelBreakdown(store)
-  if (list.length === 0) return <Text color={colors.dim}>No model usage recorded yet.</Text>
+  if (list.length === 0) return <Text color={colors.dim}>{t('stats.noModels')}</Text>
   const nameW = Math.min(28, Math.max(8, ...list.map((r) => r.model.length)))
   return (
     <Box flexDirection="column">
-      <Text bold color={colors.accent}>Models by tokens (all-time)</Text>
+      <Text bold color={colors.accent}>{t('stats.modelsTitle')}</Text>
       <Text> </Text>
       {list.slice(0, 8).map((r) => (
         <Text key={r.model} wrap="truncate">
@@ -133,8 +141,9 @@ function Models({ store, colors }: { store: StatsStore; colors: ThemeColors }): 
   )
 }
 
-export function StatsView({ width, rows, sub, range, focusRow = 0 }: Props): React.ReactElement {
+export function StatsView({ width, rows, sub, range, focusRow = 0, hover }: Props): React.ReactElement {
   const colors = useTheme()
+  const t = useT()
   const store = useMemo(() => loadStats(), [])
   const empty = store.sessions === 0 && Object.keys(store.days).length === 0
   return (
@@ -142,14 +151,14 @@ export function StatsView({ width, rows, sub, range, focusRow = 0 }: Props): Rea
       <Text>
         <Text color={focusRow === 0 ? colors.accentBright : colors.dim}>{focusRow === 0 ? '❯ ' : '  '}</Text>
         {(['overview', 'models'] as StatsSub[]).map((s) => (
-          <Text key={s} inverse={s === sub} bold={s === sub} color={s === sub ? undefined : colors.dim}>{` ${s === 'overview' ? 'Overview' : 'Models'} `}</Text>
+          <Text key={s} inverse={s === sub} bold={s === sub} underline={hover === s} color={s === sub ? undefined : colors.dim}>{` ${s === 'overview' ? t('stats.tab.overview') : t('stats.tab.models')} `}</Text>
         ))}
       </Text>
       <Text> </Text>
       {empty ? (
-        <Text color={colors.dim}>No lifetime stats yet — they accrue as you use AnyCode.</Text>
+        <Text color={colors.dim}>{t('stats.empty')}</Text>
       ) : sub === 'overview' ? (
-        <Overview store={store} width={width} rows={Math.max(1, rows - 2)} range={range} colors={colors} focused={focusRow === 1} />
+        <Overview store={store} width={width} rows={Math.max(1, rows - 2)} range={range} colors={colors} focused={focusRow === 1} hover={hover} />
       ) : (
         <Models store={store} colors={colors} />
       )}

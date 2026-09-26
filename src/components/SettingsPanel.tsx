@@ -1,11 +1,13 @@
-import React, { useEffect, useMemo, useState } from 'react'
-import { Box, Text, useInput } from 'ink'
+import React, { useEffect, useMemo, useRef, useState } from 'react'
+import { Box, Text, useInput, useStdin } from 'ink'
 import type { AppConfig, Message, PanelTab, SessionUsage } from '../types'
 import { useTheme } from '../theme'
 import { themeList, AUTO_THEME } from '../theme'
 import { providerIds } from '../providers'
 import { DEFAULT_THEME } from '../theme'
 import { VERSION, NAME } from '../version'
+import { displayWidth, fitToWidth } from '../lib/text'
+import { useT, useLang, settingLabel, settingDesc, type Lang, type MessageKey } from '../lib/i18n'
 import {
   SETTINGS, type SettingSpec, getSetting, coerceSetting, settingHint,
 } from '../lib/settings'
@@ -23,15 +25,27 @@ import type { Range } from '../lib/stats'
 // read-only panels. Rendered by App in place of the input cluster, exactly like
 // ThemePicker, so the transcript stays visible above it.
 
+// A translator bound to the active language (the shape useT() returns), passed
+// into the module-level row/line builders so their strings localize too.
+type Tr = (key: MessageKey, params?: Record<string, string | number>) => string
+
 // "Settings" is the panel's title (rendered as a heading above the tab row), not
 // a selectable tab. The core config fields that used to live under a "Settings"
-// tab now lead the Config tab (see rowsForTab).
-const TABS: { id: PanelTab; label: string }[] = [
-  { id: 'status', label: 'Status' },
-  { id: 'config', label: 'Config' },
-  { id: 'usage', label: 'Usage' },
-  { id: 'stats', label: 'Stats' },
+// tab now lead the Config tab (see rowsForTab). Labels are localized at render
+// via `labelKey`; ids stay stable (they key tab state + mouse hit-testing).
+const TABS: { id: PanelTab; labelKey: MessageKey }[] = [
+  { id: 'status', labelKey: 'tab.status' },
+  { id: 'config', labelKey: 'tab.config' },
+  { id: 'usage', labelKey: 'tab.usage' },
+  { id: 'stats', labelKey: 'tab.stats' },
 ]
+
+// The content-column spans of the Stats tab's two selector rows (for mouse
+// hit-testing) are computed at render from the *translated* token widths — see
+// `statsSubSegs`/`statsRangeSegs` in the component. They can't be constants here
+// because a zh label ("范围" vs "Range ") shifts every column, which would
+// desync clicks. Kept in the panel (not StatsView) so the owner of the mouse
+// also owns the geometry; StatsView only renders.
 
 // A row on an editable tab: a schema-backed setting, a core AppConfig field, or
 // a read-only line (the API key).
@@ -57,31 +71,32 @@ interface Props {
 // Core AppConfig fields shown on the Settings tab. provider/theme cycle through
 // their known values (provider ids include any custom Anthropic-protocol
 // providers, see providers/index.ts); model/system are free text.
-function coreRows(config: AppConfig): Row[] {
+function coreRows(config: AppConfig, t: Tr): Row[] {
   return [
-    { kind: 'core', key: 'provider', label: 'Provider', ctl: 'enum', values: providerIds(config) },
-    { kind: 'core', key: 'model', label: 'Model', ctl: 'text' },
-    { kind: 'core', key: 'theme', label: 'Theme', ctl: 'enum', values: [AUTO_THEME, ...themeList().map((t) => t.name)] },
-    { kind: 'core', key: 'system', label: 'System prompt', ctl: 'text' },
-    { kind: 'readonly', key: 'apiKey', label: 'API key' },
+    { kind: 'core', key: 'provider', label: t('core.provider'), ctl: 'enum', values: providerIds(config) },
+    { kind: 'core', key: 'model', label: t('core.model'), ctl: 'text' },
+    { kind: 'core', key: 'theme', label: t('core.theme'), ctl: 'enum', values: [AUTO_THEME, ...themeList().map((t) => t.name)] },
+    { kind: 'core', key: 'system', label: t('core.system'), ctl: 'text' },
+    { kind: 'readonly', key: 'apiKey', label: t('core.apiKey') },
   ]
 }
 
 // All rows for an editable tab. Config now leads with the core AppConfig fields
 // (provider/model/theme/system/apiKey) and then the schema-backed settings, so
-// everything editable lives on one tab under the "Settings" title.
-function rowsForTab(tab: PanelTab, config: AppConfig): Row[] {
+// everything editable lives on one tab under the "Settings" title. Setting labels
+// are localized (zh from the i18n table, falling back to the spec's English).
+function rowsForTab(tab: PanelTab, config: AppConfig, t: Tr, lang: Lang): Row[] {
   if (tab === 'config' || tab === 'settings') {
-    return [...coreRows(config), ...SETTINGS.map((s) => ({ kind: 'setting' as const, key: s.key, label: s.label, spec: s }))]
+    return [...coreRows(config, t), ...SETTINGS.map((s) => ({ kind: 'setting' as const, key: s.key, label: settingLabel(lang, s.key, s.label), spec: s }))]
   }
   return []
 }
 
 // The current value of a row, formatted for the value column.
-function rowValue(row: Row, config: AppConfig): string {
-  if (row.kind === 'readonly') return config.apiKey ? 'set (from env)' : 'not set'
+function rowValue(row: Row, config: AppConfig, t: Tr): string {
+  if (row.kind === 'readonly') return config.apiKey ? t('val.setFromEnv') : t('val.notSet')
   if (row.kind === 'core') {
-    if (row.key === 'system') return config.system ? 'custom' : 'default'
+    if (row.key === 'system') return config.system ? t('val.custom') : t('val.default')
     if (row.key === 'theme') return config.theme ?? DEFAULT_THEME
     return String(config[row.key] ?? '')
   }
@@ -90,17 +105,17 @@ function rowValue(row: Row, config: AppConfig): string {
   if (spec.type === 'boolean') return v ? 'true' : 'false'
   const base = spec.type === 'number' ? `${v}${spec.unit ?? ''}` : String(v)
   // Mark the default like Claude Code ("medium (default)") — but not for booleans.
-  return v === spec.default ? `${base} (default)` : base
+  return v === spec.default ? t('val.withDefault', { base }) : base
 }
 
 // A one-line hint describing the focused row (its schema description or how to
 // edit it), shown just above the footer.
-function rowHint(row: Row | undefined): string {
+function rowHint(row: Row | undefined, t: Tr, lang: Lang): string {
   if (!row) return ''
-  if (row.kind === 'setting') return `${row.spec.description}. Accepts: ${settingHint(row.spec)}.`
-  if (row.kind === 'readonly') return 'Read from ANTHROPIC_API_KEY — never set or stored here.'
-  if (row.ctl === 'enum') return `Cycle with Enter/Space. Options: ${(row.values ?? []).join(', ')}.`
-  return 'Press Enter to edit. Empty value clears it.'
+  if (row.kind === 'setting') return t('hint.setting', { desc: settingDesc(lang, row.spec.key, row.spec.description), hint: settingHint(row.spec) })
+  if (row.kind === 'readonly') return t('hint.apikey')
+  if (row.ctl === 'enum') return t('hint.enum', { opts: (row.values ?? []).join(', ') })
+  return t('hint.text')
 }
 
 // Whether a row is edited inline (number/string) vs toggled/cycled in place.
@@ -119,23 +134,28 @@ function editSeed(row: Row, config: AppConfig): string {
 
 // Read-only tab bodies. Each returns markdown-free lines the panel renders as a
 // simple column — mirroring what the /status, /usage, /stats text commands show.
-function statusLines(config: AppConfig, usage: SessionUsage, messages: Message[], goal: string, loop: string): string[] {
+function statusLines(config: AppConfig, usage: SessionUsage, messages: Message[], goal: string, loop: string, t: Tr): string[] {
   const ctx = contextState(messages, config.model)
   const pct = Math.round(ctx.ratio * 100)
   const mem = loadMemory()
   const skills = loadSkills()
   const custom = loadUserCommands()
+  // Pad the label column by display width (not string length) so zh labels align
+  // like ASCII ones — a CJK glyph is two columns wide.
+  const labels = [t('status.cwd'), t('status.providerModel'), t('status.apiKey'), t('status.context'), t('status.session'), t('status.goal'), t('status.loop')]
+  const W = Math.max(...labels.map(displayWidth)) + 1
+  const pad = (s: string): string => fitToWidth(s, W)
   return [
     `${NAME} v${VERSION}`,
     '',
-    `cwd            ${process.cwd()}`,
-    `provider/model ${config.provider} / ${config.model}`,
-    `api key        ${config.apiKey ? 'set' : 'not set'}   ·   theme  ${config.theme ?? DEFAULT_THEME}`,
-    `context        ${bar(ctx.ratio, 16)} ${pct}% (${contextLevel(ctx.ratio)})`,
-    `session        ${usage.turns} turns · ${fmtTokens(usage.inputTokens + usage.outputTokens)} tokens · ${usage.toolCalls} tool calls · ${usage.compactions} compactions`,
-    `goal           ${goal}`,
-    `loop           ${loop}`,
-    `notes ${mem.notes.length} · skills ${skills.length} · custom commands ${custom.length}`,
+    `${pad(t('status.cwd'))}${process.cwd()}`,
+    `${pad(t('status.providerModel'))}${config.provider} / ${config.model}`,
+    `${pad(t('status.apiKey'))}${config.apiKey ? t('status.set') : t('status.notSet')}   ·   ${t('core.theme')}  ${config.theme ?? DEFAULT_THEME}`,
+    `${pad(t('status.context'))}${bar(ctx.ratio, 16)} ${pct}% (${contextLevel(ctx.ratio)})`,
+    `${pad(t('status.session'))}${t('status.sessionValue', { turns: usage.turns, tokens: fmtTokens(usage.inputTokens + usage.outputTokens), tools: usage.toolCalls, compactions: usage.compactions })}`,
+    `${pad(t('status.goal'))}${goal}`,
+    `${pad(t('status.loop'))}${loop}`,
+    t('status.countsLine', { notes: mem.notes.length, skills: skills.length, custom: custom.length }),
   ]
 }
 
@@ -143,33 +163,39 @@ function statusLines(config: AppConfig, usage: SessionUsage, messages: Message[]
 // rates (lib/pricing) regardless of provider; tokens/cache are the provider's
 // real counts when reported (0 for mock). Sections are laid out so each heading
 // is the only line followed by a blank (see the heading heuristic in render).
-function usageLines(config: AppConfig, usage: SessionUsage, messages: Message[]): string[] {
+function usageLines(config: AppConfig, usage: SessionUsage, messages: Message[], t: Tr): string[] {
   const ctx = contextState(messages, config.model)
   const pct = Math.round(ctx.ratio * 100)
   const totalTokens = usage.inputTokens + usage.outputTokens + usage.cacheReadTokens + usage.cacheCreationTokens
   const wallMs = Math.max(0, Date.now() - usage.startedAt)
+  const labels = [t('usage.totalCost'), t('usage.durationApi'), t('usage.durationWall'), t('usage.codeChanges'), t('usage.turnsTools'), t('usage.input'), t('usage.output'), t('usage.cacheRead'), t('usage.cacheWrite'), t('usage.totalTokens')]
+  const W = Math.max(...labels.map(displayWidth)) + 2
+  const pad = (s: string): string => fitToWidth(s, W)
   return [
-    'Session', '',
-    `Total cost              ${fmtUsd(usage.costUsd)}`,
-    `Total duration (API)    ${fmtDuration(usage.apiMs)}`,
-    `Total duration (wall)   ${fmtDuration(wallMs)}`,
-    `Total code changes      ${usage.linesAdded} added · ${usage.linesRemoved} removed`,
-    `Turns · tool calls      ${usage.turns} · ${usage.toolCalls}`,
-    'Usage', '',
-    `Input                   ${fmtTokens(usage.inputTokens)}`,
-    `Output                  ${fmtTokens(usage.outputTokens)}`,
-    `Cache read              ${fmtTokens(usage.cacheReadTokens)}`,
-    `Cache write             ${fmtTokens(usage.cacheCreationTokens)}`,
-    `Total tokens            ${fmtTokens(totalTokens)}`,
-    'Context window', '',
+    t('usage.sectionSession'), '',
+    `${pad(t('usage.totalCost'))}${fmtUsd(usage.costUsd)}`,
+    `${pad(t('usage.durationApi'))}${fmtDuration(usage.apiMs)}`,
+    `${pad(t('usage.durationWall'))}${fmtDuration(wallMs)}`,
+    `${pad(t('usage.codeChanges'))}${t('usage.codeChangesValue', { added: usage.linesAdded, removed: usage.linesRemoved })}`,
+    `${pad(t('usage.turnsTools'))}${usage.turns} · ${usage.toolCalls}`,
+    t('usage.sectionUsage'), '',
+    `${pad(t('usage.input'))}${fmtTokens(usage.inputTokens)}`,
+    `${pad(t('usage.output'))}${fmtTokens(usage.outputTokens)}`,
+    `${pad(t('usage.cacheRead'))}${fmtTokens(usage.cacheReadTokens)}`,
+    `${pad(t('usage.cacheWrite'))}${fmtTokens(usage.cacheCreationTokens)}`,
+    `${pad(t('usage.totalTokens'))}${fmtTokens(totalTokens)}`,
+    t('usage.sectionContext'), '',
     `${bar(ctx.ratio, 20)} ${pct}%`,
-    `used ${fmtTokens(ctx.used)} / ${fmtTokens(ctx.limit)}  ·  remaining ${fmtTokens(ctx.remaining)}`,
+    t('usage.ctxUsed', { used: fmtTokens(ctx.used), limit: fmtTokens(ctx.limit), remaining: fmtTokens(ctx.remaining) }),
   ]
 }
 
 export function SettingsPanel(props: Props): React.ReactElement {
   const { tab, width, rows, config, usage, messages, goalStatus, loopStatus, setConfig, onChangeTab, onClose } = props
   const colors = useTheme()
+  const t = useT()
+  const lang = useLang()
+  const { stdin } = useStdin()
   const [cursor, setCursor] = useState(0)
   const [search, setSearch] = useState('')
   // Editable tabs are search-first: the tab opens focused on the search box, and
@@ -184,20 +210,29 @@ export function SettingsPanel(props: Props): React.ReactElement {
   // Overview/Models view, 1 = the Range filter) and ↵/space cycles the focused
   // one — the same move/change model as the editable tabs, so Range is reachable.
   const [statsCursor, setStatsCursor] = useState(0)
+  // Which tab the mouse is hovering (index into TABS), or null. Drives an
+  // underline under that tab so hover has visible feedback, like Claude Code's nav.
+  const [hoverTab, setHoverTab] = useState<number | null>(null)
+  // Which Stats selector token the mouse is hovering ('overview'|'models'|'all'|
+  // '30d'|'7d'), or null — underlined the same way for hover feedback.
+  const [hoverStat, setHoverStat] = useState<string | null>(null)
 
   // Every tab switch resets navigation/search/edit/stats state so each tab opens clean.
   useEffect(() => {
     setCursor(0); setSearch(''); setFocus('search'); setEditing(false); setEditError(null)
-    setStatsSub('overview'); setStatsRange('all'); setStatsCursor(0)
+    setStatsSub('overview'); setStatsRange('all'); setStatsCursor(0); setHoverStat(null)
   }, [tab])
 
   const editable = tab === 'config' || tab === 'settings'
-  const allRows = useMemo(() => rowsForTab(tab, config), [tab, config])
+  // Labels are localized, so recompute when the language changes (t's identity
+  // isn't stable across renders, so `lang` is the real dependency).
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const allRows = useMemo(() => rowsForTab(tab, config, t, lang), [tab, config, lang])
   const q = search.trim().toLowerCase()
   const filtered = q ? allRows.filter((r) => r.label.toLowerCase().includes(q)) : allRows
   const cur = Math.min(cursor, Math.max(0, filtered.length - 1))
   const focused: Row | undefined = filtered[cur]
-  const labelW = Math.min(38, Math.max(8, ...allRows.map((r) => r.label.length)))
+  const labelW = Math.min(38, Math.max(8, ...allRows.map((r) => displayWidth(r.label))))
 
   const switchTab = (delta: number): void => {
     const i = TABS.findIndex((t) => t.id === tab)
@@ -246,6 +281,10 @@ export function SettingsPanel(props: Props): React.ReactElement {
   }
 
   useInput((input, key) => {
+    // Drop mouse reports Ink may surface here as text (SGR / legacy forms), so
+    // pointer movement never pollutes the search box or the inline editor (the
+    // panel handles the mouse via its own stdin listener below).
+    if (input && (/\x1b?\[<\d+;\d+;\d+[Mm]/.test(input) || /\x1b?\[M/.test(input))) return
     if (editing) {
       if (key.return) { commit(); return }
       if (key.escape) { setEditing(false); setEditError(null); return }
@@ -327,35 +366,175 @@ export function SettingsPanel(props: Props): React.ReactElement {
   const above = start
   const below = Math.max(0, filtered.length - (start + listRows))
 
+  // ---- mouse geometry / hit-testing ----
+  // The panel renders top-anchored (its modal wrapper is a default row-direction
+  // flex box, so justifyContent doesn't move it vertically): the top border sits
+  // on screen row 1, so everything is measured DOWN from there. SGR y is 1-based.
+  // Content col c ↔ screen x = c + COL_OFF, where COL_OFF = border(1) + paddingX(1)
+  // + 1 (to 1-based). The tab strip is a fixed row; the editable list starts after
+  // title/tabs/blank/search/blank, pushed one row down when "↑ N more above" shows.
+  const COL_OFF = 3
+  const TAB_ROW = 3 // border(1) + title(1) → tabs on screen row 3
+  const SEARCH_ROW = 5 // border/title/tabs/blank → search box on screen row 5
+  const STATS_SUB_ROW = 5 // stats body starts after tabs/blank → sub-view row here
+  const STATS_RANGE_ROW = 7 // sub-view/blank → Range row (only on the Overview view)
+  const listFirstRow = 7 + (above > 0 ? 1 : 0) // after tabs/blank/search/blank[/↑more]
+  const listLastRow = listFirstRow + windowed.length - 1
+  // Content-column span of each tab token (" Label "), for click hit-testing.
+  // Measured from the *translated* label, so it stays correct in zh; `lang` is
+  // the memo dependency (t's identity isn't stable).
+  const tabSegs = useMemo(() => {
+    let col = 0
+    return TABS.map((tb, i) => {
+      const w = displayWidth(` ${t(tb.labelKey)} `)
+      const seg = { id: tb.id, tabIndex: i, start: col, end: col + w - 1 }
+      col += w
+      return seg
+    })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [lang])
+  // Stats selector spans, recomputed from translated token widths (see the note
+  // where the old constants used to be). The sub-view row is `<2-col marker>` +
+  // ` Overview ` + ` Models `; the range row is `<2-col marker>` + `Range ` +
+  // ` all ` + ` 30d ` + ` 7d ` — the range/sub labels translate, the range ids
+  // (all/30d/7d) don't.
+  const statsSubSegs = useMemo(() => {
+    const wo = displayWidth(` ${t('stats.tab.overview')} `)
+    const wm = displayWidth(` ${t('stats.tab.models')} `)
+    return [
+      { id: 'overview', start: 2, end: 2 + wo - 1 },
+      { id: 'models', start: 2 + wo, end: 2 + wo + wm - 1 },
+    ] as const
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [lang])
+  const statsRangeSegs = useMemo(() => {
+    const base = 2 + displayWidth(`${t('stats.range')} `)
+    const wa = displayWidth(' all '); const w3 = displayWidth(' 30d '); const w7 = displayWidth(' 7d ')
+    return [
+      { id: 'all', start: base, end: base + wa - 1 },
+      { id: '30d', start: base + wa, end: base + wa + w3 - 1 },
+      { id: '7d', start: base + wa + w3, end: base + wa + w3 + w7 - 1 },
+    ] as const
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [lang])
+  const isStats = tab === 'stats'
+  const statsRangeShown = statsSub === 'overview'
+  // Refs the stdin listener (attached once) reads for the latest render's layout
+  // and actions, mirroring ModelPicker so hover/click/wheel stay in sync.
+  const uiRef = useRef({ editable, editing, isStats, statsRangeShown, tabSegs, statsSubSegs, statsRangeSegs, windowStart: start, firstItemRow: listFirstRow, lastItemRow: listLastRow, filteredLen: filtered.length })
+  uiRef.current = { editable, editing, isStats, statsRangeShown, tabSegs, statsSubSegs, statsRangeSegs, windowStart: start, firstItemRow: listFirstRow, lastItemRow: listLastRow, filteredLen: filtered.length }
+  const actRef = useRef({ switchTo: (_id: PanelTab) => {}, hover: (_i: number) => {}, click: (_i: number) => {}, wheel: (_d: number) => {}, focusSearch: () => {}, setHoverTab: (_i: number | null) => {}, setHoverStat: (_id: string | null) => {}, statsClick: (_id: string) => {} })
+  actRef.current = {
+    switchTo: (id: PanelTab) => { if (id !== tab) onChangeTab(id) },
+    hover: (i: number) => { setFocus('list'); setCursor((c) => (c === i ? c : i)) },
+    click: (i: number) => { const r = filtered[i]; setFocus('list'); setCursor(i); if (r) activate(r) },
+    wheel: (d: number) => { setFocus('list'); setCursor((c) => Math.max(0, Math.min(filtered.length - 1, c + d))) },
+    focusSearch: () => setFocus('search'),
+    setHoverTab: (i) => setHoverTab((h) => (h === i ? h : i)),
+    setHoverStat: (id) => setHoverStat((h) => (h === id ? h : id)),
+    statsClick: (id) => {
+      if (id === 'overview' || id === 'models') { setStatsSub(id); setStatsCursor(0) }
+      else { setStatsRange(id as Range); setStatsCursor(1) }
+    },
+  }
+
+  // Enable any-motion mouse reporting (?1003h) so hover moves the highlight; the
+  // app skips mouse while a modal is open, so this overlay owns it. On unmount
+  // re-assert the app's base modes (?1000h?1002h?1006h) — a bare ?1003l can clear
+  // tracking entirely on single-mode terminals, leaving the wheel to emit ↑/↓
+  // (which PromptInput reads as history navigation).
+  useEffect(() => {
+    const out = process.stdout
+    try { out.write('\x1b[?1003h') } catch { /* best-effort */ }
+    const onData = (buf: Buffer): void => {
+      const s = buf.toString('utf8')
+      const re = /\x1b\[<(\d+);(\d+);(\d+)([Mm])/g
+      let m: RegExpExecArray | null
+      while ((m = re.exec(s)) !== null) {
+        const L = uiRef.current; const A = actRef.current
+        if (L.editing) continue
+        const b = Number(m[1]); const x = Number(m[2]); const y = Number(m[3]); const release = m[4] === 'm'
+        const cc = x - COL_OFF // 1-based screen x → 0-based content column
+        // Wheel (buttons 64/65) → move the editable list cursor.
+        if (b === 64 || b === 65) {
+          A.setHoverTab(null); A.setHoverStat(null)
+          if (L.editable && L.filteredLen > 0) A.wheel(b === 65 ? 1 : -1)
+          continue
+        }
+        // Tab strip: hover underlines the tab, release (click) switches to it.
+        if (y === TAB_ROW) {
+          const seg = L.tabSegs.find((t) => cc >= t.start && cc <= t.end)
+          A.setHoverTab(seg ? seg.tabIndex : null); A.setHoverStat(null)
+          if (release && seg) A.switchTo(seg.id)
+          continue
+        }
+        A.setHoverTab(null) // pointer left the tab row
+        // Stats tab: the sub-view (Overview/Models) and Range selector rows.
+        if (L.isStats) {
+          if (y === STATS_SUB_ROW) {
+            const seg = L.statsSubSegs.find((t) => cc >= t.start && cc <= t.end)
+            A.setHoverStat(seg ? seg.id : null)
+            if (release && seg) A.statsClick(seg.id)
+            continue
+          }
+          if (L.statsRangeShown && y === STATS_RANGE_ROW) {
+            const seg = L.statsRangeSegs.find((t) => cc >= t.start && cc <= t.end)
+            A.setHoverStat(seg ? seg.id : null)
+            if (release && seg) A.statsClick(seg.id)
+            continue
+          }
+          A.setHoverStat(null)
+          continue
+        }
+        A.setHoverStat(null)
+        // Search box: a click returns focus to it (the way back from the list).
+        if (L.editable && y === SEARCH_ROW) {
+          if (release) A.focusSearch()
+          continue
+        }
+        // Editable list rows: hover moves the highlight, release (click) activates.
+        if (L.editable && L.filteredLen > 0 && y >= L.firstItemRow && y <= L.lastItemRow) {
+          const real = L.windowStart + (y - L.firstItemRow)
+          if (real < 0 || real >= L.filteredLen) continue
+          if (release) A.click(real)
+          else A.hover(real)
+        }
+      }
+    }
+    stdin?.on('data', onData)
+    return () => { stdin?.off('data', onData); try { out.write('\x1b[?1003l\x1b[?1000h\x1b[?1002h\x1b[?1006h') } catch { /* best-effort */ } }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [stdin])
+
   const goal = goalStatus?.() ?? 'none'
   const loop = loopStatus?.() ?? 'none'
   const roAll =
-    tab === 'status' ? statusLines(config, usage, messages, goal, loop)
-    : tab === 'usage' ? usageLines(config, usage, messages)
+    tab === 'status' ? statusLines(config, usage, messages, goal, loop, t)
+    : tab === 'usage' ? usageLines(config, usage, messages, t)
     : []
   // Read-only tabs have no scroll keys, so clamp to the budget: on a terminal too
   // short to show everything, drop the overflow and note it rather than letting the
   // frame spill past the viewport (which is what desynced Ink's repaint).
   const roLines = roAll.length > bodyBudget
-    ? [...roAll.slice(0, Math.max(1, bodyBudget - 1)), `… +${roAll.length - Math.max(1, bodyBudget - 1)} more — resize terminal`]
+    ? [...roAll.slice(0, Math.max(1, bodyBudget - 1)), t('panel.overflowMore', { n: roAll.length - Math.max(1, bodyBudget - 1) })]
     : roAll
 
   const footer =
-    editing ? 'type · ↵ save · esc cancel'
-    : tab === 'stats' ? '↑↓ move · ↵/space change · ←→ tabs · esc close'
-    : !editable ? '←→ tabs · esc close'
-    : focus === 'search' ? `type to filter · ↓/↵ list · esc ${search ? 'clear' : 'close'} · ←→ tabs`
-    : '↑↓ move · ↵/space change · / search · ←→ tabs · esc close'
+    editing ? t('footer.editing')
+    : tab === 'stats' ? t('footer.stats')
+    : !editable ? t('footer.readonly')
+    : focus === 'search' ? (search ? t('footer.searchClear') : t('footer.searchClose'))
+    : t('footer.list')
 
   return (
     <Box flexDirection="column" width={width} borderStyle="round" borderColor={colors.accentDim} paddingX={1}>
-      <Text bold color={colors.accentBright}>Settings</Text>
+      <Text bold color={colors.accentBright}>{t('panel.title')}</Text>
       <Box>
-        {TABS.map((t) => {
-          const active = t.id === tab
+        {TABS.map((tb, i) => {
+          const active = tb.id === tab
           return (
-            <Text key={t.id} inverse={active} bold={active} color={active ? undefined : colors.dim}>
-              {` ${t.label} `}
+            <Text key={tb.id} inverse={active} bold={active} underline={hoverTab === i} color={active ? undefined : colors.dim}>
+              {` ${t(tb.labelKey)} `}
             </Text>
           )
         })}
@@ -367,27 +546,27 @@ export function SettingsPanel(props: Props): React.ReactElement {
             {'🔍 '}
             {search
               ? <Text color={colors.text}>{search}</Text>
-              : <Text color={colors.dim}>{tab === 'config' ? 'Search settings…' : 'Search options…'}</Text>}
+              : <Text color={colors.dim}>{tab === 'config' ? t('panel.searchSettings') : t('panel.searchOptions')}</Text>}
             {focus === 'search' ? '▏' : ''}
           </Text>
           <Text> </Text>
-          {above > 0 ? <Text color={colors.dim}>{`  ↑ ${above} more above`}</Text> : null}
-          {filtered.length === 0 ? <Text color={colors.dim}>  no matching settings</Text> : null}
+          {above > 0 ? <Text color={colors.dim}>{`  ${t('panel.moreAbove', { n: above })}`}</Text> : null}
+          {filtered.length === 0 ? <Text color={colors.dim}>{`  ${t('panel.noMatch')}`}</Text> : null}
           {windowed.map((row) => {
             const isCur = focus === 'list' && row === focused
             const editingThis = editing && isCur
             return (
               <Text key={`${row.kind}:${row.key}`} color={isCur ? colors.accentBright : colors.text} wrap="truncate">
-                {isCur ? '❯ ' : '  '}{row.label.padEnd(labelW).slice(0, labelW)}  {editingThis
+                {isCur ? '❯ ' : '  '}{fitToWidth(row.label, labelW)}  {editingThis
                   ? <Text color={colors.accent}>{draft}▏</Text>
-                  : <Text color={colors.dim}>{rowValue(row, config)}</Text>}
+                  : <Text color={colors.dim}>{rowValue(row, config, t)}</Text>}
               </Text>
             )
           })}
-          {below > 0 ? <Text color={colors.dim}>{`  ↓ ${below} more below`}</Text> : null}
+          {below > 0 ? <Text color={colors.dim}>{`  ${t('panel.moreBelow', { n: below })}`}</Text> : null}
         </Box>
       ) : tab === 'stats' ? (
-        <StatsView width={width - 6} rows={bodyBudget} sub={statsSub} range={statsRange} focusRow={statsSub === 'overview' ? Math.min(statsCursor, 1) : 0} />
+        <StatsView width={width - 6} rows={bodyBudget} sub={statsSub} range={statsRange} focusRow={statsSub === 'overview' ? Math.min(statsCursor, 1) : 0} hover={hoverStat} />
       ) : (
         <Box flexDirection="column">
           {roLines.map((line, i) => {
@@ -401,7 +580,7 @@ export function SettingsPanel(props: Props): React.ReactElement {
       <Text> </Text>
       {editError
         ? <Text color={colors.error} wrap="truncate">{`⚠ ${editError}`}</Text>
-        : (editable && focused && focus === 'list' ? <Text color={colors.dim} wrap="truncate">{rowHint(focused)}</Text> : null)}
+        : (editable && focused && focus === 'list' ? <Text color={colors.dim} wrap="truncate">{rowHint(focused, t, lang)}</Text> : null)}
       <Text color={colors.dim}>{footer}</Text>
     </Box>
   )
