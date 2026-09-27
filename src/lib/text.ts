@@ -90,3 +90,42 @@ export function fitToWidth(s: string, cols: number): string {
   return t + ' '.repeat(pad)
 }
 
+/**
+ * Hard-wrap `s` into segments each at most `maxCols` display columns wide,
+ * breaking on grapheme boundaries (no word wrap — this is for code/log output
+ * where a break can land anywhere). Always returns at least one segment, so an
+ * empty string yields `['']` (one row). A single grapheme wider than `maxCols`
+ * sits alone on its row rather than looping forever.
+ */
+export function wrapToWidth(s: string, maxCols: number): string[] {
+  if (maxCols < 1) return [s]
+  const out: string[] = []
+  let cur = ''
+  let used = 0
+  for (const g of toGraphemes(s)) {
+    const w = cellWidth(g)
+    if (used + w > maxCols && cur !== '') { out.push(cur); cur = ''; used = 0 }
+    cur += g
+    used += w
+  }
+  out.push(cur)
+  return out
+}
+
+/**
+ * Expand tab characters to spaces so the string's measured width matches what a
+ * terminal draws (string-width counts a raw '\t' as 0, but the terminal advances
+ * to the next 8-column tab stop). `start` is the display column the string
+ * begins at, so tab stops line up with the surrounding layout.
+ */
+export function expandTabs(s: string, start = 0): string {
+  if (!s.includes('\t')) return s
+  let out = ''
+  let col = start
+  for (const g of toGraphemes(s)) {
+    if (g === '\t') { const n = 8 - (col % 8); out += ' '.repeat(n); col += n }
+    else { out += g; col += cellWidth(g) }
+  }
+  return out
+}
+

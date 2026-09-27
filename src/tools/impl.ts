@@ -6,6 +6,7 @@ import path from 'node:path'
 import { spawn } from 'node:child_process'
 import type { SpawnOpts, SpawnResult, ToolContext, ToolDef, ToolResult } from './types'
 import type { AgentEvent, AgentSnapshot, DiffLine, WorkflowAgent } from '../types'
+import { startBackground, listBackground, waitForBackground } from '../lib/background'
 
 const MAX_OUT = 30000 // hard cap on any single tool's returned text
 
@@ -501,7 +502,8 @@ const task: ToolDef = {
   name: 'task',
   description:
     'Delegate a self-contained sub-task to a fresh sub-agent that has the same file/search/shell tools and its own context. ' +
-    'Use for focused work you want handled independently (deep research, a scoped edit, a broad search). Returns the sub-agent\'s final report. Sub-agents cannot spawn further sub-agents.',
+    'Use for focused work you want handled independently (deep research, a scoped edit, a broad search). Returns the sub-agent\'s final report. Sub-agents cannot spawn further sub-agents. ' +
+    'Pass `background: true` to run it WITHOUT blocking: you get a handle id immediately and can keep working, then collect it with `agent_wait` (or just end your turn — the system feeds finished background work back so you resume automatically).',
   orchestration: true,
   input_schema: {
     type: 'object',
@@ -509,6 +511,7 @@ const task: ToolDef = {
       description: { type: 'string', description: 'A short (3-6 word) label for the sub-task.' },
       prompt: { type: 'string', description: 'The full, self-contained instructions for the sub-agent.' },
       subagent_type: { type: 'string', enum: Object.keys(SUBAGENT_ROLES), description: 'Sub-agent role (default: general).' },
+      background: { type: 'boolean', description: 'Run in the background (non-blocking): returns a handle id immediately instead of the result.' },
     },
     required: ['prompt'],
   },
@@ -517,6 +520,15 @@ const task: ToolDef = {
     const prompt = String(input.prompt ?? '').trim()
     if (!prompt) return { content: 'task requires a `prompt`.', isError: true }
     const label = String(input.description ?? 'task').trim() || 'task'
+    // Non-blocking: register the run and return a handle immediately. The work
+    // keeps going after this turn; agent_wait collects it, or the turn-end
+    // wake-up feeds it back so the main agent resumes on its own.
+    if (input.background && ctx.allowBackground) {
+      const id = startBackground(label, 'task', () =>
+        runSwitchableAgent(ctx, { prompt, label, type: input.subagent_type }, 'task')
+          .then((r) => ({ text: `▸ sub-agent "${label}" · ${r.steps} tool call${r.steps === 1 ? '' : 's'}${r.error ? ` · error: ${r.error}` : ''}\n\n${r.text || '(no output)'}`, error: r.error })))
+      return { content: `▸ 后台子代理已启动 "${label}" · 句柄 ${id}。用 agent_status 查询、agent_wait 收集，或本轮结束后由系统在其完成时自动喂回并唤醒继续。` }
+    }
     // A `task` is a single switchable sub-agent: it streams its own transcript
     // through ctx.onAgent so the user can switch the viewport to it (distinct
     // from `workflow`, which shows a progress tree).
@@ -574,6 +586,7 @@ const workflow: ToolDef = {
           required: ['prompt'],
         },
       },
+      background: { type: 'boolean', description: 'Run in the background (non-blocking): returns a handle id immediately instead of the collected reports.' },
     },
     required: ['tasks'],
   },
@@ -586,19 +599,69 @@ const workflow: ToolDef = {
     if (tasks.length === 0) return { content: 'workflow requires a non-empty `tasks` array, each with a `prompt`.', isError: true }
     const capped = tasks.slice(0, WORKFLOW_MAX_TASKS)
     const dropped = tasks.length - capped.length
-    // Same live-snapshot engine as `task`/`plan`, just fanned out: up to
-    // WORKFLOW_CONCURRENCY sub-agents run at once, each transition pushed to the UI.
-    const results = await runAgentBatch(ctx, capped, {
+    const runBatch = (): Promise<string> => runAgentBatch(ctx, capped, {
       title: `workflow · ${capped.length} sub-agent${capped.length === 1 ? '' : 's'}`,
       idPrefix: 'wf', concurrency: WORKFLOW_CONCURRENCY,
+    }).then((results) => {
+      const totalSteps = results.reduce((n, r) => n + r.steps, 0)
+      const body = results
+        .map((r, i) => `### ${i + 1}. ${r.label}${r.error ? ` (error: ${r.error})` : ''}\n${r.text || '(no output)'}`)
+        .join('\n\n')
+      const header = `▸ workflow · ${capped.length} sub-agent${capped.length === 1 ? '' : 's'} · ${totalSteps} tool calls${dropped > 0 ? ` · ${dropped} extra task(s) dropped (max ${WORKFLOW_MAX_TASKS})` : ''}`
+      return clip(`${header}\n\n${body}`)
     })
-    const totalSteps = results.reduce((n, r) => n + r.steps, 0)
-    const body = results
-      .map((r, i) => `### ${i + 1}. ${r.label}${r.error ? ` (error: ${r.error})` : ''}\n${r.text || '(no output)'}`)
-      .join('\n\n')
-    const header = `▸ workflow · ${capped.length} sub-agent${capped.length === 1 ? '' : 's'} · ${totalSteps} tool calls${dropped > 0 ? ` · ${dropped} extra task(s) dropped (max ${WORKFLOW_MAX_TASKS})` : ''}`
-    return { content: clip(`${header}\n\n${body}`) }
+    // Non-blocking: register the fan-out and return a handle immediately.
+    if (input.background && ctx.allowBackground) {
+      const id = startBackground(`workflow · ${capped.length}`, 'workflow', async () => ({ text: await runBatch() }))
+      return { content: `▸ 后台工作流已启动 · ${capped.length} 个子代理 · 句柄 ${id}。用 agent_status 查询、agent_wait 收集，或本轮结束后由系统在其完成时自动喂回并唤醒继续。` }
+    }
+    // Same live-snapshot engine as `task`/`plan`, just fanned out: up to
+    // WORKFLOW_CONCURRENCY sub-agents run at once, each transition pushed to the UI.
+    return { content: await runBatch() }
   },
 }
 
-export const TOOLS: ToolDef[] = [bash, readFile, writeFile, editFile, grep, globTool, listDir, task, plan, workflow]
+// --- Background orchestration: check on / collect non-blocking task/workflow runs.
+
+const agentStatus: ToolDef = {
+  name: 'agent_status',
+  description:
+    'List the background sub-agent tasks you started (task/workflow with background: true) and their current status (running / done / error). Non-blocking. Use it to see what background work is still in flight.',
+  orchestration: true,
+  input_schema: { type: 'object', properties: {} },
+  async run(_input, ctx) {
+    if (!ctx.allowBackground) return { content: 'background tasks are not available here.', isError: true }
+    const list = listBackground()
+    if (list.length === 0) return { content: 'No background tasks.' }
+    const lines = list.map((t) => {
+      const secs = (((t.endedAt ?? Date.now()) - t.startedAt) / 1000).toFixed(0)
+      return `• ${t.id} · ${t.label} · ${t.kind} · ${t.status} (${secs}s)`
+    })
+    return { content: `Background tasks (${list.length}):\n${lines.join('\n')}` }
+  },
+}
+
+const agentWait: ToolDef = {
+  name: 'agent_wait',
+  description:
+    'Block until background sub-agent work finishes and return its results. Pass `ids` to wait for specific handles, or omit to wait for ALL running background tasks. Use this to collect background work before you depend on its output.',
+  orchestration: true,
+  input_schema: {
+    type: 'object',
+    properties: {
+      ids: { type: 'array', items: { type: 'string' }, description: 'Handle ids (from a background task/workflow) to wait for. Omit to wait for all.' },
+    },
+  },
+  async run(input, ctx) {
+    if (!ctx.allowBackground) return { content: 'background tasks are not available here.', isError: true }
+    const ids = Array.isArray(input.ids) ? input.ids.map((x) => String(x)) : undefined
+    if (listBackground().length === 0) return { content: 'No background tasks to wait for.' }
+    const done = await waitForBackground(ids)
+    if (ctx.signal?.aborted) return { content: '(aborted)', isError: true }
+    if (done.length === 0) return { content: 'No matching background tasks (already collected or unknown ids).' }
+    const body = done.map((t) => `### ${t.label} (${t.id}) · ${t.status}${t.error ? ` · error: ${t.error}` : ''}\n${t.result || '(no output)'}`).join('\n\n')
+    return { content: clip(`Collected ${done.length} background task${done.length === 1 ? '' : 's'}:\n\n${body}`) }
+  },
+}
+
+export const TOOLS: ToolDef[] = [bash, readFile, writeFile, editFile, grep, globTool, listDir, task, plan, workflow, agentStatus, agentWait]

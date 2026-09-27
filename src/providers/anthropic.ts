@@ -1,12 +1,33 @@
 import type { AgentEvent, Message, Provider, StreamOpts } from '../types'
 import { loadConfig } from '../config'
 import { runTool, toolSchemas, type SpawnOpts, type SpawnResult } from '../tools'
+import { estimateTokens } from '../lib/tokens'
+import { contextLimit, AUTO_COMPACT_RATIO } from '../lib/usage'
 
 const API_VERSION = '2023-06-01'
-const MAX_STEPS = 24 // safety cap on tool-use iterations within a single turn
-const MAX_ATTEMPTS = 5 // total tries per request before giving up
-// Transient HTTP statuses worth retrying (rate limit, overload, gateway churn).
-const RETRY_STATUS = new Set([408, 409, 429, 500, 502, 503, 504, 529])
+// Last-resort guard against a runaway loop (e.g. a misbehaving provider that keeps
+// returning tool_use forever). Deliberately high so it never fires on real work —
+// like Claude Code, the real limits are the context window (→ auto-compaction) and
+// the user's interrupt, not a small fixed step count.
+const MAX_STEPS = 1000
+const MAX_ATTEMPTS = 10 // default total tries per request before giving up
+// Default transient HTTP statuses worth retrying (rate limit, overload, gateway
+// churn). Overridable per-request via StreamOpts.retryStatusCodes.
+const DEFAULT_RETRY_CODES = '408,409,429,500-599'
+
+// Compile a retry-code spec ('408,409,429,500-599') into a fast predicate. Each
+// comma-separated part is a single code or an inclusive `lo-hi` range; malformed
+// parts are skipped. An empty/garbage spec yields a never-retry predicate.
+function parseRetryCodes(spec?: string): (s: number) => boolean {
+  const ranges: Array<[number, number]> = []
+  for (const part of (spec ?? DEFAULT_RETRY_CODES).split(',')) {
+    const m = /^\s*(\d+)(?:-(\d+))?\s*$/.exec(part)
+    if (!m) continue
+    const lo = Number(m[1]), hi = m[2] ? Number(m[2]) : lo
+    ranges.push([Math.min(lo, hi), Math.max(lo, hi)])
+  }
+  return ranges.length ? (s) => ranges.some(([a, b]) => s >= a && s <= b) : () => false
+}
 
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve) => {
@@ -99,11 +120,15 @@ interface StreamUsage { input: number; output: number; cacheRead: number; cacheC
 function emptyStreamUsage(): StreamUsage { return { input: 0, output: 0, cacheRead: 0, cacheCreation: 0 } }
 
 // Prior transcript → API messages (text turns only; tool history is rebuilt as
-// the loop runs so we never resend stale tool state).
+// the loop runs so we never resend stale tool state). Compaction digests are the
+// one exception to "user/assistant only": they carry role 'system' for the UI,
+// but must reach the model, so they're relabeled as a user turn here.
 function toApiMessages(messages: Message[]): ApiMsg[] {
   return messages
-    .filter((m) => (m.role === 'user' || m.role === 'assistant') && m.content.trim())
-    .map((m) => ({ role: m.role as 'user' | 'assistant', content: m.content }))
+    .filter((m) => (m.role === 'user' || m.role === 'assistant' || m.meta?.compacted) && m.content.trim())
+    .map((m) => m.meta?.compacted
+      ? { role: 'user' as const, content: `[Summary of the earlier conversation, which was compacted to save context]\n\n${m.content}` }
+      : { role: m.role as 'user' | 'assistant', content: m.content })
 }
 
 // A bearer-auth provider (new-api relay) sends `Authorization: Bearer <key>`;
@@ -194,14 +219,112 @@ async function* parseStream(res: Response, signal?: AbortSignal): AsyncGenerator
   yield { type: 'done', blocks: blocks.filter(Boolean), stopReason, usage }
 }
 
+// --- Mid-turn compaction --------------------------------------------------
+// Like Claude Code, a turn that keeps calling tools must not run into the
+// model's context limit. When the convo we're about to send nears the window,
+// the older messages are folded into a model-written summary and the loop
+// continues — the same idea as the between-turn /compact (see lib/compact,
+// lib/summarize), applied inside the tool loop.
+
+// Mirror of lib/summarize's SUMMARY_SYSTEM, kept local so the provider doesn't
+// import lib/summarize (which imports providers → a module init cycle).
+const SUMMARY_SYSTEM =
+  'You are compressing a long coding-assistant conversation so it can continue seamlessly after the older messages are dropped from the context window. ' +
+  'Write a dense, factual summary — notes, not prose — that a fresh instance of the assistant could read to pick up exactly where things left off. ' +
+  'Cover, in this order: (1) what the user is trying to accomplish and any explicit requirements or constraints they stated; ' +
+  '(2) key files, paths, functions, commands, and decisions made; (3) what has been done so far and its outcome (what worked, what failed); ' +
+  '(4) the current state and the concrete next steps. ' +
+  'Preserve exact identifiers (file paths, symbol names, flags, error text) — do not paraphrase them away. Omit pleasantries and filler. ' +
+  'Output ONLY the summary text.'
+
+// Rough token estimate of the API convo we'd send (the ~4-char/token heuristic
+// the rest of the app uses for its fill bar and thresholds — see lib/tokens).
+function estimateApiConvo(convo: ApiMsg[]): number {
+  let n = 0
+  for (const m of convo) {
+    if (typeof m.content === 'string') { n += estimateTokens(m.content); continue }
+    for (const b of m.content) {
+      if (b.type === 'text') n += estimateTokens(b.text)
+      else if (b.type === 'thinking') n += estimateTokens(b.thinking)
+      else if (b.type === 'tool_use') n += estimateTokens(JSON.stringify(b.input)) + 4
+      else if (b.type === 'tool_result') n += estimateTokens(b.content)
+    }
+  }
+  return n
+}
+
+// Render the folded slice as a labeled transcript for the summarizer. Blocks are
+// flattened to text; tool calls/results are noted and clipped so a huge slice
+// still fits the summarizer's own input budget.
+function renderApiConvo(msgs: ApiMsg[], perMsg = 2000): string {
+  const parts: string[] = []
+  for (const m of msgs) {
+    const who = m.role === 'user' ? 'USER' : 'ASSISTANT'
+    let body: string
+    if (typeof m.content === 'string') body = m.content
+    else {
+      const segs: string[] = []
+      for (const b of m.content) {
+        if (b.type === 'text') segs.push(b.text)
+        else if (b.type === 'tool_use') segs.push(`\u2192 ${b.name}(${JSON.stringify(b.input).slice(0, 300)})`)
+        else if (b.type === 'tool_result') segs.push(`\u2190 ${b.is_error ? 'error: ' : ''}${b.content.slice(0, 500)}`)
+      }
+      body = segs.join('\n')
+    }
+    if (!body.trim()) continue
+    parts.push(`${who}: ${body.length > perMsg ? body.slice(0, perMsg) + '\u2026' : body}`)
+  }
+  return parts.join('\n\n')
+}
+
+// Pick a fold boundary: keep a recent suffix, but snap the cut to an assistant
+// message so no tool_use/tool_result pair is split across the fold (the API
+// rejects an orphaned tool_result). Returns -1 when no safe, worthwhile cut
+// exists (nothing to fold, or the whole tail is one giant step).
+function pickCut(convo: ApiMsg[]): number {
+  if (convo.length < 4) return -1 // too short to fold anything worthwhile
+  // Keep ~a third as the recent tail, but never so much that fewer than 2
+  // messages remain to fold, and never fewer than the last couple of steps.
+  const keep = Math.min(convo.length - 2, Math.max(4, Math.floor(convo.length / 3)))
+  let cut = convo.length - keep
+  while (cut < convo.length && convo[cut].role !== 'assistant') cut++
+  return cut < convo.length ? cut : -1
+}
+
+// Fold the older slice into one summary "user" turn (relabeled like a compaction
+// digest, exactly as toApiMessages does for the between-turn path). Returns the
+// rewritten convo + how many messages were folded, or null when it can't (no
+// safe cut, or the one-shot summary call failed → caller keeps the convo as-is).
+async function compactConvo(convo: ApiMsg[], opts: StreamOpts, cfg: AnthropicOpts): Promise<{ convo: ApiMsg[]; folded: number } | null> {
+  const cut = pickCut(convo)
+  if (cut < 0) return null
+  let summary: string
+  try {
+    const raw = await complete(
+      [{ id: 'compact', role: 'user', content: 'Summarize the following conversation so it can continue after the older messages are dropped:\n\n' + renderApiConvo(convo.slice(0, cut)) }],
+      { model: opts.model, system: SUMMARY_SYSTEM, signal: opts.signal },
+      cfg,
+    )
+    summary = raw.trim()
+  } catch { return null }
+  if (!summary) return null
+  const digest: ApiMsg = { role: 'user', content: `[Summary of the earlier conversation, which was compacted to save context]\n\n${summary}` }
+  return { convo: [digest, ...convo.slice(cut)], folded: cut }
+}
+
 // `sub` marks a nested sub-agent run: it is offered no orchestration tools and
 // gets no spawnAgent in its tool context, so nesting is capped at one level.
 async function* agent(messages: Message[], opts: StreamOpts, cfg: AnthropicOpts, sub = false): AsyncGenerator<AgentEvent, void, unknown> {
   let apiKey = cfg.resolveKeyAsync ? await cfg.resolveKeyAsync() : resolveKey(cfg)
   if (!apiKey) { yield { type: 'text', text: keyHint(cfg) }; return }
   const url = resolveUrl(cfg)
-  const convo = toApiMessages(messages)
+  let convo = toApiMessages(messages)
   const cwd = process.cwd()
+
+  // Retry policy is configurable per request (see settings retryStatusCodes /
+  // retryMaxAttempts, threaded through StreamOpts); fall back to the built-ins.
+  const shouldRetry = parseRetryCodes(opts.retryStatusCodes)
+  const maxAttempts = opts.retryMaxAttempts && opts.retryMaxAttempts > 0 ? opts.retryMaxAttempts : MAX_ATTEMPTS
 
   // The orchestration tools (`task`, `workflow`) delegate through this callback.
   // Supplied only at the top level; a sub-agent receives `undefined` (so the
@@ -210,7 +333,7 @@ async function* agent(messages: Message[], opts: StreamOpts, cfg: AnthropicOpts,
     ? undefined
     : async (sp) => {
         const subMessages: Message[] = [{ id: 'sub-user', role: 'user', content: sp.prompt }]
-        const subOpts: StreamOpts = { model: opts.model, system: sp.system, signal: opts.signal }
+        const subOpts: StreamOpts = { model: opts.model, system: sp.system, signal: opts.signal, retryStatusCodes: opts.retryStatusCodes, retryMaxAttempts: opts.retryMaxAttempts }
         let text = ''
         let lastText = ''
         let steps = 0
@@ -232,7 +355,22 @@ async function* agent(messages: Message[], opts: StreamOpts, cfg: AnthropicOpts,
   // At most one forced token refresh per turn (on a 401), so an unrecoverable
   // auth failure surfaces as an error instead of looping. OAuth logins only.
   let refreshedAuth = false
+  // Convo length at the last mid-turn compaction — only re-compact once the
+  // convo has grown again, so we never thrash on an already-folded transcript.
+  let compactedLen = 0
   for (let step = 0; step < MAX_STEPS; step++) {
+    // Mid-turn auto-compaction (top level only — sub-agents stay lean): when the
+    // request we're about to send nears the model's window, fold the older
+    // messages into a summary and continue instead of hitting the hard limit.
+    if (!sub && convo.length > compactedLen + 1 && estimateApiConvo(convo) >= contextLimit(opts.model) * AUTO_COMPACT_RATIO) {
+      const res = await compactConvo(convo, opts, cfg)
+      if (opts.signal?.aborted) return
+      if (res) {
+        convo = res.convo
+        compactedLen = convo.length
+        yield { type: 'text', text: `\n\u2397 Context compacted \u2014 folded ${res.folded} earlier messages to stay within the window.\n\n` }
+      }
+    }
     // Extended thinking is opt-in via /effort (high+). Never for sub-agents (keep
     // them lean). max_tokens must exceed the thinking budget, so add headroom.
     const think = !sub && opts.thinkingBudget && opts.thinkingBudget >= 1024 ? opts.thinkingBudget : 0
@@ -252,16 +390,16 @@ async function* agent(messages: Message[], opts: StreamOpts, cfg: AnthropicOpts,
     let blocks: ApiBlock[] = []
     let stopReason = 'end_turn'
     let streamed = false
-    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
       let res: Response
       try {
         res = await post(url, body, apiKey, cfg.auth, opts.signal)
       } catch (e) {
         if (opts.signal?.aborted) return
         const reason = (e as Error).message || 'network error'
-        if (attempt >= MAX_ATTEMPTS - 1) { yield { type: 'error', message: `network error after ${MAX_ATTEMPTS} attempts: ${reason}` }; return }
+        if (attempt >= maxAttempts - 1) { yield { type: 'error', message: `network error after ${maxAttempts} attempts: ${reason}` }; return }
         const delay = backoffMs(attempt)
-        yield { type: 'retry', attempt: attempt + 1, max: MAX_ATTEMPTS, delayMs: delay, reason }
+        yield { type: 'retry', attempt: attempt + 1, max: maxAttempts, delayMs: delay, reason }
         await sleep(delay, opts.signal); if (opts.signal?.aborted) return
         continue
       }
@@ -282,9 +420,9 @@ async function* agent(messages: Message[], opts: StreamOpts, cfg: AnthropicOpts,
           yield { type: 'error', message: `登录已失效或权限不足（HTTP ${status}）。请运行 /login 重新登录（OAuth 应用需具备 models.invoke 权限）。` }
           return
         }
-        if (!RETRY_STATUS.has(status) || attempt >= MAX_ATTEMPTS - 1) { yield { type: 'error', message: `API error ${status}: ${errText.slice(0, 400)}` }; return }
+        if (!shouldRetry(status) || attempt >= maxAttempts - 1) { yield { type: 'error', message: `API error ${status}: ${errText.slice(0, 400)}` }; return }
         const delay = backoffMs(attempt, parseRetryAfter(res.headers.get('retry-after')))
-        yield { type: 'retry', attempt: attempt + 1, max: MAX_ATTEMPTS, delayMs: delay, reason: `HTTP ${status}` }
+        yield { type: 'retry', attempt: attempt + 1, max: maxAttempts, delayMs: delay, reason: `HTTP ${status}` }
         await sleep(delay, opts.signal); if (opts.signal?.aborted) return
         continue
       }
@@ -302,18 +440,18 @@ async function* agent(messages: Message[], opts: StreamOpts, cfg: AnthropicOpts,
       } catch (e) {
         if (opts.signal?.aborted) return
         const reason = (e as Error).message || 'stream interrupted'
-        if (stepStreamed || attempt >= MAX_ATTEMPTS - 1) { yield { type: 'error', message: `stream error: ${reason}` }; return }
+        if (stepStreamed || attempt >= maxAttempts - 1) { yield { type: 'error', message: `stream error: ${reason}` }; return }
         const delay = backoffMs(attempt)
-        yield { type: 'retry', attempt: attempt + 1, max: MAX_ATTEMPTS, delayMs: delay, reason }
+        yield { type: 'retry', attempt: attempt + 1, max: maxAttempts, delayMs: delay, reason }
         await sleep(delay, opts.signal); if (opts.signal?.aborted) return
         continue
       }
       // A clean EOF carrying no content (truncated/empty upstream): retry while
       // nothing was shown, else surface it rather than returning a blank turn.
       if (!stepStreamed && blocks.length === 0) {
-        if (attempt >= MAX_ATTEMPTS - 1) { yield { type: 'error', message: 'empty response from API (no content) after retries' }; return }
+        if (attempt >= maxAttempts - 1) { yield { type: 'error', message: 'empty response from API (no content) after retries' }; return }
         const delay = backoffMs(attempt)
-        yield { type: 'retry', attempt: attempt + 1, max: MAX_ATTEMPTS, delayMs: delay, reason: 'empty response' }
+        yield { type: 'retry', attempt: attempt + 1, max: maxAttempts, delayMs: delay, reason: 'empty response' }
         await sleep(delay, opts.signal); if (opts.signal?.aborted) return
         continue
       }
@@ -340,7 +478,7 @@ async function* agent(messages: Message[], opts: StreamOpts, cfg: AnthropicOpts,
     const results: ApiBlock[] = []
     for (const tu of toolUses) {
       yield { type: 'tool_use', id: tu.id, name: tu.name, input: tu.input }
-      const r = await runTool(tu.name, tu.input, { cwd, signal: opts.signal, spawnAgent, onWorkflow: opts.onWorkflow, onAgent: opts.onAgent })
+      const r = await runTool(tu.name, tu.input, { cwd, signal: opts.signal, spawnAgent, onWorkflow: opts.onWorkflow, onAgent: opts.onAgent, allowBackground: !sub })
       if (opts.signal?.aborted) return
       yield { type: 'tool_result', id: tu.id, name: tu.name, content: r.content, isError: r.isError, linesAdded: r.linesAdded, linesRemoved: r.linesRemoved, diff: r.diff }
       results.push({ type: 'tool_result', tool_use_id: tu.id, content: r.content, is_error: r.isError })

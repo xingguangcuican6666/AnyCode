@@ -1,4 +1,5 @@
 import React from 'react'
+import { PassThrough } from 'node:stream'
 import { render } from 'ink'
 import { App, type SessionSnapshot } from './app'
 import type { AppConfig } from './types'
@@ -6,6 +7,7 @@ import { loadConfig } from './config'
 import { getProvider } from './providers'
 import { NAME, VERSION } from './version'
 import { newSessionId, saveSession, loadSession, latestSession } from './lib/sessions'
+import { KITTY_ON, KITTY_OFF, createKittyTranslator } from './lib/kittykeys'
 
 // Fullscreen (alternate-screen) control sequences. AnyCode owns the whole
 // viewport the way Claude Code does — the transcript is a self-managed scroll
@@ -115,12 +117,35 @@ async function runInteractive(initial: AppConfig, resume?: { snapshot: SessionSn
     saveTimer = setTimeout(() => { saveTimer = null; if (last) saveSession(sessionId, last) }, 1500)
   }
 
-  process.stdout.write(ALT_ON + MOUSE_ON + CLEAR)
+  process.stdout.write(ALT_ON + MOUSE_ON + KITTY_ON + CLEAR)
+
+  // Sit a translator in front of Ink's stdin so the kitty keyboard protocol
+  // (enabled above) gives us Shift/Alt+Enter as a newline while every other key
+  // — including ctrl+c — still reaches Ink as the legacy byte it expects (see
+  // lib/kittykeys). `wrapped` is a plain readable Ink and the mouse listener both
+  // consume; we forward process.stdin through the translator into it and proxy
+  // the TTY controls Ink needs (isTTY / setRawMode) back to the real stdin.
+  const source = process.stdin
+  const wrapped = new PassThrough() as PassThrough & {
+    isTTY?: boolean
+    setRawMode?: (mode: boolean) => unknown
+    ref?: () => unknown
+    unref?: () => unknown
+  }
+  wrapped.isTTY = source.isTTY
+  wrapped.setRawMode = (mode: boolean) => { source.setRawMode?.(mode); return wrapped }
+  wrapped.ref = () => wrapped
+  wrapped.unref = () => wrapped
+  const translate = createKittyTranslator()
+  const forward = (chunk: Buffer): void => { wrapped.write(translate(chunk.toString('utf8'))) }
+  source.on('data', forward)
+
   let restored = false
   const restore = (): void => {
     if (restored) return
     restored = true
-    process.stdout.write(MOUSE_OFF + ALT_OFF)
+    source.off('data', forward)
+    process.stdout.write(KITTY_OFF + MOUSE_OFF + ALT_OFF)
   }
   // Always restore the terminal, even on a crash or signal — a stuck alternate
   // screen / mouse mode would otherwise leave the user's shell unusable.
@@ -154,7 +179,7 @@ async function runInteractive(initial: AppConfig, resume?: { snapshot: SessionSn
       // exiting on the first ctrl+c itself.
       instance = render(
         <App config={config} initial={snapshot} onClear={onClear} onRepaint={onRepaint} onSnapshot={onSnapshot} onResume={onResume} />,
-        { exitOnCtrlC: false },
+        { exitOnCtrlC: false, stdin: wrapped as unknown as NodeJS.ReadStream },
       )
       await instance.waitUntilExit()
       if (!again) break

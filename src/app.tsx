@@ -8,14 +8,19 @@ import { ThemePicker } from './components/ThemePicker'
 import { ModelPicker } from './components/ModelPicker'
 import { LoginPanel } from './components/LoginPanel'
 import { SessionPicker } from './components/SessionPicker'
+import { AutoCompactPicker, type AutoCompactChoice } from './components/AutoCompactPicker'
+import { EffortPicker, type EffortChoice } from './components/EffortPicker'
 import { SettingsPanel } from './components/SettingsPanel'
 import { WorkflowView, WorkflowCollapsed } from './components/WorkflowView'
 import { AgentSwitcher } from './components/AgentSwitcher'
-import { getSetting } from './lib/settings'
-import { contextState, contextLevel, AUTO_COMPACT_RATIO, fmtTokens, bar } from './lib/usage'
-import { compactMessages } from './lib/compact'
+import { getSetting, isEffortLevel, type EffortLevel } from './lib/settings'
+import { contextState, contextLevel, contextLimit, AUTO_COMPACT_RATIO, fmtTokens, bar } from './lib/usage'
+import { ensureModelDb } from './lib/modelDb'
+import { planCompaction, buildCompacted, heuristicSummary } from './lib/compact'
+import { summarizeConversation } from './lib/summarize'
 import { flattenMessages, thinkingLines, messagesFromEvents, type LineKind, type FlatLine } from './lib/transcript'
 import { type Selection, lineSpan, splitByCols, stripAnsi, isEmpty, selectedText } from './lib/selection'
+import { displayWidth } from './lib/text'
 import { copyToClipboard } from './lib/clipboard'
 import { loadSession } from './lib/sessions'
 import { registry } from './commands'
@@ -39,9 +44,13 @@ function formatLoop(l: ActiveLoop): string {
 
 // A goal AnyCode autonomously works toward, like Claude Code's /goal. `startedAt`
 // drives the live "◎ /goal active (Ns)" timer; `runs` counts turns spent on it.
-export type ActiveGoal = { text: string; startedAt: number; runs: number }
+// `paused` freezes the autonomous loop (esc, or a turn that got no model
+// response) WITHOUT clearing the goal — the driver skips a paused goal and waits
+// for the user; any submit (or /goal) resumes it.
+export type ActiveGoal = { text: string; startedAt: number; runs: number; paused?: boolean }
 
 function formatGoal(g: ActiveGoal, elapsed: number, judging = false): string {
+  if (g.paused) return `◎ /goal 已暂停 · ${g.text} · 输入任意内容或 /goal 继续`
   const tail = judging ? ' · evaluating whether to continue…' : ''
   return `◎ /goal active (${elapsed}s) · working toward: ${g.text}${tail} · /goal clear to stop`
 }
@@ -84,6 +93,13 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume 
   const { stdin } = useStdin()
   const chat = useChat(config, initial?.messages, initial?.usage)
   const [elapsed, setElapsed] = useState(0)
+  // Ticks every 250ms while a retry countdown is showing, so the "Retrying in
+  // Ns" line above the prompt counts down live (see chat.retry, #3). The value
+  // itself is unused — bumping it just forces the re-render that re-reads the clock.
+  const [, setRetryTick] = useState(0)
+  // Bumped when the online model-window DB refreshes (see ensureModelDb), forcing
+  // a re-render so the context bar reflects the freshly-fetched window.
+  const [, setDbTick] = useState(0)
   const [exitArmed, setExitArmed] = useState(false)
   const [pickerOpen, setPickerOpen] = useState(false)
   // The interactive model picker overlay (opened by bare /model). Search box +
@@ -96,6 +112,16 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume 
   // The /resume session picker overlay (opened by /resume). Lists saved sessions;
   // selecting one remounts the app seeded with that transcript (see onResume).
   const [resumeOpen, setResumeOpen] = useState(false)
+  // The /autocompact window picker overlay (opened by bare /autocompact). Chooses
+  // when auto-compaction fires (off / auto / an explicit token window).
+  const [autoCompactOpen, setAutoCompactOpen] = useState(false)
+  // The /effort slider overlay (opened by bare /effort). A Faster↔Smarter slider
+  // over the five effort levels plus the "ultracode" stop (xhigh + workflows).
+  const [effortOpen, setEffortOpen] = useState(false)
+  // Live "Compacting conversation… ▱▱▱ N%" indicator shown above the prompt while
+  // a model-driven /compact (or auto-compaction) is summarizing. Null when idle;
+  // the remount that applies the fold tears the indicator down.
+  const [compacting, setCompacting] = useState<{ pct: number } | null>(null)
   // The interactive settings/status overlay (Settings/Status/Config/Usage/Stats),
   // opened by /config /status /usage /stats. Null when closed. Like ThemePicker it
   // renders in place of the input cluster and owns the keyboard while open.
@@ -150,6 +176,7 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume 
   const loopRef = useRef(loop); loopRef.current = loop
   const goalRef = useRef(goal); goalRef.current = goal
   const panelRef = useRef(panel); panelRef.current = panel
+  const effortOpenRef = useRef(effortOpen); effortOpenRef.current = effortOpen
   const scrollTopRef = useRef<number | null>(scrollTop); scrollTopRef.current = scrollTop
   const wfExpandedRef = useRef(wfExpanded); wfExpandedRef.current = wfExpanded
   const wfSelRef = useRef(wfSel); wfSelRef.current = wfSel
@@ -182,6 +209,21 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume 
   const linesRef = useRef<FlatLine[]>([])
   const pressPtRef = useRef<{ line: number; col: number } | null>(null)
   const draggedRef = useRef(false)
+  // Screen row (1-based) of the clickable "Jump to bottom" hint while scrolled up,
+  // or -1 when it isn't shown. The mouse listener maps a left click on that row to
+  // resumeFollow(). Set during render (the hint is the cluster's first row, which
+  // sits just below the viewport → row viewportH + 1).
+  const jumpRowRef = useRef(-1)
+  // Screen row (1-based) of the clickable "previous message" hint at the very top
+  // of the viewport while scrolled up (or -1 when hidden). It's rendered above the
+  // viewport, so it always sits on screen row 1. A left click on it scrolls up to
+  // the nearest message boundary above the current top row (see jumpToPrev).
+  const prevRowRef = useRef(-1)
+  // Screen row (1-based) of the viewport's FIRST content row. Normally 1, but the
+  // "previous message" hint (when scrolled) occupies row 1 and pushes the viewport
+  // down to row 2. The mouse listener uses this to map an SGR y to a transcript
+  // line, and the bottom-hint row shifts by the same offset.
+  const vpTopRef = useRef(1)
 
   const streaming = chat.status === 'streaming'
 
@@ -203,17 +245,34 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume 
   // only a fresh instance re-emits the compacted transcript cleanly. Returns
   // the number of messages folded (0 = nothing to do, no remount). Drives both
   // /compact and auto-compaction.
-  const doCompact = (): number => {
-    const { messages: folded, folded: n } = compactMessages(chatRef.current.messages)
-    if (n <= 0) return 0
-    onRepaint({
-      config: chatRef.current.config,
-      messages: folded,
-      goal: goalRef.current,
-      loop: loopRef.current,
-      usage: { ...chatRef.current.usage, compactions: chatRef.current.usage.compactions + 1 },
-    })
-    return n
+  //
+  // The summary is model-driven: an independent provider.complete() call distills
+  // the folded messages (see lib/summarize), with the offline heuristic as a
+  // fallback when no summarizer is available or the call fails. While it runs, a
+  // "Compacting conversation…" progress line shows above the prompt. `compacting`
+  // guards against overlapping runs (auto-compaction can re-fire mid-summary).
+  const compactingRef = useRef(false)
+  const doCompact = async (force = false): Promise<number> => {
+    if (compactingRef.current) return 0
+    const plan = planCompaction(chatRef.current.messages, undefined, { force })
+    if (!plan) return 0
+    compactingRef.current = true
+    setCompacting({ pct: 1 })
+    try {
+      const summary = (await summarizeConversation(plan.older, chatRef.current.config)) ?? heuristicSummary(plan.older)
+      const { messages: folded, folded: n } = buildCompacted(plan, summary)
+      onRepaint({
+        config: chatRef.current.config,
+        messages: folded,
+        goal: goalRef.current,
+        loop: loopRef.current,
+        usage: { ...chatRef.current.usage, compactions: chatRef.current.usage.compactions + 1 },
+      })
+      return n
+    } finally {
+      compactingRef.current = false
+      setCompacting(null)
+    }
   }
   // Scroll helpers for the owned viewport. `null` scrollTop = following the live
   // bottom; a number pins the first visible line. Reaching the bottom resumes
@@ -228,6 +287,18 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume 
     })
   }
   const resumeFollow = (): void => setScrollTop(null)
+  // Scroll up to the previous USER message: the nearest FlatLine that starts a
+  // user turn (msgStart + kind 'user') strictly above the current top row. "上一条
+  // 消息" means the user's own input (including mid-stream insertions), never an
+  // agent tool call. Message boundaries are marked by flattenMessages; no-op when
+  // there's no earlier user message above.
+  const jumpToPrev = (): void => {
+    const lines = linesRef.current
+    const from = curRef.current
+    let target = -1
+    for (let i = 0; i < from && i < lines.length; i++) if (lines[i]?.msgStart && lines[i]?.kind === 'user') target = i
+    if (target >= 0) setScrollTop(target)
+  }
 
   // Resize → just update dims; the viewport reflows (no remount, no <Static>).
   useEffect(() => {
@@ -243,8 +314,9 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume 
   // wheel up/down are button 64/65; a left press is button 0 + 'M', a left-drag
   // (motion with the button held) is button 32 + 'M', and release is 'm'. Ink's
   // useInput doesn't surface mouse events, so we read them off stdin directly.
-  // SGR x,y are 1-based; the viewport's top row is screen row 1, so the absolute
-  // transcript point is { line: cur + (y-1), col: x-1 }.
+  // SGR x,y are 1-based; the viewport's top content row is screen row vpTopRef
+  // (1 normally, 2 when the top "previous message" hint occupies row 1), so the
+  // absolute transcript point is { line: cur + (y - vpTop), col: x-1 }.
   useEffect(() => {
     if (!stdin) return
     const onData = (data: Buffer): void => {
@@ -257,12 +329,27 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume 
         const x = Number(m[2])
         const y = Number(m[3])
         const release = m[4] === 'm'
+        // A left click on the "Jump to bottom" hint (the cluster row just below
+        // the viewport, when scrolled up) snaps back to the live bottom — the same
+        // as ctrl+End. Handle it before any modal/selection logic and skip the
+        // rest so it doesn't also start a text selection.
+        if (b === 0 && !release && jumpRowRef.current > 0 && y === jumpRowRef.current) {
+          resumeFollow()
+          continue
+        }
+        // A left click on the "previous message" hint (screen row 1, when scrolled
+        // up) scrolls up to the nearest message boundary above. Same early-out so
+        // it doesn't also start a text selection.
+        if (b === 0 && !release && prevRowRef.current > 0 && y === prevRowRef.current) {
+          jumpToPrev()
+          continue
+        }
         // A modal overlay owns the mouse entirely (it runs its own stdin listener
         // for hover/click/wheel); don't scroll or select the transcript behind it.
         if (modalOpenRef.current) continue
         if (b === 64) { delta -= 3; continue }
         if (b === 65) { delta += 3; continue }
-        const pt = { line: curRef.current + (y - 1), col: Math.max(0, x - 1) }
+        const pt = { line: curRef.current + (y - vpTopRef.current), col: Math.max(0, x - 1) }
         if (b === 0 && !release) {
           // Left press: begin (or restart) a selection anchored here. An
           // immediate release with no drag leaves anchor===head (empty) → the
@@ -309,14 +396,14 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume 
   const t = (key: Parameters<typeof translate>[1], params?: Parameters<typeof translate>[2]): string => translate(lang, key, params)
 
   // Live context-window fill, used for the warning line and auto-compaction.
-  const ctx = contextState(chat.messages, chat.config.model)
+  const ctx = contextState(chat.messages, chat.config.model, Number(getSetting(chat.config.settings, 'contextWindow')) || undefined)
   const ctxLevel = contextLevel(ctx.ratio)
   // The workflow whose tree is currently expanded (looked up by id), or null.
   const expandedWf = wfExpanded ? chat.workflows.find((w) => w.id === wfExpanded) ?? null : null
 
   // A modal overlay (theme picker / settings / workflow tree) replaces the whole
   // content area — you operate it rather than read the transcript behind it.
-  const modalOpen = pickerOpen || modelOpen || loginOpen || resumeOpen || !!panel || !!expandedWf
+  const modalOpen = pickerOpen || modelOpen || loginOpen || resumeOpen || autoCompactOpen || !!panel || !!expandedWf
   modalOpenRef.current = modalOpen
   const scrolled = scrollTop !== null
 
@@ -338,13 +425,23 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume 
     (goal || loop ? 1 : 0) +
     queued.length +
     (streaming ? 1 : 0) +
+    (chat.retry ? 1 : 0) +
+    (compacting ? 1 : 0) +
     (ctxLevel !== 'ok' ? 1 : 0) +
     INPUT_ROWS +
     chat.workflows.length +
     (chat.agents.length > 0 ? chat.agents.length + 2 : 0) + // switcher: header + main row + agents
     1 + // footer
-    (scrolled ? 1 : 0)
+    (scrolled ? 1 : 0) + // bottom "jump to bottom" hint
+    (scrolled ? 1 : 0)   // top "previous message" hint (rendered above the viewport)
   const viewportH = Math.max(1, dims.rows - clusterH)
+  // Screen row of the viewport's first content row: 1 normally, 2 when the top
+  // "previous message" hint occupies row 1 (only while scrolled, non-modal).
+  vpTopRef.current = scrolled && !modalOpen ? 2 : 1
+  // The "Jump to bottom" hint is the FIRST row of the bottom cluster (rendered
+  // only when scrolled and no modal owns the screen), so it sits on the screen row
+  // right below the viewport — which is offset by the top hint (vpTopRef).
+  jumpRowRef.current = scrolled && !modalOpen ? vpTopRef.current + viewportH : -1
 
   // The whole transcript as flat, one-row-per-entry lines: banner + committed
   // messages + the live reasoning/reply tail. The committed part is memoized (it
@@ -389,6 +486,20 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume 
   pageStepRef.current = pageStep
   const cur = scrollTop === null ? maxTop : Math.min(scrollTop, maxTop)
   curRef.current = cur
+  // The "previous message" hint renders above the viewport (screen row 1) while
+  // scrolled up, and previews the nearest USER message above the top row — the
+  // one a click jumps to. Hidden when there's no earlier user message above.
+  let prevUserIdx = -1
+  for (let i = 0; i < cur && i < lines.length; i++) if (lines[i].msgStart && lines[i].kind === 'user') prevUserIdx = i
+  const showPrevHint = scrolled && !modalOpen && prevUserIdx >= 0
+  prevRowRef.current = showPrevHint ? 1 : -1
+  // Preview text for the band: the user line as it renders ("> …"), clipped to
+  // width with a leading ↑ so it reads as "jump up to this message".
+  const prevPreview = prevUserIdx >= 0 ? `↑ ${stripAnsi(lines[prevUserIdx].text).trim()}` : ''
+  // Pad a string with trailing spaces to the full terminal width, so a
+  // backgroundColor band fills the whole row (never truncate here — Ink's
+  // ansi-aware wrap="truncate" clips an over-long row at render).
+  const padFull = (s: string): string => { const w = displayWidth(s); return w < width ? s + ' '.repeat(width - w) : s }
   const visible = lines.slice(cur, cur + viewportH)
   const below = Math.max(0, total - (cur + viewportH))
   // Fresh / short session → banner sits at the TOP, input at the BOTTOM, an empty
@@ -402,21 +513,59 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume 
       case 'error': return colors.error
       case 'retry': return colors.warning
       case 'tool-header': return colors.accent
+      // Shade hierarchy done with the FONT, not a background: thinking (inner
+      // monologue) is the faintest, tool output reads at full text brightness (real
+      // data you scan), so the two are clearly different depths at a glance.
+      case 'thinking': return colors.dim
+      case 'collapsed': return colors.dim
+      case 'tool': return colors.text
+      case 'system': return colors.system
       case 'diff-add': return colors.success
       case 'diff-del': return colors.error
+      case 'diff-hunk': return colors.accent
+      case 'diff-ctx': return colors.dim
       default: return colors.dim
     }
   }
+  // Full-row background tint for +/− diff lines (GitHub/Claude Code style), so an
+  // added/removed line reads at a glance instead of by its foreground alone. The
+  // ANSI-only themes leave these empty (no subtle tint on 16 colours) → no bg.
+  const bgFor = (k: LineKind): string | undefined => {
+    if (k === 'diff-add') return colors.diffAddBg || undefined
+    if (k === 'diff-del') return colors.diffDelBg || undefined
+    return undefined
+  }
 
   // Auto-compaction: when the context fills past the threshold and we're idle,
-  // fold older messages into a digest exactly like Claude Code. Re-runs only
-  // when the ratio changes, so it fires once per crossing and never mid-stream.
+  // fold older messages into a digest exactly like Claude Code. The `autoCompact`
+  // toggle can disable it entirely, and `/autocompact` sets a token window that
+  // caps the trigger below the model's full context (effective threshold =
+  // min(window, model context) × AUTO_COMPACT_RATIO). Fires once per crossing and
+  // never mid-stream.
+  const autoCompactOn = getSetting(chat.config.settings, 'autoCompact') !== false
+  const autoCompactWindow = Number(getSetting(chat.config.settings, 'autoCompactWindow')) || 0
+  const autoCompactLimit = autoCompactWindow > 0 ? Math.min(autoCompactWindow, ctx.limit) : ctx.limit
+  const autoCompactTrigger = autoCompactOn && !streaming && ctx.used >= autoCompactLimit * AUTO_COMPACT_RATIO
   useEffect(() => {
-    if (streaming) return
-    if (ctx.ratio < AUTO_COMPACT_RATIO) return
-    doCompact() // remounts with the compacted transcript when it folds anything
+    if (!autoCompactTrigger) return
+    void doCompact() // remounts with the compacted transcript when it folds anything
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [streaming, ctx.ratio])
+  }, [autoCompactTrigger])
+
+  // Animate the "Compacting conversation…" progress while a compaction runs. The
+  // summary call has no real progress, so ramp toward ~95% and let the remount
+  // (which unmounts this instance) stand in for 100%.
+  const isCompacting = compacting !== null
+  useEffect(() => {
+    if (!isCompacting) return
+    const id = setInterval(() => setCompacting((c) => (c ? { pct: Math.min(95, c.pct + 7) } : c)), 200)
+    return () => clearInterval(id)
+  }, [isCompacting])
+
+  // Kick the online model-window DB once at startup: if the on-disk cache is
+  // stale/missing it refreshes from models.dev in the background, then re-renders
+  // so the context bar picks up the accurate window. Never blocks a turn.
+  useEffect(() => { ensureModelDb(() => setDbTick((n) => n + 1)) }, [])
 
   // Elapsed-time ticker while the model is working.
   useEffect(() => {
@@ -425,6 +574,14 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume 
     const t = setInterval(() => setElapsed(Math.floor((Date.now() - start) / 1000)), 250)
     return () => clearInterval(t)
   }, [streaming])
+
+  // Drive the retry countdown: tick every 250ms while a retry notice is live so
+  // the "Retrying in Ns" text ticks down toward its target time.
+  useEffect(() => {
+    if (!chat.retry) return
+    const t = setInterval(() => setRetryTick((n) => n + 1), 250)
+    return () => clearInterval(t)
+  }, [chat.retry])
 
   // Live "◎ /goal active (Ns)" timer while a goal is being worked.
   useEffect(() => {
@@ -465,9 +622,8 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume 
     }
   }, [chat.agents, viewingAgent, agentSel])
 
-  // Global keys: esc interrupts a stream and stops autonomous goal work; ctrl+c
-  // twice exits. Esc handles the goal even between turns (when not streaming), so
-  // it's a reliable "stop working on this" — /goal clear also forgets the goal.
+  // Global keys: esc interrupts a streaming turn (never clears the goal — that's
+  // /goal's job, so autonomous work isn't lost to a stray esc); ctrl+c twice exits.
   useInput((input, key) => {
     // The expanded workflow tree owns the keyboard (its own useInput handles
     // ↑↓/x/esc) while open.
@@ -476,6 +632,14 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume 
     // handles esc/arrows/typing); don't let esc here also interrupt/stop.
     if (panelRef.current) {
       if (key.ctrl && input === 'c') { setPanel(null); return }
+      return
+    }
+    // The /effort picker renders inline (in place of the input box, transcript
+    // still visible — not a modal), so it's NOT in modalOpen. It owns all keys
+    // via its own useInput; here we only let ctrl+c dismiss it and swallow the
+    // rest so App's esc/arrows don't double-fire.
+    if (effortOpenRef.current) {
+      if (key.ctrl && input === 'c') { setEffortOpen(false); return }
       return
     }
     // Workflow selection mode: a cursor runs across the collapsed workflow lines.
@@ -535,18 +699,31 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume 
     // ctrl+End (best-effort ctrl+F/~, since terminals surface End inconsistently)
     // jumps back to the live bottom and resumes following.
     if (key.ctrl && /F|~/.test(input)) { resumeFollow(); return }
+    // A running goal is AUTONOMOUS — one esc or ctrl+c must be able to halt it,
+    // even while scrolled up reading its output. So this comes before the
+    // selection-clear / scroll-snap esc steps (which would otherwise eat the
+    // first press). PAUSE, never clear: the goal survives, the driver freezes,
+    // and any later submit (or /goal) resumes it. ctrl+c with an active text
+    // selection still falls through to copy it (handled below).
+    const escOrCtrlC = key.escape || (key.ctrl && input === 'c')
+    const hasSelection = !!(selRef.current && !isEmpty(selRef.current))
+    if (escOrCtrlC && goalRef.current && !goalRef.current.paused && !(key.ctrl && hasSelection)) {
+      if (streaming) chat.interrupt()
+      setGoalRun((gv) => (gv ? { ...gv, paused: true } : gv))
+      chat.print('◎ 目标已暂停 —— 输入任意内容或 /goal 继续。', 'system')
+      return
+    }
     // esc clears an active text selection first — before it snaps scroll back or
     // interrupts the turn — so dismissing a highlight is a distinct, cheap step.
     if (key.escape && selRef.current && !isEmpty(selRef.current)) { setSel(null); return }
     // esc while scrolled up snaps back to the bottom first, so a scrolled esc
     // never doubles as interrupting the running turn.
     if (key.escape && scrollTopRef.current !== null) { resumeFollow(); return }
-    if (key.escape && (streaming || goalRef.current)) {
+    if (key.escape && streaming) {
       // Swallow the esc that just dismissed the workflow tree (and any immediate
       // repeat), so returning from the view never doubles as interrupting.
       if (Date.now() - wfClosedAtRef.current < 250) return
-      if (streaming) chat.interrupt()
-      if (goalRef.current) setGoalRun(null)
+      chat.interrupt()
       return
     }
     if (key.ctrl && input === 'c') {
@@ -585,15 +762,20 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume 
     // through the type-ahead queue so it starts on the next idle tick — never
     // re-entrantly inside the /command turn that requested it.
     send: (text: string) => setQueued((q) => [...q, text]),
-    compact: () => doCompact(),
+    compact: () => doCompact(true),
     openPanel: (tab) => setPanel(tab),
     openLogin: () => setLoginOpen(true),
     openResume: () => setResumeOpen(true),
+    openAutoCompact: () => setAutoCompactOpen(true),
+    openEffortPicker: () => setEffortOpen(true),
   })
 
   // Submitting while a response streams queues the line (type-ahead) rather than
   // dropping it; the idle driver flushes the queue as soon as the turn finishes.
   const handleSubmit = (v: string): void => {
+    // A user submit while the goal is paused resumes it: run their line now, and
+    // the idle driver picks the goal back up once that turn finishes.
+    setGoalRun((gv) => (gv && gv.paused ? { ...gv, paused: false } : gv))
     if (chatRef.current.status === 'streaming') setQueued((q) => [...q, v])
     else void chatRef.current.submit(v, makeActions())
   }
@@ -615,7 +797,17 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume 
       return
     }
 
-    if (goal) {
+    if (goal && !goal.paused) {
+      // If the just-finished goal turn produced no model response (auth/HTTP
+      // error surfaced as an error system message), don't spin the loop — pause
+      // and wait for the user to fix it. This is what stopped the endless
+      // "Judge call failed; keep working" flood when the login had expired.
+      const lastMsg = chatRef.current.messages[chatRef.current.messages.length - 1]
+      if (goal.runs > 0 && lastMsg?.meta?.error) {
+        setGoalRun((gv) => (gv ? { ...gv, paused: true } : gv))
+        chatRef.current.print('◎ 目标已暂停 —— 上一轮未获得模型响应，请修复后输入任意内容继续。', 'system')
+        return
+      }
       // First turn: start working on the goal immediately.
       if (goal.runs === 0) {
         const t = setTimeout(() => {
@@ -641,6 +833,11 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume 
               setGoal('')
               setGoalRun(null)
               chatRef.current.print(`◎ Goal complete — ${verdict.reason}`, 'system')
+            } else if (verdict.decision === 'pause') {
+              // No model response (judge call itself failed) — pause instead of
+              // continuing into another doomed turn; the user resumes on submit.
+              setGoalRun((gv) => (gv ? { ...gv, paused: true } : gv))
+              chatRef.current.print(`◎ 目标已暂停 —— ${verdict.reason} 输入任意内容或 /goal 继续。`, 'system')
             } else {
               chatRef.current.print(`◎ Continuing — ${verdict.reason}`, 'system')
               setGoalRun((gv) => (gv ? { ...gv, runs: gv.runs + 1 } : gv))
@@ -711,6 +908,27 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume 
                 }}
                 onCancel={() => setResumeOpen(false)}
               />
+            ) : autoCompactOpen ? (
+              <AutoCompactPicker
+                width={width}
+                rows={dims.rows}
+                modelLimit={ctx.limit}
+                current={
+                  getSetting(chat.config.settings, 'autoCompact') === false
+                    ? { kind: 'off' }
+                    : autoCompactWindow > 0
+                      ? { kind: 'tokens', tokens: autoCompactWindow }
+                      : { kind: 'auto' }
+                }
+                onSelect={(choice: AutoCompactChoice) => {
+                  const s = chat.config.settings
+                  if (choice.kind === 'off') { chat.setConfig({ settings: { ...s, autoCompact: false } }); chat.print(t('cmd.autocompactOff'), 'system') }
+                  else if (choice.kind === 'auto') { chat.setConfig({ settings: { ...s, autoCompact: true, autoCompactWindow: 0 } }); chat.print(t('cmd.autocompactAuto', { limit: fmtTokens(contextLimit(chat.config.model)) }), 'system') }
+                  else { chat.setConfig({ settings: { ...s, autoCompact: true, autoCompactWindow: choice.tokens } }); chat.print(t('cmd.autocompactSet', { value: fmtTokens(choice.tokens) }), 'system') }
+                  setAutoCompactOpen(false)
+                }}
+                onCancel={() => setAutoCompactOpen(false)}
+              />
             ) : panel ? (
               <SettingsPanel
                 tab={panel}
@@ -736,6 +954,24 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume 
             ) : null}
           </Box>
         ) : (
+          <>
+          {/* "Previous message" hint, pinned above the viewport (screen row 1)
+              while scrolled up: a single-line band (styled like an expanded
+              block, colors.blockBg) previewing the USER message a click jumps to.
+              Reserve the row whenever scrolled (clusterH counts it) so the
+              viewport height stays consistent; paint the band only when there's
+              an earlier user message above. */}
+          {scrolled ? (
+            showPrevHint ? (
+              <Box width={width}>
+                <Text backgroundColor={colors.blockBg || undefined} color={colors.dim} wrap="truncate">
+                  {padFull(` ${prevPreview}`)}
+                </Text>
+              </Box>
+            ) : (
+              <Box><Text> </Text></Box>
+            )
+          ) : null}
           <Box flexGrow={1} flexDirection="column" overflow="hidden" justifyContent={anchor}>
             {visible.map((ln, i) => {
               const absIdx = cur + i
@@ -745,12 +981,33 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume 
               // selected — an accepted trade so the SGR codes never tear.
               const plain = stripAnsi(ln.text)
               const span = sel && !isEmpty(sel) ? lineSpan(sel, absIdx, plain) : null
+              // Background band for diff +/− rows (green/red carries the add/del
+              // meaning) AND for every row of an EXPANDED collapsed block (ln.tint):
+              // Claude Code paints those as one uniform box. The band is a SINGLE
+              // shade (colors.blockBg) — think vs tool are set apart by FONT depth
+              // (see colorFor), not by different tints — and it covers the tinted
+              // blank spacer rows too, so the box stays continuous instead of
+              // leaking the terminal wallpaper through as patchy holes. The
+              // ANSI-only themes leave these empty → no bg. Pad-only to full width
+              // (never truncate), letting Ink's ansi-aware wrap="truncate" clip any
+              // rare over-long row.
+              const bg = bgFor(ln.kind) ?? (ln.tint ? (colors.blockBg || undefined) : undefined)
+              const padRow = (s: string): string => {
+                const w = displayWidth(s)
+                return w < width ? s + ' '.repeat(width - w) : s
+              }
               if (span) {
                 const [before, mid, after] = splitByCols(plain, span.a, span.b)
+                const fill = bg ? Math.max(0, width - displayWidth(plain)) : 0
                 return (
-                  <Text key={absIdx} color={colorFor(ln.kind)} wrap="truncate">
-                    {before}<Text inverse>{mid}</Text>{after}
+                  <Text key={absIdx} color={colorFor(ln.kind)} backgroundColor={bg} wrap="truncate">
+                    {before}<Text inverse>{mid}</Text>{after}{fill ? ' '.repeat(fill) : ''}
                   </Text>
+                )
+              }
+              if (bg) {
+                return (
+                  <Text key={absIdx} color={colorFor(ln.kind)} backgroundColor={bg} wrap="truncate">{padRow(ln.text)}</Text>
                 )
               }
               return (
@@ -758,6 +1015,7 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume 
               )
             })}
           </Box>
+          </>
         )}
 
         {/* Fixed bottom cluster: transient status + input box + collapsed
@@ -766,9 +1024,9 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume 
         {!modalOpen ? (
           <Box flexDirection="column">
             {scrolled ? (
-              <Box paddingLeft={1}>
-                <Text color={colors.accentBright} wrap="truncate">
-                  {`↓ ${below} more line${below === 1 ? '' : 's'} below · PgDn/ctrl+End/esc to resume`}
+              <Box justifyContent="center">
+                <Text backgroundColor={colors.blockBg || undefined} color={colors.accentBright} bold wrap="truncate">
+                  {` ${t('app.jumpToBottom')} `}
                 </Text>
               </Box>
             ) : null}
@@ -801,6 +1059,30 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume 
               />
             ) : null}
 
+            {chat.retry ? (
+              <Box paddingLeft={1}>
+                <Text color={colors.warning} wrap="truncate">
+                  {t('app.retryLine', {
+                    reason: chat.retry.reason,
+                    secs: Math.max(0, Math.ceil((chat.retry.until - Date.now()) / 1000)),
+                    attempt: chat.retry.attempt,
+                    max: chat.retry.max,
+                  })}
+                </Text>
+              </Box>
+            ) : null}
+
+            {compacting ? (
+              <Box paddingLeft={1}>
+                <Text color={colors.accent} wrap="truncate">
+                  {t('app.compacting', {
+                    bar: '▰'.repeat(Math.round((compacting.pct / 100) * 5)) + '▱'.repeat(5 - Math.round((compacting.pct / 100) * 5)),
+                    pct: compacting.pct,
+                  })}
+                </Text>
+              </Box>
+            ) : null}
+
             {ctxLevel !== 'ok' ? (
               <Box paddingLeft={1}>
                 <Text color={ctxLevel === 'danger' ? colors.error : colors.warning} wrap="truncate">
@@ -815,23 +1097,46 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume 
               </Box>
             ) : null}
 
-            <PromptInput
-              active={wfSel === null && agentSel === null}
-              width={width}
-              commands={registry}
-              placeholder={t('app.placeholder')}
-              onSubmit={handleSubmit}
-              onOverflowDown={() => {
-                // A single ↓ past the input drops into a selectable region below
-                // it. Prefer the agent switcher (switchable transcripts) when
-                // sub-agents exist, else the collapsed workflow lines.
-                if (chatRef.current.agents.length > 0) { setAgentSel(0); return true }
-                const wfs = chatRef.current.workflows
-                if (wfs.length === 0) return false
-                setWfSel(0)
-                return true
-              }}
-            />
+            {effortOpen ? (
+              <EffortPicker
+                width={width}
+                current={
+                  getSetting(chat.config.settings, 'ultracodeTrigger') === true
+                    ? { kind: 'ultracode' }
+                    : { kind: 'level', level: (isEffortLevel(String(getSetting(chat.config.settings, 'effort'))) ? String(getSetting(chat.config.settings, 'effort')) : 'medium') as EffortLevel }
+                }
+                onSelect={(choice: EffortChoice, sessionOnly: boolean) => {
+                  const s = chat.config.settings
+                  if (choice.kind === 'ultracode') {
+                    chat.setConfig({ settings: { ...s, effort: 'xhigh', ultracodeTrigger: true, dynamicWorkflows: true } }, { persist: !sessionOnly })
+                    chat.print(t(sessionOnly ? 'cmd.effortSetUltraSession' : 'cmd.effortSetUltra'), 'system')
+                  } else {
+                    chat.setConfig({ settings: { ...s, effort: choice.level, ultracodeTrigger: false } }, { persist: !sessionOnly })
+                    chat.print(t(sessionOnly ? 'cmd.effortSetSession' : 'cmd.effortSet', { effort: choice.level }), 'system')
+                  }
+                  setEffortOpen(false)
+                }}
+                onCancel={() => setEffortOpen(false)}
+              />
+            ) : (
+              <PromptInput
+                active={wfSel === null && agentSel === null}
+                width={width}
+                commands={registry}
+                placeholder={t('app.placeholder')}
+                onSubmit={handleSubmit}
+                onOverflowDown={() => {
+                  // A single ↓ past the input drops into a selectable region below
+                  // it. Prefer the agent switcher (switchable transcripts) when
+                  // sub-agents exist, else the collapsed workflow lines.
+                  if (chatRef.current.agents.length > 0) { setAgentSel(0); return true }
+                  const wfs = chatRef.current.workflows
+                  if (wfs.length === 0) return false
+                  setWfSel(0)
+                  return true
+                }}
+              />
+            )}
 
             {/* The switchable agent list sits below the input, so a single ↓ past
                 the input lands on it (see onOverflowDown). Selecting a row swaps

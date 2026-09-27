@@ -12,7 +12,52 @@ import { renderMarkdown } from './markdown'
 import { symbols } from '../theme'
 import { NAME, VERSION } from '../version'
 import { summarizeToolCall } from '../tools'
+import { displayWidth, wrapToWidth, expandTabs } from './text'
 import { t } from './i18n'
+import wrapAnsi from 'wrap-ansi'
+
+// Render markdown, then re-wrap each line to `width` display columns. marked-
+// terminal reflows PARAGRAPHS to the target width but leaves list items (and
+// other non-paragraph blocks) as single long lines; the one-row-per-line
+// ScrollView would then truncate them with an ellipsis (the "…" the user saw)
+// instead of wrapping. wrapAnsi is ANSI-aware (keeps the syntax colouring) and
+// CJK-aware (a wide glyph counts as 2 columns). A list item ("  * …" / "  1. …")
+// hangs its continuation rows under the text, aligned past the marker, so a
+// wrapped bullet reads like one item rather than a new one.
+function mdLines(content: string, width: number): string[] {
+  const out: string[] = []
+  for (const line of renderMarkdown(content, width).split('\n')) {
+    if (displayWidth(line) <= width) { out.push(line); continue }
+    // Leading list marker is plain ASCII (marked-terminal doesn't colour it), so
+    // its char length equals its display width and slicing by index is safe.
+    const m = /^(\s*(?:[*\-•]|\d+[.)])\s+)/.exec(line)
+    const hang = m ? m[1].length : 0
+    if (hang > 0 && hang < width - 8) {
+      const marker = line.slice(0, hang)
+      const segs = wrapAnsi(line.slice(hang), width - hang, { hard: true, trim: false }).split('\n')
+      out.push(marker + segs[0])
+      for (let i = 1; i < segs.length; i++) out.push(' '.repeat(hang) + segs[i])
+    } else {
+      for (const seg of wrapAnsi(line, width, { hard: true, trim: false }).split('\n')) out.push(seg)
+    }
+  }
+  return out
+}
+
+// Wrap PLAIN text (no markdown) to `width` display columns. Used for thinking
+// blocks: renderMarkdown injects ANSI colour codes only on the FIRST physical
+// line of each paragraph, so a markdown-rendered thinking block came out with a
+// bright first line and dim continuation lines ("thinking块深浅还不统一"). By
+// wrapping the raw text ourselves (no ANSI at all) every line carries the SAME
+// colour from colorFor(thinking) → one uniform dim shade. CJK-aware via wrapAnsi.
+function plainLines(content: string, width: number): string[] {
+  const out: string[] = []
+  for (const para of content.split('\n')) {
+    if (para === '') { out.push(''); continue }
+    for (const seg of wrapAnsi(para, width, { hard: true, trim: false }).split('\n')) out.push(seg)
+  }
+  return out
+}
 
 export type LineKind =
   | 'user' | 'assistant' | 'system' | 'error' | 'tool' | 'tool-header'
@@ -25,6 +70,18 @@ export interface FlatLine {
   // Groups collapsible activity: every row sharing a `group` id toggles together
   // when clicked (see app.tsx). Absent for plain, non-collapsible rows.
   group?: string
+  // Marks every row of an EXPANDED collapsed block (thinking + merged tool output),
+  // INCLUDING the blank padding rows between sub-blocks. app.tsx paints all of them
+  // with ONE uniform background so the block reads as a single Claude-Code-style box
+  // — tinting the padding rows too is what stops the terminal wallpaper leaking
+  // through as patchy holes. The block's sub-blocks are told apart by FONT depth
+  // (see colorFor), not by different background shades.
+  tint?: boolean
+  // Marks the FIRST row of each top-level transcript entry (a prose message, a
+  // thinking/merged run, or a tool block). app.tsx uses these boundaries for the
+  // "jump to previous message" affordance at the top of the viewport — clicking
+  // it scrolls up to the nearest msgStart above the current top row.
+  msgStart?: boolean
 }
 
 export interface FlattenOpts {
@@ -100,10 +157,13 @@ export function flattenMessages(messages: Message[], width: number, opts?: Flatt
 
   // 2) Emit. Mergeable runs collapse/merge; everything else renders in full.
   const mergeable = (it: Item): boolean => it.kind === 'think' || (it.kind === 'tool' && MERGE_TOOLS.has(it.tool))
+  // Mark the first row emitted for a top-level entry as a message boundary, so
+  // app.tsx can jump between entries (see FlatLine.msgStart).
+  const markStart = (from: number): void => { if (out[from]) out[from].msgStart = true }
   for (let k = 0; k < items.length; k++) {
     const it = items[k]
     if (it.kind === 'banner') { if (opts?.banner) { for (const l of bannerLines(width)) out.push(l); spacer() } continue }
-    if (it.kind === 'msg') { emitMsg(it.m, out, contentW); continue }
+    if (it.kind === 'msg') { const s = out.length; emitMsg(it.m, out, contentW); markStart(s); continue }
     if (mergeable(it)) {
       let j = k
       while (j + 1 < items.length && mergeable(items[j + 1])) j++
@@ -111,13 +171,28 @@ export function flattenMessages(messages: Message[], width: number, opts?: Flatt
       k = j
       const gid = (run[0] as { id: string }).id
       const open = expandAll || (expanded?.has(gid) ?? false)
-      if (open) { for (const r of run) emitMergedFull(r, out, contentW, gid) }
+      const s = out.length
+      if (open) {
+        // One continuous, UNIFORMLY-tinted band behind the whole expanded run
+        // (see FlatLine.tint / app.tsx). think vs tool are told apart by FONT
+        // depth, not by different background shades. A single TINTED blank row
+        // separates sub-blocks so they don't read as one glued lump ("为什么挤
+        // 那么近") — the row is part of the band (tinted), never a transparent
+        // gap that would leak the terminal wallpaper through as a patchy hole.
+        run.forEach((r, ri) => {
+          if (ri > 0) out.push({ text: '', kind: 'blank', group: gid, tint: true })
+          emitMergedFull(r, out, contentW, gid)
+        })
+      }
       else { const glyph = run[0].kind === 'think' ? symbols.star : symbols.assistant; push(`  ${glyph} ${mergedSummary(run)}`, 'collapsed', gid) }
+      markStart(s)
       spacer()
       continue
     }
     // Non-mergeable tool (write/edit/task/plan/workflow): header + result/diff.
+    const s = out.length
     emitTool(it as Extract<Item, { kind: 'tool' }>, out, contentW, expanded, expandAll)
+    markStart(s)
     spacer()
   }
   while (out.length && out[out.length - 1].kind === 'blank') out.pop()
@@ -128,13 +203,16 @@ export function flattenMessages(messages: Message[], width: number, opts?: Flatt
 function emitMsg(m: Message, out: FlatLine[], contentW: number): void {
   const push = (text: string, kind: LineKind): void => { out.push({ text, kind }) }
   const spacer = (): void => { if (out.length && out[out.length - 1].kind !== 'blank') push('', 'blank') }
+  // Per-turn completion footer ("✻ <word> for <elapsed> · done <clock>"): a faint
+  // system line, rendered verbatim (no markdown) so the ✻ / · glyphs stay intact.
+  if (m.meta?.turnDone) { m.content.split('\n').forEach((l) => push(`  ${l}`, 'system')); spacer(); return }
   if (m.role === 'user') {
     m.content.split('\n').forEach((l, i) => push(i === 0 ? `${symbols.userPrompt} ${l}` : `  ${l}`, 'user'))
   } else if (m.role === 'system') {
     const kind: LineKind = m.meta?.error ? 'error' : m.meta?.retry ? 'retry' : 'system'
-    renderMarkdown(m.content, contentW).split('\n').forEach((l) => push(`  ${l}`, kind))
+    mdLines(m.content, contentW).forEach((l) => push(`  ${l}`, kind))
   } else {
-    renderMarkdown(m.content, contentW).split('\n').forEach((l, i) =>
+    mdLines(m.content, contentW).forEach((l, i) =>
       push(i === 0 ? `${symbols.assistant} ${l}` : `  ${l}`, 'assistant'))
     if (m.meta?.interrupted) push('  ⎿ interrupted', 'error')
   }
@@ -145,14 +223,51 @@ function emitMsg(m: Message, out: FlatLine[], contentW: number): void {
 // its reasoning, each tool its header + result — all tagged with `gid` so a
 // click anywhere re-collapses the run.
 function emitMergedFull(it: Item, out: FlatLine[], contentW: number, gid: string): void {
-  const push = (text: string, kind: LineKind): void => { out.push({ text, kind, group: gid }) }
+  const push = (text: string, kind: LineKind): void => { out.push({ text, kind, group: gid, tint: true }) }
   if (it.kind === 'think') {
     push(`  ${symbols.star} Thought${it.m.meta?.thinkingSeconds ? ` for ${it.m.meta.thinkingSeconds}s` : ''}`, 'thinking')
-    renderMarkdown(it.m.content, contentW).split('\n').forEach((l) => push(`  ${l}`, 'thinking'))
+    // PLAIN (not markdown) so every line is the same dim shade — see plainLines.
+    plainLines(it.m.content, contentW).forEach((l) => push(`  ${l}`, 'thinking'))
   } else if (it.kind === 'tool') {
     it.header.content.split('\n').forEach((l) => push(`  ${l}`, 'tool-header'))
-    if (it.result) { const err = it.result.meta?.error; it.result.content.split('\n').forEach((l) => push(`  ${l}`, err ? 'error' : 'tool')) }
+    if (it.result) {
+      const err = it.result.meta?.error
+      if (it.tool === 'read_file' && !err) {
+        for (const row of readFileRows(it.result.content, contentW + 4)) push(row, 'tool')
+      } else {
+        it.result.content.split('\n').forEach((l) => push(`  ${l}`, err ? 'error' : 'tool'))
+      }
+    }
   }
+}
+
+// Render a read_file result block with a HANGING INDENT: a code line too wide for
+// the row wraps onto continuation rows aligned after the line-number gutter,
+// instead of falling back to column 0. read_file numbers each line as
+// "<n padded to 5>\t<code>" (see tools/impl.ts) and useChat prefixes the block
+// with "⎿ "; the tab puts the code at a fixed column on screen, but string-width
+// measures a raw '\t' as 0 columns, so a long line slipped past wrap="truncate"
+// and the terminal soft-wrapped it to column 0. We expand every tab to spaces so
+// our width math matches the terminal, then hard-wrap the code, indenting each
+// wrapped row to the gutter column. Each returned string is exactly one row, so
+// the ScrollView's one-line-per-row windowing stays exact. `width` is the full
+// terminal width; the 2-space transcript indent is added here.
+function readFileRows(content: string, width: number): string[] {
+  const rowMax = Math.max(20, width - 1) // 1-col right safety margin (avoid a stray terminal wrap)
+  const rows: string[] = []
+  for (const raw of content.split('\n')) {
+    const line = `  ${raw}`
+    const tab = line.indexOf('\t')
+    if (tab < 0) { rows.push(line); continue } // no line-number gutter (e.g. the "… (+N more lines)" tail)
+    const left = line.slice(0, tab)
+    const leftW = displayWidth(left)
+    const indent = ((leftW >> 3) + 1) << 3 // next 8-column tab stop = where the code starts on screen
+    const code = expandTabs(line.slice(tab + 1), indent) // expand the code's own tabs from that column
+    const segs = wrapToWidth(code, Math.max(8, rowMax - indent))
+    rows.push(left + ' '.repeat(indent - leftW) + segs[0])
+    for (let i = 1; i < segs.length; i++) rows.push(' '.repeat(indent) + segs[i])
+  }
+  return rows
 }
 
 // The one-line summary for a collapsed run: verbs grouped and counted in
@@ -240,7 +355,9 @@ export function bannerLines(width: number): FlatLine[] {
 export function thinkingLines(msg: Message, width: number): FlatLine[] {
   const contentW = Math.max(20, width - 4)
   const out: FlatLine[] = [{ text: `  ${symbols.star} Thinking…`, kind: 'thinking' }]
-  renderMarkdown(msg.content, contentW).split('\n').forEach((l) => out.push({ text: `  ${l}`, kind: 'thinking' }))
+  // PLAIN wrap (no markdown ANSI) so the streaming reasoning stays a single
+  // uniform dim shade, matching the committed "Thought" block.
+  plainLines(msg.content, contentW).forEach((l) => out.push({ text: `  ${l}`, kind: 'thinking' }))
   return out
 }
 

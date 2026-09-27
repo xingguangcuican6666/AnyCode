@@ -38,3 +38,27 @@ export function randomStatusWord(): string {
   const list = getLang() === 'zh' ? statusWordsZh : statusWords
   return list[Math.floor(Math.random() * list.length)]
 }
+
+/** Playful past-tense verbs for the per-turn completion footer ("✻ Sautéed for
+ *  10m 10s · done 2:09"), the spirit of Claude Code's done line. */
+export const completedWords = [
+  'Accomplished', 'Baked', 'Brewed', 'Calculated', 'Churned', 'Cogitated',
+  'Computed', 'Concocted', 'Conjured', 'Cooked', 'Crafted', 'Created',
+  'Crunched', 'Deliberated', 'Divined', 'Forged', 'Generated', 'Hatched',
+  'Herded', 'Hustled', 'Ideated', 'Imagined', 'Incubated', 'Inferred',
+  'Manifested', 'Marinated', 'Mulled', 'Mustered', 'Percolated', 'Pondered',
+  'Processed', 'Puzzled', 'Ruminated', 'Sautéed', 'Simmered', 'Stewed',
+  'Synthesized', 'Tinkered', 'Transmuted', 'Vibed', 'Worked', 'Wrangled',
+]
+
+/** The same, in Chinese — a short "…完成/完毕" register shown when lang is zh. */
+export const completedWordsZh = [
+  '烹制完成', '酝酿完毕', '思考完成', '盘算完毕', '琢磨完成', '推敲完毕',
+  '调制完成', '炖煮完毕', '打磨完成', '创作完毕', '演算完成', '合成完毕',
+  '构想完成', '锻造完毕', '孵化完成', '编织完毕', '拿捏完成', '钻研完毕',
+]
+
+export function randomCompletedWord(): string {
+  const list = getLang() === 'zh' ? completedWordsZh : completedWords
+  return list[Math.floor(Math.random() * list.length)]
+}

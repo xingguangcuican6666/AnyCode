@@ -3,7 +3,7 @@ import { Box, Text, useInput } from 'ink'
 import { symbols, useTheme } from '../theme'
 import { useT } from '../lib/i18n'
 import type { CommandSpec } from '../types'
-import { toGraphemes, computeWindow, truncateToWidth } from '../lib/text'
+import { toGraphemes, truncateToWidth, displayWidth } from '../lib/text'
 import { loadHistory, appendHistory } from '../lib/history'
 
 interface Props {
@@ -104,6 +104,20 @@ export function PromptInput({ active, placeholder, width, commands, onSubmit, on
       // other keys (typing, backspace, cursor moves) fall through below
     }
 
+    // Manual newline (shift/alt/ctrl+Enter) vs submit (plain Enter). Terminals
+    // don't agree on shift+Enter, and Ink can't see a shift modifier on Return
+    // (it flags EVERY Return as shift). What we CAN rely on: plain Enter is CR
+    // with key.return=true; a linefeed (Ctrl+J, and shift+Enter on terminals that
+    // send LF) arrives as input '\n' with key.return=false; alt/⌥+Enter arrives
+    // as ESC+CR, which Ink strips to a bare '\r' with key.return=false. So: LF, or
+    // a CR that ISN'T the parsed Return, inserts a newline. Ctrl+J always works.
+    const isNewline = input === '\n' || (input === '\r' && !key.return)
+    if (isNewline) {
+      setValue(g.slice(0, cursor).join('') + '\n' + g.slice(cursor).join(''))
+      setCursor((c) => c + 1)
+      setDismissed(false); setSelected(0)
+      return
+    }
     if (key.return) { submit(value); return }
     if (key.leftArrow) { setCursor((c) => Math.max(0, c - 1)); return }
     if (key.rightArrow) { setCursor((c) => Math.min(g.length, c + 1)); return }
@@ -150,11 +164,14 @@ export function PromptInput({ active, placeholder, width, commands, onSubmit, on
     // here (ESC stripped), which would otherwise insert literal junk like
     // "[<65;10;10M". Drop the SGR (\x1b[<b;x;yM/m) and legacy (\x1b[M…) forms.
     if (/\x1b?\[<\d+;\d+;\d+[Mm]/.test(input) || /\x1b?\[M/.test(input)) return
-    // A real Enter arrives as key.return, but paste or bulk input can deliver a
-    // chunk with an embedded CR/LF — submit the first line in that case.
+    // Paste or bulk input can deliver a chunk with embedded CR/LF. The input is
+    // multi-line now, so insert the whole thing at the cursor (normalising line
+    // endings to '\n') instead of submitting the first line.
     if (/[\r\n]/.test(input)) {
-      const firstLine = input.split(/\r\n|\r|\n/)[0]
-      submit(g.slice(0, cursor).join('') + firstLine + g.slice(cursor).join(''))
+      const chunk = input.replace(/\r\n|\r/g, '\n')
+      setValue(g.slice(0, cursor).join('') + chunk + g.slice(cursor).join(''))
+      setCursor((c) => c + toGraphemes(chunk).length)
+      setDismissed(false); setSelected(0)
       return
     }
     setValue(g.slice(0, cursor).join('') + input + g.slice(cursor).join(''))
@@ -165,51 +182,97 @@ export function PromptInput({ active, placeholder, width, commands, onSubmit, on
   const border = active ? colors.accent : colors.dim
   const isEmpty = value.length === 0
 
-  // Single-line window over `value`, measured in display columns so wide (CJK)
-  // and zero-width glyphs never overflow or break the rounded border.
-  // Inner width = box width minus borders, padding and the "> " marker.
+  // Inner text width = box width minus borders (2), padding (2) and the 2-col
+  // "> "/indent prefix every row carries. `value` soft-wraps to this width and
+  // also breaks on the manual '\n' newlines from shift/ctrl+Enter.
   const inner = Math.max(8, width - 6)
-  const g = toGraphemes(value)
-  const { visible, rel } = computeWindow(g, cursor, inner)
-  const before = visible.slice(0, rel).join('')
-  const at = visible[rel] ?? ' '
-  const after = visible.slice(rel + 1).join('')
+  const { rows, cRow, cCol } = layoutInput(value, cursor, inner)
+  // Cap the visible height and window to keep the cursor row on screen, so a very
+  // long prompt scrolls inside the box instead of pushing the transcript away.
+  let startRow = 0
+  if (rows.length > MAX_INPUT_ROWS) {
+    startRow = Math.min(Math.max(0, cRow - MAX_INPUT_ROWS + 1), rows.length - MAX_INPUT_ROWS)
+  }
+  const visibleRows = rows.slice(startRow, startRow + MAX_INPUT_ROWS)
   // Reserve one extra column for the inverse cursor block that precedes the hint
-  // while the input is active, so marker + cursor + hint can never exceed the
-  // box's inner width.
+  // while the input is active, so marker + cursor + hint can never exceed width.
   const hint = truncateToWidth(placeholder, Math.max(8, inner - (active ? 1 : 0)))
 
   return (
     <Box flexDirection="column" width={width}>
       {menuOpen ? <CommandMenu matches={matches} selected={sel} width={width} /> : null}
 
-      {/* flexDirection="column" is load-bearing. In the default row direction a
-          single Text child is sized to its own (Yoga-measured) intrinsic width
-          and left-aligned; once messages exist above, that measurement of the
-          marker+cursor+hint run comes back short, so Ink wraps the hint onto the
-          bottom border (`╰──commands)──╯`) or truncate clips it. As a column, the
-          Text is the cross-axis child and stretches to the box's full inner
-          width, so wrap/truncate uses the real width (≈ terminal − 4) and the
-          one-line content never wraps. */}
+      {/* flexDirection="column" is load-bearing: each row is the cross-axis child
+          and stretches to the box's full inner width, so wrap="truncate" measures
+          the real width (≈ terminal − 4) rather than the row's short intrinsic
+          width (which would push content onto the bottom border). We wrap the
+          text ourselves (layoutInput) and let the box grow in height. */}
       <Box borderStyle="round" borderColor={border} paddingX={1} flexDirection="column" width={width}>
-        <Text wrap="truncate">
-          <Text color={colors.accent}>{symbols.userPrompt} </Text>
-          {isEmpty ? (
-            <Text>
-              {active ? <Text inverse> </Text> : null}
-              <Text color={colors.dim}>{hint}</Text>
-            </Text>
-          ) : (
-            <Text color={colors.text}>
-              {before}
-              {active ? <Text inverse>{at}</Text> : null}
-              {active ? after : visible.slice(rel).join('')}
-            </Text>
-          )}
-        </Text>
+        {isEmpty ? (
+          <Text wrap="truncate">
+            <Text color={colors.accent}>{symbols.userPrompt} </Text>
+            {active ? <Text inverse> </Text> : null}
+            <Text color={colors.dim}>{hint}</Text>
+          </Text>
+        ) : (
+          visibleRows.map((rowG, i) => {
+            const absRow = startRow + i
+            const marker = absRow === 0 ? `${symbols.userPrompt} ` : '  '
+            const text = rowG.join('')
+            if (!active || absRow !== cRow) {
+              return (
+                <Text key={absRow} wrap="truncate">
+                  <Text color={colors.accent}>{marker}</Text>
+                  <Text color={colors.text}>{text}</Text>
+                </Text>
+              )
+            }
+            // Cursor row: draw the inverse block on the grapheme at cCol (a space
+            // when the caret sits at the row's end).
+            const before = rowG.slice(0, cCol).join('')
+            const atG = rowG[cCol]
+            const after = atG !== undefined ? rowG.slice(cCol + 1).join('') : ''
+            return (
+              <Text key={absRow} wrap="truncate">
+                <Text color={colors.accent}>{marker}</Text>
+                <Text color={colors.text}>{before}<Text inverse>{atG ?? ' '}</Text>{after}</Text>
+              </Text>
+            )
+          })
+        )}
       </Box>
     </Box>
   )
+}
+
+// Highest number of input rows drawn at once; a longer prompt scrolls within the
+// box (the cursor row is always kept visible).
+const MAX_INPUT_ROWS = 10
+
+// Lay `value` (which may hold manual '\n' newlines from shift/ctrl+Enter) into
+// visual rows that each fit `inner` display columns, soft-wrapping long logical
+// lines on grapheme boundaries. Returns the rows (as grapheme arrays) plus the
+// cursor's visual position — row index and grapheme offset within that row — so
+// the inverse cursor block lands exactly where the terminal will draw the caret.
+function layoutInput(value: string, cursor: number, inner: number): { rows: string[][]; cRow: number; cCol: number } {
+  const gs = toGraphemes(value)
+  const rows: string[][] = [[]]
+  let colW = 0
+  let cRow = 0
+  let cCol = 0
+  let placed = false
+  for (let i = 0; i <= gs.length; i++) {
+    if (i === cursor) { cRow = rows.length - 1; cCol = rows[rows.length - 1].length; placed = true }
+    if (i === gs.length) break
+    const ch = gs[i]
+    if (ch === '\n') { rows.push([]); colW = 0; continue }
+    const w = Math.max(1, displayWidth(ch))
+    if (colW + w > inner && rows[rows.length - 1].length > 0) { rows.push([]); colW = 0 }
+    rows[rows.length - 1].push(ch)
+    colW += w
+  }
+  if (!placed) { cRow = rows.length - 1; cCol = rows[rows.length - 1].length }
+  return { rows, cRow, cCol }
 }
 
 // The dropdown of slash-command suggestions, rendered just above the input box.

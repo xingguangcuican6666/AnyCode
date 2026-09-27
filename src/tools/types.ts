@@ -35,6 +35,11 @@ export interface ToolContext {
   // called with a fresh snapshot each time the sub-agent emits an event. Threaded
   // from StreamOpts.onAgent by the agent loop. Absent = no switchable view.
   onAgent?: (snap: AgentSnapshot) => void
+  // True only at the top level: whether `task`/`workflow` may run in the
+  // BACKGROUND (return a handle immediately and keep running past the turn, see
+  // lib/background). Withheld from sub-agents so background orchestration — like
+  // ordinary orchestration — never nests.
+  allowBackground?: boolean
 }
 
 export interface SpawnOpts {
