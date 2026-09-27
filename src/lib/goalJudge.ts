@@ -7,24 +7,40 @@ import type { AppConfig, Message } from '../types'
 import { getProvider } from '../providers'
 
 export interface GoalVerdict {
-  decision: 'continue' | 'complete'
+  decision: 'continue' | 'complete' | 'pause'
   reason: string
 }
 
 const JUDGE_SYSTEM =
   'You are a Stop hook — a reviewer OUTSIDE the working session. You are given a GOAL and a transcript of what the agent has done so far. ' +
-  'Decide whether the agent should STOP (the goal is genuinely and verifiably achieved) or CONTINUE (there is still work to do). ' +
-  'Bias strongly toward "continue": a reply that only answers a question, restates or outlines a plan, acknowledges the task, or reports partial progress is NOT completion. ' +
-  'Only choose "complete" when the goal is fully accomplished AND the result was verified (e.g. the build or tests pass). ' +
+  'Decide whether the agent should STOP (the goal is genuinely achieved) or CONTINUE (there is still work to do). ' +
+  'Bias toward "continue" for genuinely partial work: a reply that only asks a question, acknowledges the task, or reports partial progress with more clearly left to do is NOT completion. ' +
+  'But do NOT keep continuing once the thing the goal asked for exists. Choose "complete" when the deliverable is fully produced: for a code change, that the change is done and verified (build/tests pass where applicable); for a plan, document, analysis, answer, or review, that the finished artifact has been delivered. A complete plan is complete work — do not demand a build. ' +
+  'CRITICAL: the transcript is an EXCERPT we trimmed for length. A passage cut off with a "[... trimmed ...]" marker means WE shortened it for you, NOT that the agent truncated its own output. Never conclude that the agent\'s output was cut off, incomplete, or truncated from what you see here, and never issue an instruction like "finish the truncated plan" or "re-output the rest" — assume the agent\'s actual output was complete unless the transcript shows it explicitly stopping mid-work. ' +
   'Respond with ONLY a JSON object and nothing else: {"decision":"continue"|"complete","reason":"<one sentence>"}. ' +
-  'When continuing, the reason must be a concrete, actionable instruction for the next step.'
+  'When continuing, the reason must be a concrete, actionable instruction for the next step that adds NEW work, never a request to redo or re-emit work already done.'
+
+// Excerpt a message for the judge. When trimming, mark the cut EXPLICITLY so the
+// judge can't mistake our shortening for the agent truncating its own output —
+// that mistake produced a false "the plan was cut off, finish it" loop where the
+// agent kept re-emitting a plan it had already delivered in full.
+function excerpt(content: string, budget: number): string {
+  if (content.length <= budget) return content
+  const dropped = content.length - budget
+  return `${content.slice(0, budget)}\n… [${dropped} chars trimmed by us for length — the agent's own output was complete, NOT truncated]`
+}
 
 function transcript(messages: Message[], limit = 14): string {
   const rel = messages.filter((m) => m.role === 'user' || m.role === 'assistant' || m.role === 'tool').slice(-limit)
+  const last = rel.length - 1
   return rel
-    .map((m) => {
+    .map((m, i) => {
       const who = m.role === 'user' ? 'USER' : m.role === 'assistant' ? 'AGENT' : 'TOOL'
-      return `${who}: ${m.content.slice(0, 800)}`
+      // Completion hinges on the latest output, so give the final message the most
+      // room and recent ones more than old ones — a stingy budget made long, fully
+      // finished outputs look truncated to the judge.
+      const budget = i === last ? 8000 : i >= last - 3 ? 2500 : 700
+      return `${who}: ${excerpt(m.content, budget)}`
     })
     .join('\n\n')
 }
@@ -69,6 +85,10 @@ export async function judgeGoal(
     })
     return parseVerdict(raw)
   } catch {
-    return { decision: 'continue', reason: 'Judge call failed; keep working toward the goal.' }
+    // The judge call itself failed — almost always because the SAME provider the
+    // agent uses is down (expired login / HTTP 4xx-5xx). Returning 'continue' here
+    // spun the goal forever ("Judge call failed; keep working" ×∞) while every
+    // agent turn also 401'd. Pause instead and wait for the user to fix it.
+    return { decision: 'pause', reason: '未能获得模型响应（判定调用失败），已暂停。' }
   }
 }

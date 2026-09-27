@@ -29,10 +29,12 @@ export interface SettingSpec {
 export const SETTINGS: SettingSpec[] = [
   // Context & model
   { key: 'autoCompact', label: 'Auto-compact', group: 'Context & model', type: 'boolean', default: true, description: 'Summarize older messages when the context window fills' },
+  { key: 'autoCompactWindow', label: 'Auto-compact window', group: 'Context & model', type: 'number', min: 0, max: 10_000_000, unit: ' tok', default: 0, description: 'Trigger auto-compact once the context reaches this many tokens (0 = auto, use the model’s window). Set with /autocompact' },
   { key: 'continueAtUsageLimit', label: 'Continue automatically at usage limit', group: 'Context & model', type: 'boolean', default: false, description: 'Keep going when a usage limit is hit instead of stopping' },
   { key: 'switchModelOnFlag', label: 'Switch models when a message is flagged', group: 'Context & model', type: 'boolean', default: false, description: 'Fall back to another model if a message is flagged' },
   { key: 'thinkingMode', label: 'Thinking mode', group: 'Context & model', type: 'enum', values: ['auto', 'off', 'on'], default: 'auto', description: 'Extended thinking before responding' },
   { key: 'effort', label: 'Reasoning effort', group: 'Context & model', type: 'enum', values: ['low', 'medium', 'high', 'xhigh', 'max'], default: 'medium', description: 'How much reasoning/verification the agent applies (set with /effort)' },
+  { key: 'contextWindow', label: 'Context window override', group: 'Context & model', type: 'number', min: 0, max: 10_000_000, unit: ' tok', default: 0, description: 'Force the context-window size in tokens (0 = auto-detect from the model)' },
   // Interface
   { key: 'showTips', label: 'Show tips', group: 'Interface', type: 'boolean', default: true, description: 'Occasional usage tips in the footer' },
   { key: 'draftedFeedback', label: 'Claude-drafted feedback', group: 'Interface', type: 'boolean', default: true, description: 'Offer a drafted message when reporting feedback' },
@@ -71,6 +73,8 @@ export const SETTINGS: SettingSpec[] = [
   { key: 'dialogExpiry', label: 'Dialog expiry', group: 'Notifications & sessions', type: 'number', min: 0, max: 86400, unit: 's', default: 300, description: 'Seconds before an idle dialog expires (0 = never)' },
   // Advanced
   { key: 'autoUpdateChannel', label: 'Auto-update channel', group: 'Advanced', type: 'enum', values: ['stable', 'latest'], default: 'stable', description: 'Which release channel to auto-update from' },
+  { key: 'retryStatusCodes', label: 'Retry status codes', group: 'Advanced', type: 'string', default: '408,409,429,500-599', description: 'HTTP statuses to retry — codes and ranges, e.g. 408,409,429,500-599' },
+  { key: 'retryMaxAttempts', label: 'Retry max attempts', group: 'Advanced', type: 'number', min: 1, max: 50, default: 10, description: 'Total tries per API request before giving up' },
   { key: 'autoConnectIde', label: 'Auto-connect to IDE (external terminal)', group: 'Advanced', type: 'boolean', default: false, description: 'Connect to a running IDE from an external terminal' },
   { key: 'chromeEnabled', label: 'Claude in Chrome enabled by default', group: 'Advanced', type: 'boolean', default: false, description: 'Enable the Chrome integration for new sessions' },
 ]

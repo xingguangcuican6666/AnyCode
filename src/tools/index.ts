@@ -47,6 +47,8 @@ export function summarizeToolCall(name: string, input: Record<string, unknown>):
     case 'list_dir': return `list_dir · ${i.path ?? '.'}`
     case 'task': return `task · ${i.description || String(i.subagent_type ?? 'general')}`
     case 'plan': return `plan · ${i.description || 'plan'}`
+    case 'agent_status': return 'agent_status'
+    case 'agent_wait': return `agent_wait${Array.isArray(i.ids) && i.ids.length ? ` · ${i.ids.length} handle(s)` : ' · all'}`
     case 'workflow': {
       const n = Array.isArray(i.tasks) ? i.tasks.length : 0
       return `workflow · ${n} sub-task${n === 1 ? '' : 's'}`

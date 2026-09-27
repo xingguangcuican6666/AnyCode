@@ -3,7 +3,8 @@ import { providerIds } from '../providers'
 import { VERSION, NAME } from '../version'
 import { themes, themeList, DEFAULT_THEME } from '../theme'
 import { loadMemory, setGoal, addNote, removeNote, formatMemory, saveMemory } from '../lib/memory'
-import { contextState, contextLevel, fmtTokens, bar, emptyUsage } from '../lib/usage'
+import { contextState, contextLevel, contextLimit, fmtTokens, bar, emptyUsage } from '../lib/usage'
+import { refreshModelDb } from '../lib/modelDb'
 import { loadSkills, expandArgs } from '../lib/skills'
 import { loadUserCommands } from '../lib/userCommands'
 import { loadCredentials, clearCredentials } from '../lib/credentials'
@@ -35,11 +36,28 @@ const clear: SlashCommand = {
   run(ctx) { ctx.clear() },
 }
 
+// --- /new: start a fresh session. ctx.clear() rotates to a brand-new session
+// file (see cli.tsx onClear), so the current transcript is dropped from view but
+// stays saved on disk and remains reopenable via /resume — this is exactly the
+// "start a new session" affordance users expected but couldn't find.
+const newSession: SlashCommand = {
+  name: 'new',
+  get description() { return t('cmd.newDesc') },
+  run(ctx) { ctx.clear() },
+}
+
 const model: SlashCommand = {
   name: 'model',
   get description() { return t('cmd.modelDesc') },
-  run(ctx) {
+  async run(ctx) {
     const next = ctx.args.trim()
+    // `/model refresh` force-updates the online context-window database (models.dev)
+    // so the context bar tracks upstream without waiting for the daily refresh.
+    if (next.toLowerCase() === 'refresh') {
+      const ok = await refreshModelDb()
+      ctx.print(ok ? t('cmd.modelDbRefreshed') : t('cmd.modelDbRefreshFailed'), 'system', ok ? undefined : { error: true })
+      return
+    }
     if (!next) {
       // Interactive session: open the search + selector overlay. Non-interactive
       // (no overlay host): fall back to printing the current model.
@@ -62,6 +80,9 @@ const effort: SlashCommand = {
     const cur = String(getSetting(ctx.config.settings, 'effort'))
     const next = ctx.args.trim().toLowerCase()
     if (!next) {
+      // Interactive session: open the Faster↔Smarter slider. Non-interactive
+      // (no overlay host): fall back to printing the current level.
+      if (ctx.openEffortPicker) { ctx.openEffortPicker(); return }
       ctx.print(t('cmd.effortCurrent', { cur, levels: EFFORT_LEVELS.join(', ') }), 'system')
       return
     }
@@ -276,13 +297,62 @@ const stats: SlashCommand = {
 const compact: SlashCommand = {
   name: 'compact',
   get description() { return t('cmd.compactDesc') },
-  run(ctx) {
+  async run(ctx) {
     if (!ctx.compact) { ctx.print(t('cmd.tuiOnly', { cmd: '/compact' }), 'system', { error: true }); return }
     // When this folds anything the app remounts with the compacted transcript
     // (the digest message is shown there), so a print here would be discarded —
-    // only report when there was nothing to do.
-    const n = ctx.compact()
+    // only report when there was nothing to do. `compact` may summarize via a
+    // model call, so it can be async; await either way.
+    const n = await ctx.compact()
     if (n <= 0) ctx.print(t('cmd.compactNothing'), 'system')
+  },
+}
+
+// Parse a token count for /autocompact: bare digits, or a k/m suffix
+// ("128000", "128k", "1m"). Returns null when it isn't a positive number.
+function parseTokens(s: string): number | null {
+  const m = /^(\d+(?:\.\d+)?)\s*([km])?$/i.exec(s.trim())
+  if (!m) return null
+  const mult = m[2]?.toLowerCase() === 'm' ? 1_000_000 : m[2]?.toLowerCase() === 'k' ? 1_000 : 1
+  const n = Math.round(Number(m[1]) * mult)
+  return n > 0 ? n : null
+}
+
+// --- /autocompact: configure WHEN auto-compaction fires ---
+// Bare `/autocompact` opens the window picker; `/autocompact auto|off|<tokens>`
+// sets it directly. "auto" tracks the model's own context window; "off" disables
+// auto-compaction (manual /compact still works); a token count caps the trigger
+// at min(window, model context). Stored in the settings bag (autoCompact +
+// autoCompactWindow) so it persists.
+const autocompact: SlashCommand = {
+  name: 'autocompact',
+  aliases: ['auto-compact'],
+  get description() { return t('cmd.autocompactDesc') },
+  run(ctx) {
+    const arg = ctx.args.trim().toLowerCase()
+    if (!arg && ctx.openAutoCompact) { ctx.openAutoCompact(); return }
+    const s = { ...ctx.config.settings }
+    if (!arg) {
+      const on = getSetting(ctx.config.settings, 'autoCompact') !== false
+      const w = Number(getSetting(ctx.config.settings, 'autoCompactWindow')) || 0
+      const value = !on ? t('autocompact.off') : w > 0 ? t('autocompact.tokens', { n: fmtTokens(w) }) : t('autocompact.auto')
+      ctx.print(t('cmd.settingInfo', { key: 'autoCompactWindow', value, label: t('autocompact.title'), hint: 'auto | off | <tokens>' }), 'system')
+      return
+    }
+    if (arg === 'off' || arg === 'none' || arg === 'disable') {
+      ctx.setConfig({ settings: { ...s, autoCompact: false } })
+      ctx.print(t('cmd.autocompactOff'), 'system')
+      return
+    }
+    if (arg === 'auto' || arg === '0' || arg === 'default') {
+      ctx.setConfig({ settings: { ...s, autoCompact: true, autoCompactWindow: 0 } })
+      ctx.print(t('cmd.autocompactAuto', { limit: fmtTokens(contextLimit(ctx.config.model)) }), 'system')
+      return
+    }
+    const n = parseTokens(arg)
+    if (n === null) { ctx.print(t('cmd.autocompactInvalid', { value: arg }), 'system', { error: true }); return }
+    ctx.setConfig({ settings: { ...s, autoCompact: true, autoCompactWindow: n } })
+    ctx.print(t('cmd.autocompactSet', { value: fmtTokens(n) }), 'system')
   },
 }
 
@@ -563,7 +633,7 @@ const logout: SlashCommand = {
   },
 }
 
-const builtins: SlashCommand[] = [help, clear, model, provider, login, logout, effort, theme, goal, plan, loop, memory, config, usage, status, stats, compact, skill, resume, version, exit]
+const builtins: SlashCommand[] = [help, clear, newSession, model, provider, login, logout, effort, theme, goal, plan, loop, memory, config, usage, status, stats, compact, autocompact, skill, resume, version, exit]
 
 // Merge user-defined commands (from ~/.anycode/commands and ./.anycode/commands)
 // into the registry, but never let them shadow a built-in name or alias. Loaded

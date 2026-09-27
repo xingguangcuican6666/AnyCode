@@ -22,9 +22,18 @@ export interface MessageMeta {
   thinkingSeconds?: number
   // A transient retry notice (rendered in the warning color, not as an error).
   retry?: boolean
+  // A compaction digest (see lib/compact). Rendered as a dim system line, but —
+  // unlike other system messages — it MUST reach the model, so toApiMessages
+  // carries it into the request as a user turn. Without this flag the summary
+  // would be dropped and the model would "forget" everything that was folded.
+  compacted?: boolean
   // A write_file/edit_file result's unified diff, rendered as a line-numbered
   // green/red diff view (collapsible on click). Absent for non-mutating tools.
   diff?: DiffLine[]
+  // A per-turn completion footer ("✻ <word> for <elapsed> · done <clock>"),
+  // appended after the agent finishes a turn (see useChat). UI-only — role
+  // 'system' keeps it out of the API history (toApiMessages drops it).
+  turnDone?: boolean
 }
 
 export interface Message {
@@ -41,6 +50,12 @@ export interface StreamOpts {
   // When > 0, request extended thinking with this token budget (see /effort →
   // thinkingBudgetFor). Providers that don't support it ignore the field.
   thinkingBudget?: number
+  // Which HTTP status codes count as transient (retryable). A comma-separated
+  // list of codes and inclusive ranges, e.g. '408,409,429,500-599'. Parsed by
+  // the provider (see parseRetryCodes); absent = the provider's built-in default.
+  retryStatusCodes?: string
+  // Total tries per request before giving up. Absent = the provider default.
+  retryMaxAttempts?: number
   // Live progress callback for the `workflow` tool: called as its sub-agents move
   // queued→running→done so the UI can render a live tree. Threaded into the tool
   // context by the provider (see providers/anthropic). Optional; absent = no live
@@ -233,14 +248,18 @@ export interface CommandContext {
   usage?: SessionUsage
   /** Run text as a model turn, as if the user had typed it (custom commands, /skill). */
   send?: (text: string) => void
-  /** Compact the transcript into a summary to reclaim context; returns messages folded (/compact). */
-  compact?: () => number
+  /** Compact the transcript into a summary to reclaim context; returns messages folded (/compact). May summarize via a model call, so it can be async. */
+  compact?: () => number | Promise<number>
   /** Open the interactive settings overlay on a given tab (interactive sessions only). */
   openPanel?: (tab: PanelTab) => void
   /** Open the interactive new-api login overlay (interactive sessions only). */
   openLogin?: () => void
   /** Open the interactive /resume session picker (interactive sessions only). */
   openResume?: () => void
+  /** Open the interactive /autocompact window picker (interactive sessions only). */
+  openAutoCompact?: () => void
+  /** Open the interactive /effort slider picker (interactive sessions only). */
+  openEffortPicker?: () => void
 }
 
 export interface SlashCommand {

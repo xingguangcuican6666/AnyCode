@@ -4,21 +4,46 @@
 // billing. Real byte-exact counts would need the provider's tokenizer.
 import type { Message, SessionUsage } from '../types'
 import { estimateTokens } from './tokens'
+import { lookupRemoteWindow } from './modelDb'
 
-// Model → context-window size (tokens). Matched by substring so version suffixes
-// (e.g. -20251001) and families resolve without an exact-id table.
+// Built-in model → context-window fallback (tokens), matched by pattern against
+// the model id so version suffixes (e.g. -20251001) and families resolve without
+// an exact-id table. This is only the FALLBACK: the online models.dev database
+// (see lib/modelDb) is consulted first for a real per-model number, and this
+// table catches anything it doesn't know. Order matters — earlier, more specific
+// patterns win (e.g. gpt-4.1 before gpt-4o).
 const CONTEXT_LIMITS: Array<[RegExp, number]> = [
-  [/opus/i, 200_000],
-  [/sonnet/i, 200_000],
-  [/haiku/i, 200_000],
-  [/fable/i, 200_000],
+  // OpenAI
+  [/gpt-5|gpt5/i, 272_000],
+  [/gpt-4\.1/i, 1_047_576],
+  [/gpt-4o|gpt-4-turbo/i, 128_000],
+  [/o[134](-|$)|o-mini/i, 200_000],
+  // Google Gemini (1.5 / 2.x and newer all ~1M)
+  [/gemini/i, 1_048_576],
+  // Open models
+  [/deepseek/i, 128_000],
+  [/qwen/i, 131_072],
+  [/llama/i, 128_000],
+  [/mistral|mixtral/i, 128_000],
+  // Anthropic Claude
+  [/claude|opus|sonnet|haiku|fable/i, 200_000],
 ]
 const DEFAULT_CONTEXT = 200_000
 
-/** The context-window size (in tokens) for a model id. */
-export function contextLimit(model: string): number {
+// The built-in fallback window for a model id (no network).
+function builtinLimit(model: string): number {
   for (const [re, n] of CONTEXT_LIMITS) if (re.test(model)) return n
   return DEFAULT_CONTEXT
+}
+
+/**
+ * The context-window size (in tokens) for a model id. Prefers the online
+ * models.dev database (kept fresh in the background, see lib/modelDb) and falls
+ * back to the built-in family table when the model is unknown or the DB hasn't
+ * loaded yet — so an accurate, self-updating number wins over a static guess.
+ */
+export function contextLimit(model: string): number {
+  return lookupRemoteWindow(model) ?? builtinLimit(model)
 }
 
 /** Cumulative session totals, accumulated turn-by-turn in useChat. */
@@ -50,8 +75,8 @@ export interface ContextState {
   remaining: number
 }
 
-export function contextState(messages: Message[], model: string): ContextState {
-  const limit = contextLimit(model)
+export function contextState(messages: Message[], model: string, override?: number): ContextState {
+  const limit = override && override > 0 ? override : contextLimit(model)
   const used = contextTokens(messages)
   return { used, limit, ratio: Math.min(1, used / limit), remaining: Math.max(0, limit - used) }
 }

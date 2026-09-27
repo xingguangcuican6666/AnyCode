@@ -25,6 +25,16 @@ export interface ThemeColors {
   warning: string
   dim: string
   text: string
+  // Full-row background tints for added / removed diff lines (GitHub/Claude Code
+  // style). Empty string = no background (the ANSI-only themes, where a subtle
+  // tint isn't possible, keep the plain coloured foreground instead).
+  diffAddBg: string
+  diffDelBg: string
+  // Uniform background for an EXPANDED collapsed block (thinking + merged tool
+  // output), so it reads as one Claude-Code-style box. ONE shade for the whole
+  // block — think vs tool are distinguished by font depth, not by tint. Empty
+  // string = no background (the ANSI-only themes).
+  blockBg: string
 }
 
 export interface Theme {
@@ -57,6 +67,9 @@ export const themes: Record<string, Theme> = {
       warning: '#E5C07B',
       dim: '#6B6B6B',
       text: '#E6E6E6',
+      diffAddBg: '#16351f',
+      diffDelBg: '#3b1719',
+      blockBg: '#1e1e22',
     },
   },
   light: {
@@ -76,6 +89,9 @@ export const themes: Record<string, Theme> = {
       warning: '#A16207',
       dim: '#78716C',
       text: '#1C1917',
+      diffAddBg: '#CBEBD1',
+      diffDelBg: '#F7CFD1',
+      blockBg: '#F0EEEC',
     },
   },
   'dark-daltonized': {
@@ -95,6 +111,9 @@ export const themes: Record<string, Theme> = {
       warning: '#F0E442',
       dim: '#6B6B6B',
       text: '#E6E6E6',
+      diffAddBg: '#123246',
+      diffDelBg: '#3a2410',
+      blockBg: '#1e1e22',
     },
   },
   'light-daltonized': {
@@ -114,6 +133,9 @@ export const themes: Record<string, Theme> = {
       warning: '#8A6D00',
       dim: '#78716C',
       text: '#1C1917',
+      diffAddBg: '#CCE1F2',
+      diffDelBg: '#F3DEC9',
+      blockBg: '#ECEEF0',
     },
   },
   'dark-ansi': {
@@ -133,6 +155,9 @@ export const themes: Record<string, Theme> = {
       warning: 'yellow',
       dim: 'gray',
       text: 'white',
+      diffAddBg: '',
+      diffDelBg: '',
+      blockBg: '',
     },
   },
   'light-ansi': {
@@ -152,6 +177,9 @@ export const themes: Record<string, Theme> = {
       warning: 'yellow',
       dim: 'gray',
       text: 'black',
+      diffAddBg: '',
+      diffDelBg: '',
+      blockBg: '',
     },
   },
 }

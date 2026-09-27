@@ -5,16 +5,32 @@ import { isCommand, runCommand } from '../commands'
 import { saveConfig } from '../config'
 import { loadMemory, goalPreamble } from '../lib/memory'
 import { changeSummary } from '../lib/transcript'
+import { t, getLang } from '../lib/i18n'
 import { effortDirective, getSetting, thinkingBudgetFor } from '../lib/settings'
-import { randomStatusWord } from '../lib/spinner'
+import { randomStatusWord, randomCompletedWord } from '../lib/spinner'
 import { summarizeToolCall } from '../tools'
 import { estimateTokens } from '../lib/tokens'
 import { emptyUsage, type SessionUsage } from '../lib/usage'
 import { computeCost } from '../lib/pricing'
 import { recordSession, recordTurn } from '../lib/stats'
+import { hasPendingBackground, takeCompleted, settleNextBackground, type BgTask } from '../lib/background'
 
 let counter = 0
 const nextId = (): string => `m${++counter}`
+
+// Per-turn completion footer helpers: elapsed as "10m 10s" / "9s" (zh: "10分10秒"
+// / "9秒"), finish time as a 12-hour "h:mm" clock (matches Claude Code's line).
+function fmtDur(ms: number): string {
+  const s = Math.max(1, Math.round(ms / 1000))
+  const zh = getLang() === 'zh'
+  const m = Math.floor(s / 60)
+  if (s < 60) return zh ? `${s}秒` : `${s}s`
+  return zh ? `${m}分${s % 60}秒` : `${m}m ${s % 60}s`
+}
+function fmtClock(d: Date): string {
+  const h = d.getHours() % 12 || 12
+  return `${h}:${String(d.getMinutes()).padStart(2, '0')}`
+}
 
 const BANNER: Message = { id: 'banner', role: 'system', content: '__banner__' }
 
@@ -24,11 +40,23 @@ const AGENT_SYSTEM =
   'You are MeowCode, a coding agent working in the user\'s project directory. ' +
   'Use the provided tools (bash, read_file, write_file, edit_file, grep, glob, list_dir) to inspect and change the project yourself instead of only describing what to do. ' +
   'For a self-contained sub-task, delegate it with the `task` tool (a fresh sub-agent with the same file/search/shell tools); to fan several independent sub-tasks out in parallel, use the `workflow` tool. ' +
+  'You may run `task`/`workflow` in the background (pass `background: true`) to keep working without blocking; check them with `agent_status` and collect their results with `agent_wait`. If you end your turn while background work is still running, the system waits for it and feeds the results back so you resume automatically — so never stop just because a sub-agent is still working. ' +
   'For any non-trivial or multi-file change, first call the `plan` tool to have a read-only sub-agent produce a concrete step-by-step implementation plan, then follow it. ' +
   'Keep going until the request is genuinely done — read what you need, make the edits, and verify with a build or tests before you stop. ' +
   'Do not stop after merely acknowledging or outlining a plan.'
 
 export type ChatStatus = 'idle' | 'streaming'
+
+// A transient, self-healing retry notice shown ABOVE the prompt (never written
+// into the transcript/context): the attempt counter, the reason, and `until` —
+// the epoch-ms moment the next attempt fires, so the UI can count down to it.
+// Cleared the instant any non-retry event arrives and when the turn ends.
+export interface RetryStatus {
+  attempt: number
+  max: number
+  reason: string
+  until: number
+}
 
 // The live token counter shown in the status line: `dir` is 'up' (input tokens,
 // counted at submit) before the reply begins and 'down' (output tokens) once the
@@ -54,10 +82,12 @@ export interface ChatActions {
   stopGoal?: () => void
   goalStatus?: () => string | null
   send?: (text: string) => void
-  compact?: () => number
+  compact?: () => number | Promise<number>
   openPanel?: (tab: PanelTab) => void
   openLogin?: () => void
   openResume?: () => void
+  openAutoCompact?: () => void
+  openEffortPicker?: () => void
 }
 
 export interface Chat {
@@ -70,6 +100,10 @@ export interface Chat {
   // Live token counter for the status line (↑ input on submit, ↓ output while
   // the model works); null when idle.
   live: LiveStatus | null
+  // A transient retry notice (attempt/max, reason, countdown target) shown above
+  // the prompt while the provider retries a transient failure; null when none.
+  // Never enters the transcript — it's ephemeral UI, cleared on the next event.
+  retry: RetryStatus | null
   // Live progress of in-flight `workflow` tool calls (per-agent state + timing).
   // One entry per running workflow — a turn can fan out several, so the UI shows
   // one collapsed line each (↓ to select, ↵ to expand). Empty when none run.
@@ -83,7 +117,7 @@ export interface Chat {
   statusWord: string
   config: AppConfig
   usage: SessionUsage
-  setConfig: (patch: Partial<AppConfig>) => void
+  setConfig: (patch: Partial<AppConfig>, opts?: { persist?: boolean }) => void
   print: (content: string, role?: Role, meta?: MessageMeta) => void
   submit: (raw: string, actions: ChatActions) => Promise<void>
   interrupt: () => void
@@ -99,6 +133,16 @@ function formatToolResult(content: string, isError?: boolean): string {
   return mark + body.split('\n').join('\n   ')
 }
 
+// Render a batch of finished background tasks (see lib/background) as the text of
+// a synthetic user turn. Fed back to the model when the main agent ended its turn
+// with background work still pending, so it resumes instead of stopping.
+function renderWakeup(tasks: BgTask[]): string {
+  const parts = tasks.map((t) =>
+    `### ${t.label} (${t.id}) — ${t.status}${t.error ? ` · error: ${t.error}` : ''}\n${t.result || '(no output)'}`)
+  const noun = tasks.length === 1 ? 'A background task' : `${tasks.length} background tasks`
+  return `[System] ${noun} you started ${tasks.length === 1 ? 'has' : 'have'} finished. Review the result${tasks.length === 1 ? '' : 's'} below and continue the original task — do not stop until it is genuinely done.\n\n${parts.join('\n\n')}`
+}
+
 export function useChat(initialConfig: AppConfig, initialMessages?: Message[], initialUsage?: SessionUsage): Chat {
   const [config, setConfigState] = useState<AppConfig>(initialConfig)
   // Seed with a carried-over transcript on a resize remount, else just the banner.
@@ -110,6 +154,10 @@ export function useChat(initialConfig: AppConfig, initialMessages?: Message[], i
   const [thinking, setThinking] = useState<Message | null>(null)
   // Live ↑/↓ token counter for the status line (null when idle).
   const [live, setLive] = useState<LiveStatus | null>(null)
+  // Transient retry notice shown above the prompt (null when not retrying). Set
+  // on a `retry` event, cleared on the next non-retry event and at turn end, so
+  // it never lands in the transcript/context (see #3).
+  const [retry, setRetry] = useState<RetryStatus | null>(null)
   // Live progress of in-flight `workflow` tool calls (null → an empty list). Each
   // arriving snapshot is upserted by id, so several workflows in one turn each
   // keep their own collapsed line; the whole list is cleared when the turn ends.
@@ -136,6 +184,9 @@ export function useChat(initialConfig: AppConfig, initialMessages?: Message[], i
   const messagesRef = useRef<Message[]>(messages)
   const configRef = useRef<AppConfig>(config)
   const abortRef = useRef<AbortController | null>(null)
+  // Tracks whether a retry notice is currently shown, so we clear it (once) on
+  // the next non-retry event without a setState on every event.
+  const retryRef = useRef<boolean>(false)
 
   // Keep refs in sync with the value we hand to React, avoiding stale closures.
   const commitMessages = useCallback((updater: (prev: Message[]) => Message[]) => {
@@ -146,13 +197,15 @@ export function useChat(initialConfig: AppConfig, initialMessages?: Message[], i
     })
   }, [])
 
-  const setConfig = useCallback((patch: Partial<AppConfig>) => {
+  const setConfig = useCallback((patch: Partial<AppConfig>, opts?: { persist?: boolean }) => {
     const next = { ...configRef.current, ...patch }
     configRef.current = next
     setConfigState(next)
     // Persist the change so /model and /provider survive a restart. saveConfig
-    // strips the apiKey before writing, so the key never touches disk.
-    saveConfig(next)
+    // strips the apiKey before writing, so the key never touches disk. Pass
+    // { persist: false } to apply a change for THIS session only (the "s" key in
+    // the /effort slider), leaving the on-disk config untouched.
+    if (opts?.persist !== false) saveConfig(next)
   }, [])
 
   const print = useCallback((content: string, role: Role = 'system', meta?: MessageMeta) => {
@@ -193,12 +246,15 @@ export function useChat(initialConfig: AppConfig, initialMessages?: Message[], i
         openPanel: actions.openPanel,
         openLogin: actions.openLogin,
         openResume: actions.openResume,
+        openAutoCompact: actions.openAutoCompact,
+        openEffortPicker: actions.openEffortPicker,
       })
       return
     }
 
     const controller = new AbortController()
     abortRef.current = controller
+    const turnStart = Date.now()
     setStatusWord(randomStatusWord())
     setStatus('streaming')
     // Clear the prior turn's switchable sub-agents as a fresh turn begins (they
@@ -237,6 +293,9 @@ export function useChat(initialConfig: AppConfig, initialMessages?: Message[], i
       system,
       signal: controller.signal,
       thinkingBudget: thinkingBudgetFor(effortLevel),
+      // Configurable retry policy (see settings retryStatusCodes/retryMaxAttempts).
+      retryStatusCodes: String(getSetting(configRef.current.settings, 'retryStatusCodes')),
+      retryMaxAttempts: Number(getSetting(configRef.current.settings, 'retryMaxAttempts')) || undefined,
       // Live workflow progress → React state so the UI can render the tree(s).
       // Snapshots are keyed by id: replace the matching one, else append. The
       // list is cleared on turn end (a workflow's final snapshot has done=true).
@@ -300,6 +359,9 @@ export function useChat(initialConfig: AppConfig, initialMessages?: Message[], i
     try {
       if (provider.agent) {
         for await (const ev of provider.agent([...prior, userMsg], opts)) {
+          // Any non-retry event means the request is progressing again — clear the
+          // transient retry notice so it doesn't linger above the prompt.
+          if (ev.type !== 'retry' && retryRef.current) { retryRef.current = false; setRetry(null) }
           if (ev.type === 'thinking') {
             if (!thinkingStart) thinkingStart = Date.now()
             thinkingAcc += ev.text
@@ -334,8 +396,10 @@ export function useChat(initialConfig: AppConfig, initialMessages?: Message[], i
             if (turnOutput > 0) setLive((l) => (l ? { ...l, dir: 'down', tokens: turnOutput } : l))
           }
           else if (ev.type === 'retry') {
-            const secs = Math.max(1, Math.round(ev.delayMs / 1000))
-            print(`⟳ Retrying (${ev.attempt}/${ev.max}) in ${secs}s — ${ev.reason}`, 'system', { retry: true })
+            // Transient, self-healing — show it ABOVE the prompt as ephemeral UI,
+            // never in the transcript (so it never re-enters the model's context).
+            retryRef.current = true
+            setRetry({ attempt: ev.attempt, max: ev.max, reason: ev.reason, until: Date.now() + ev.delayMs })
           }
           else if (ev.type === 'error') { errorMsg = ev.message }
         }
@@ -361,6 +425,18 @@ export function useChat(initialConfig: AppConfig, initialMessages?: Message[], i
     }
     if (errorMsg && !interrupted) {
       print(`⚠️ ${errorMsg}`, 'system', { error: true })
+    }
+    // Per-turn completion footer at the bottom of the turn (like Claude Code's
+    // "✻ Sautéed for 10m 10s · done 2:09"). Only when the turn actually produced a
+    // reply and wasn't interrupted. role 'system' keeps it out of the API history.
+    if (!interrupted && acc.trim()) {
+      const now = new Date()
+      const line = t('app.turnDone', {
+        word: randomCompletedWord(),
+        dur: fmtDur(now.getTime() - turnStart),
+        clock: fmtClock(now),
+      })
+      commitMessages((prev) => [...prev, { id: nextId(), role: 'system', content: line, meta: { turnDone: true } }])
     }
     // Fold this turn into the running totals. Prefer the provider's real token
     // counts (incl. cache); fall back to estimates when none were reported. Cost
@@ -390,10 +466,27 @@ export function useChat(initialConfig: AppConfig, initialMessages?: Message[], i
     setStreaming(null)
     setThinking(null)
     setLive(null)
+    retryRef.current = false
+    setRetry(null)
     setWorkflows([])
     setStatus('idle')
     abortRef.current = null
+
+    // #1/#2: don't stop dead if this turn launched background sub-agents that are
+    // still running (or finished but uncollected). Wait for the next batch to
+    // settle, then feed the results back as a fresh turn so the main agent resumes
+    // on its own. Draining recurses through submit's own turn-end, so it continues
+    // until nothing is pending. Skipped when the user interrupted.
+    if (!interrupted && hasPendingBackground()) {
+      let collected = takeCompleted()
+      if (collected.length === 0) {
+        await settleNextBackground()
+        if (abortRef.current) return // a new turn started meanwhile — let it drive
+        collected = takeCompleted()
+      }
+      if (collected.length > 0) await submit(renderWakeup(collected), actions)
+    }
   }, [status, commitMessages, setConfig, print, bumpUsage])
 
-  return { messages, streaming, thinking, live, workflows, agents, status, statusWord, config, usage, setConfig, print, submit, interrupt }
+  return { messages, streaming, thinking, live, retry, workflows, agents, status, statusWord, config, usage, setConfig, print, submit, interrupt }
 }

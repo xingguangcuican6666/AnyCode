@@ -15,8 +15,15 @@ import type { SessionSnapshot } from '../app'
 
 export const SESSIONS_DIR = path.join(CONFIG_DIR, 'sessions')
 
-// Keep at most this many sessions on disk; the oldest fall off on save.
-const MAX_SESSIONS = 50
+// Keep at most this many sessions PER WORKSPACE (cwd); the oldest in a workspace
+// fall off on save. Other workspaces' sessions are never touched — history is
+// scoped to the project you're in, not one global list.
+const MAX_PER_WORKSPACE = 100
+
+// Normalize a cwd for stable comparison across saves (absolute, no trailing /).
+function normCwd(p: string): string {
+  try { return path.resolve(p) } catch { return p }
+}
 
 // One saved session file: the snapshot plus the metadata the picker lists.
 export interface SavedSession {
@@ -86,8 +93,9 @@ function readFile(id: string): SavedSession | null {
   }
 }
 
-// All sessions' metadata, newest-first. Best-effort: unreadable files are skipped.
-export function listSessions(): SessionMeta[] {
+// Every session's metadata across all workspaces, newest-first. Best-effort:
+// unreadable files are skipped.
+function allMetas(): SessionMeta[] {
   let names: string[] = []
   try {
     names = fs.readdirSync(SESSIONS_DIR).filter((f) => f.endsWith('.json'))
@@ -102,21 +110,42 @@ export function listSessions(): SessionMeta[] {
   return metas.sort((a, b) => b.savedAt - a.savedAt)
 }
 
+// Saved sessions' metadata, newest-first. Scoped to ONE workspace by default
+// (the current cwd) so /resume and `--continue` show this project's own history
+// instead of a globally-shared list — pass `null` to list every workspace.
+export function listSessions(cwd: string | null = process.cwd()): SessionMeta[] {
+  const all = allMetas()
+  if (cwd === null) return all
+  const want = normCwd(cwd)
+  return all.filter((m) => normCwd(m.cwd) === want)
+}
+
 // Load a full session snapshot by id (null if missing/corrupt).
 export function loadSession(id: string): SessionSnapshot | null {
   return readFile(id)?.snapshot ?? null
 }
 
-// The most-recently-saved session's metadata, or null (drives `--continue`).
-export function latestSession(): SessionMeta | null {
-  return listSessions()[0] ?? null
+// The most-recently-saved session's metadata in this workspace, or null (drives
+// `--continue`). Pass `null` for the globally newest across all workspaces.
+export function latestSession(cwd: string | null = process.cwd()): SessionMeta | null {
+  return listSessions(cwd)[0] ?? null
 }
 
-// Trim to MAX_SESSIONS, deleting the oldest files.
+// Trim each workspace to MAX_PER_WORKSPACE, deleting its oldest files. Grouped
+// by cwd so a busy project never evicts another project's saved sessions.
 function prune(): void {
   try {
-    for (const m of listSessions().slice(MAX_SESSIONS)) {
-      try { fs.unlinkSync(fileFor(m.id)) } catch { /* ignore one bad unlink */ }
+    const byCwd = new Map<string, SessionMeta[]>()
+    for (const m of allMetas()) { // already newest-first
+      const k = normCwd(m.cwd)
+      const arr = byCwd.get(k) ?? []
+      arr.push(m)
+      byCwd.set(k, arr)
+    }
+    for (const arr of byCwd.values()) {
+      for (const m of arr.slice(MAX_PER_WORKSPACE)) {
+        try { fs.unlinkSync(fileFor(m.id)) } catch { /* ignore one bad unlink */ }
+      }
     }
   } catch {
     // best-effort; pruning is non-critical
