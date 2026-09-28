@@ -25,7 +25,7 @@ const WORKFLOW_MAX_TASKS = 8
 const WORKFLOW_CONCURRENCY = 4
 // `agent_wait` always waits for a BOUNDED time so the model can never spin
 // forever holding the turn open: it must pass a timeout, and we cap it here.
-const WAIT_TIMEOUT_CAP = 120
+const WAIT_TIMEOUT_CAP = 600
 
 async function runBatched<T, R>(
   items: T[],

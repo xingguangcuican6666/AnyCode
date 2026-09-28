@@ -25,9 +25,12 @@ const ALT_ON = '\x1b[?1049h'
 const ALT_OFF = '\x1b[?1049l'
 // ?1000h button events + ?1002h button-event MOTION (so a left-drag streams as
 // button 32, which App turns into a text selection) + ?1006h SGR coordinates +
-// ?1004h focus reporting (CSI I/O in & out, so App can gate notifications).
-const MOUSE_ON = '\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?1004h'
-const MOUSE_OFF = '\x1b[?1000l\x1b[?1002l\x1b[?1006l\x1b[?1004l'
+// ?1004h focus reporting (CSI I/O in & out, so App can gate notifications) +
+// ?2004h bracketed paste (the terminal wraps pasted text in \x1b[200~…\x1b[201~;
+// the kitty translator strips the wrapper so the content pastes cleanly instead
+// of leaking "[200~" and mangling under the kitty keyboard protocol).
+const MOUSE_ON = '\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?1004h\x1b[?2004h'
+const MOUSE_OFF = '\x1b[?1000l\x1b[?1002l\x1b[?1006l\x1b[?1004l\x1b[?2004l'
 const CLEAR = '\x1b[2J\x1b[3J\x1b[H'
 
 const argv = process.argv.slice(2)

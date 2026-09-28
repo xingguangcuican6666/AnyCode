@@ -77,6 +77,12 @@ export function createKittyTranslator(): (chunk: string) => string {
     // in the parameter class below, so the anchor can't reach it → not buffered.
     const tail = /\x1b(?:\[[0-9;:<>?]*)?$/.exec(s)
     if (tail) { pending = s.slice(tail.index); s = s.slice(0, tail.index) }
+    // Strip bracketed-paste markers (?2004h, enabled in cli.tsx). The terminal
+    // wraps a paste in \x1b[200~ … \x1b[201~; we drop the wrapper and keep the
+    // content, which then inserts as normal text (PromptInput's CR/LF handling
+    // splits multi-line pastes). Without this the markers leak as literal
+    // "[200~"/"[201~" and the kitty protocol mangles the paste.
+    s = s.replace(/\x1b\[20[01]~/g, '')
     // Replace every complete CSI-u event with its legacy form.
     return s.replace(/\x1b\[([0-9;:]+)u/g, (_full, params: string) => legacyForCsiU(params))
   }
