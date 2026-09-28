@@ -5,7 +5,7 @@ import { isCommand, runCommand } from '../commands'
 import { saveConfig } from '../config'
 import { loadMemory, goalPreamble } from '../lib/memory'
 import { changeSummary } from '../lib/transcript'
-import { t, getLang } from '../lib/i18n'
+import { t } from '../lib/i18n'
 import { effortDirective, getSetting, resolveThinkingBudget, outputStyleDirective } from '../lib/settings'
 import { randomStatusWord, randomCompletedWord } from '../lib/spinner'
 import { summarizeToolCall } from '../tools'
@@ -13,40 +13,11 @@ import { estimateTokens } from '../lib/tokens'
 import { emptyUsage, type SessionUsage } from '../lib/usage'
 import { computeCost } from '../lib/pricing'
 import { recordSession, recordTurn } from '../lib/stats'
-import { hasPendingBackground, takeCompleted, settleNextBackground, type BgTask } from '../lib/background'
+import { hasPendingBackground, takeCompleted, settleNextBackground, clearBackground, abortBackground } from '../lib/background'
+import { BANNER, AGENT_SYSTEM, fmtDur, fmtClock, formatToolResult, renderWakeup } from './chat-helpers'
 
 let counter = 0
 const nextId = (): string => `m${++counter}`
-
-// Per-turn completion footer helpers: elapsed as "10m 10s" / "9s" (zh: "10分10秒"
-// / "9秒"), finish time as a 12-hour "h:mm" clock (matches Claude Code's line).
-function fmtDur(ms: number): string {
-  const s = Math.max(1, Math.round(ms / 1000))
-  const zh = getLang() === 'zh'
-  const m = Math.floor(s / 60)
-  if (s < 60) return zh ? `${s}秒` : `${s}s`
-  return zh ? `${m}分${s % 60}秒` : `${m}m ${s % 60}s`
-}
-function fmtClock(d: Date, fmt24: boolean): string {
-  const mm = String(d.getMinutes()).padStart(2, '0')
-  if (fmt24) return `${String(d.getHours()).padStart(2, '0')}:${mm}`
-  const h = d.getHours() % 12 || 12
-  const ampm = d.getHours() < 12 ? 'am' : 'pm'
-  return `${h}:${mm}${ampm}`
-}
-
-const BANNER: Message = { id: 'banner', role: 'system', content: '__banner__' }
-
-// Base instructions so a real model behaves like a coding agent: lean on the
-// tools, and actually finish (verify) rather than narrate a plan and stop.
-const AGENT_SYSTEM =
-  'You are MeowCode, a coding agent working in the user\'s project directory. ' +
-  'Use the provided tools (bash, read_file, write_file, edit_file, grep, glob, list_dir) to inspect and change the project yourself instead of only describing what to do. ' +
-  'For a self-contained sub-task, delegate it with the `task` tool (a fresh sub-agent with the same file/search/shell tools); to fan several independent sub-tasks out in parallel, use the `workflow` tool. ' +
-  'You may run `task`/`workflow` in the background (pass `background: true`) to keep working without blocking; check them with `agent_status` and collect their results with `agent_wait`. If you end your turn while background work is still running, the system waits for it and feeds the results back so you resume automatically — so never stop just because a sub-agent is still working. ' +
-  'For any non-trivial or multi-file change, first call the `plan` tool to have a read-only sub-agent produce a concrete step-by-step implementation plan, then follow it. ' +
-  'Keep going until the request is genuinely done — read what you need, make the edits, and verify with a build or tests before you stop. ' +
-  'Do not stop after merely acknowledging or outlining a plan.'
 
 export type ChatStatus = 'idle' | 'streaming'
 
@@ -85,6 +56,11 @@ export interface ChatActions {
   stopGoal?: () => void
   goalStatus?: () => string | null
   send?: (text: string) => void
+  // Drain the type-ahead queue for a MID-TURN interjection: returns the plain-text
+  // lines the user typed while the turn was streaming (commands are left queued for
+  // the idle flush) and removes them from the queue. Called from useChat's provider
+  // opts after each tool batch. Absent = no interjection support.
+  takePending?: () => string[]
   compact?: () => number | Promise<number>
   openPanel?: (tab: PanelTab) => void
   openLogin?: () => void
@@ -116,6 +92,10 @@ export interface Chat {
   // workflow tree). Kept until the NEXT turn starts, so a finished sub-agent's
   // chat can still be browsed after the turn ends.
   agents: AgentSnapshot[]
+  // True when background sub-agent work (task/plan/workflow) is still running or
+  // finished-but-uncollected while the main agent is idle — drives the idle
+  // "后台运行中" indicator and lets Esc cancel it (see app.tsx).
+  bgPending: boolean
   status: ChatStatus
   statusWord: string
   config: AppConfig
@@ -124,26 +104,10 @@ export interface Chat {
   print: (content: string, role?: Role, meta?: MessageMeta) => void
   submit: (raw: string, actions: ChatActions) => Promise<void>
   interrupt: () => void
-}
-
-// Render a tool result as an indented, dimmed block, truncated for the transcript.
-function formatToolResult(content: string, isError?: boolean): string {
-  const lines = content.split('\n')
-  const shown = lines.slice(0, 12)
-  const more = lines.length - shown.length
-  const body = shown.join('\n') + (more > 0 ? `\n… (+${more} more lines)` : '')
-  const mark = isError ? '⎿ ⚠️ ' : '⎿ '
-  return mark + body.split('\n').join('\n   ')
-}
-
-// Render a batch of finished background tasks (see lib/background) as the text of
-// a synthetic user turn. Fed back to the model when the main agent ended its turn
-// with background work still pending, so it resumes instead of stopping.
-function renderWakeup(tasks: BgTask[]): string {
-  const parts = tasks.map((t) =>
-    `### ${t.label} (${t.id}) — ${t.status}${t.error ? ` · error: ${t.error}` : ''}\n${t.result || '(no output)'}`)
-  const noun = tasks.length === 1 ? 'A background task' : `${tasks.length} background tasks`
-  return `[System] ${noun} you started ${tasks.length === 1 ? 'has' : 'have'} finished. Review the result${tasks.length === 1 ? '' : 's'} below and continue the original task — do not stop until it is genuinely done.\n\n${parts.join('\n\n')}`
+  // Destroy a finished workflow / switchable sub-agent snapshot once it loses UI
+  // focus, so completed instances stop lingering at the bottom (see app.tsx).
+  dropWorkflow: (id: string) => void
+  dropAgent: (id: string) => void
 }
 
 export function useChat(initialConfig: AppConfig, initialMessages?: Message[], initialUsage?: SessionUsage): Chat {
@@ -169,6 +133,13 @@ export function useChat(initialConfig: AppConfig, initialMessages?: Message[], i
   // unlike workflows these survive turn end and are cleared when the NEXT turn
   // begins, so a completed sub-agent's transcript remains browsable.
   const [agents, setAgents] = useState<AgentSnapshot[]>([])
+  // True while background work is still in flight (or finished-uncollected) with
+  // the main agent idle. Set at turn end from hasPendingBackground(); drives the
+  // idle indicator + Esc-cancel path.
+  const [bgPending, setBgPending] = useState<boolean>(false)
+  // Set by interrupt() when Esc is pressed while idle with background work
+  // pending, so the turn-end drain drops the results instead of feeding them back.
+  const bgCancelRef = useRef<boolean>(false)
   const [status, setStatus] = useState<ChatStatus>('idle')
   const [statusWord, setStatusWord] = useState<string>('Working')
   // Cumulative session token/turn accounting (drives /usage, /status, warnings).
@@ -179,6 +150,11 @@ export function useChat(initialConfig: AppConfig, initialMessages?: Message[], i
     usageRef.current = next
     setUsage(next)
   }, [])
+  // Destroy a finished workflow / switchable sub-agent snapshot. The UI calls
+  // these once a COMPLETED instance loses focus (no longer expanded / viewed), so
+  // it stops lingering at the bottom instead of waiting for the next turn to clear.
+  const dropWorkflow = useCallback((id: string) => setWorkflows((prev) => prev.filter((w) => w.id !== id)), [])
+  const dropAgent = useCallback((id: string) => setAgents((prev) => prev.filter((a) => a.id !== id)), [])
 
   // Count one lifetime session per process (idempotent — App remounts on
   // resize/compact/clear must not re-count).
@@ -216,7 +192,16 @@ export function useChat(initialConfig: AppConfig, initialMessages?: Message[], i
   }, [commitMessages])
 
   const interrupt = useCallback(() => {
-    abortRef.current?.abort()
+    // Streaming turn: abort the in-flight request (its controller). Background
+    // work has its OWN controller, so a streaming interrupt leaves it running.
+    if (abortRef.current) { abortRef.current.abort(); return }
+    // Idle with background work pending: a second Esc cancels the background run.
+    // Flag the drain so it drops the (aborted) results instead of feeding them
+    // back, then abort every running background task.
+    if (hasPendingBackground()) {
+      bgCancelRef.current = true
+      abortBackground()
+    }
   }, [])
 
   const submit = useCallback(async (raw: string, actions: ChatActions) => {
@@ -330,6 +315,25 @@ export function useChat(initialConfig: AppConfig, initialMessages?: Message[], i
           next[i] = snap
           return next
         }),
+      // Mid-turn interjection: after each tool batch the provider calls this to
+      // pull anything the user type-ahead-queued during the turn. We drain the
+      // host queue (actions.takePending, which drops commands back for the idle
+      // flush), commit each drained line to the transcript as a real user message
+      // so it shows in-place and survives into the next turn's context, and hand
+      // the lines to the provider to merge into the current request. Absent host
+      // support (or nothing queued) → the turn is unaffected.
+      takePending: actions.takePending
+        ? (): string[] => {
+            const pending = (actions.takePending?.() ?? []).map((p) => p.trim()).filter(Boolean)
+            if (pending.length > 0) {
+              commitMessages((prev) => [
+                ...prev,
+                ...pending.map((p) => ({ id: nextId(), role: 'user' as const, content: p })),
+              ])
+            }
+            return pending
+          }
+        : undefined,
     }
 
     // Estimate the prompt size (system + full transcript) as a billing/context
@@ -397,7 +401,9 @@ export function useChat(initialConfig: AppConfig, initialMessages?: Message[], i
               // diff rows in meta, so the transcript can render the diff view.
               print(`⎿ ${changeSummary(ev.linesAdded ?? 0, ev.linesRemoved ?? 0)}`, 'tool', { diff: ev.diff })
             } else {
-              print(formatToolResult(ev.content, ev.isError), 'tool', ev.isError ? { error: true } : undefined)
+              // Prefer the tool's short `display` (keeps internal guidance/handles
+              // out of the terminal); the model already got the full `content`.
+              print(formatToolResult(ev.display ?? ev.content, ev.isError), 'tool', ev.isError ? { error: true } : undefined)
             }
           }
           else if (ev.type === 'usage') {
@@ -485,16 +491,30 @@ export function useChat(initialConfig: AppConfig, initialMessages?: Message[], i
     setWorkflows([])
     setStatus('idle')
     abortRef.current = null
+    // Reflect whether background work outlives this turn — drives the idle
+    // "后台运行中" indicator and enables the Esc-cancel path while we drain below.
+    setBgPending(hasPendingBackground())
 
     // #1/#2: don't stop dead if this turn launched background sub-agents that are
     // still running (or finished but uncollected). Wait for the next batch to
     // settle, then feed the results back as a fresh turn so the main agent resumes
     // on its own. Draining recurses through submit's own turn-end, so it continues
-    // until nothing is pending. Skipped when the user interrupted.
-    if (!interrupted && hasPendingBackground()) {
+    // until nothing is pending. Runs even after an Esc-interrupt: the idle
+    // indicator promises the work auto-continues when done, and a second Esc while
+    // it drains cancels it (interrupt sets bgCancelRef; the check below honors it).
+    if (hasPendingBackground()) {
       let collected = takeCompleted()
       if (collected.length === 0) {
         await settleNextBackground()
+        // Esc while idle set the cancel flag (see interrupt): drop the aborted
+        // results instead of feeding them back, and clear the pending state.
+        if (bgCancelRef.current) {
+          bgCancelRef.current = false
+          clearBackground()
+          setBgPending(false)
+          print('⏹ 已取消后台任务。', 'system')
+          return
+        }
         if (abortRef.current) return // a new turn started meanwhile — let it drive
         collected = takeCompleted()
       }
@@ -502,5 +522,5 @@ export function useChat(initialConfig: AppConfig, initialMessages?: Message[], i
     }
   }, [status, commitMessages, setConfig, print, bumpUsage])
 
-  return { messages, streaming, thinking, live, retry, workflows, agents, status, statusWord, config, usage, setConfig, print, submit, interrupt }
+  return { messages, streaming, thinking, live, retry, workflows, agents, bgPending, status, statusWord, config, usage, setConfig, print, submit, interrupt, dropWorkflow, dropAgent }
 }
