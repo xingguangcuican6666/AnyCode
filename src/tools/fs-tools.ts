@@ -8,6 +8,7 @@ import { spawn } from 'node:child_process'
 import type { ToolContext, ToolDef, ToolResult } from './types'
 import type { DiffLine } from '../types'
 import { clip } from './util'
+import { recordCheckpoint } from '../lib/checkpoints'
 
 function resolve(cwd: string, p: string): string {
   return path.isAbsolute(p) ? p : path.resolve(cwd, p)
@@ -167,8 +168,11 @@ const writeFile: ToolDef = {
     const content = String(input.content ?? '')
     try {
       // Read the prior contents (if any) so we can report an accurate line diff
-      // rather than counting a full rewrite as all-added.
-      const before = await fsp.readFile(file, 'utf8').catch(() => '')
+      // rather than counting a full rewrite as all-added. `prior === null` means
+      // the file didn't exist — a rewind then deletes it.
+      const prior = await fsp.readFile(file, 'utf8').then((c) => c).catch(() => null)
+      if (ctx.rewind !== false) recordCheckpoint(file, prior, 'write_file', Date.now())
+      const before = prior ?? ''
       await fsp.mkdir(path.dirname(file), { recursive: true })
       await fsp.writeFile(file, content, 'utf8')
       const { added, removed } = lineDiff(before, content)
@@ -202,6 +206,7 @@ const editFile: ToolDef = {
       if (count === 0) return { content: `old_string not found in ${file}`, isError: true }
       if (count > 1 && !input.replace_all) return { content: `old_string is not unique in ${file} (${count} matches); pass replace_all or add context.`, isError: true }
       const next = input.replace_all ? raw.split(oldStr).join(newStr) : raw.replace(oldStr, newStr)
+      if (ctx.rewind !== false) recordCheckpoint(file, raw, 'edit_file', Date.now())
       await fsp.writeFile(file, next, 'utf8')
       const reps = input.replace_all ? count : 1
       // Whole-file diff gives accurate counts and a proper context view; the

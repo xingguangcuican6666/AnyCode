@@ -66,11 +66,6 @@ export function removeNote(index: number): MemoryStore {
   return m
 }
 
-export function clearMemory(): MemoryStore {
-  const m = emptyStore()
-  saveMemory(m)
-  return m
-}
 
 export function formatMemory(m: MemoryStore): string {
   const lines: string[] = ['**Memory**', '']

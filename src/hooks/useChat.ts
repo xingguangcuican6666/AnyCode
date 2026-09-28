@@ -1,12 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import type { AgentSnapshot, AppConfig, LoopSpec, Message, MessageMeta, PanelTab, Role, WorkflowSnapshot } from '../types'
+import type { AgentSnapshot, AppConfig, LoopSpec, Message, MessageMeta, PanelTab, PermissionRequest, Role, WorkflowSnapshot } from '../types'
 import { getProvider } from '../providers'
 import { isCommand, runCommand } from '../commands'
 import { saveConfig } from '../config'
 import { loadMemory, goalPreamble } from '../lib/memory'
 import { changeSummary } from '../lib/transcript'
 import { t } from '../lib/i18n'
-import { effortDirective, getSetting, resolveThinkingBudget, outputStyleDirective } from '../lib/settings'
+import { effortDirective, getSetting, resolveThinkingBudget, outputStyleDirective, workflowSizeDirective } from '../lib/settings'
 import { randomStatusWord, randomCompletedWord } from '../lib/spinner'
 import { summarizeToolCall } from '../tools'
 import { estimateTokens } from '../lib/tokens'
@@ -67,6 +67,14 @@ export interface ChatActions {
   openResume?: () => void
   openAutoCompact?: () => void
   openEffortPicker?: () => void
+  // Open the last assistant response in $EDITOR (the `lastResponseInEditor`
+  // setting). Absent = no external-editor host (print mode).
+  openEditor?: (text: string) => void
+  // Interactive permission prompt (the `permissionMode` / `autoModeInPlan`
+  // settings): the provider calls this before a gated tool runs; resolve 'allow'
+  // to run it or 'deny' to skip it (the denial is fed back to the model). Absent
+  // = no interactive gating.
+  requestPermission?: (req: PermissionRequest) => Promise<'allow' | 'deny'>
 }
 
 export interface Chat {
@@ -236,6 +244,7 @@ export function useChat(initialConfig: AppConfig, initialMessages?: Message[], i
         openResume: actions.openResume,
         openAutoCompact: actions.openAutoCompact,
         openEffortPicker: actions.openEffortPicker,
+        openEditor: actions.openEditor,
       })
       return
     }
@@ -275,7 +284,13 @@ export function useChat(initialConfig: AppConfig, initialMessages?: Message[], i
     const effort = effortDirective(effortLevel)
     // Output style (concise/explanatory) injects a preamble line like effort does.
     const outStyle = outputStyleDirective(String(getSetting(configRef.current.settings, 'outputStyle')))
-    const system = [AGENT_SYSTEM, effort, outStyle, preamble, configRef.current.system].filter(Boolean).join('\n\n')
+    // Workflow orchestration: `dynamicWorkflows` gates the `workflow` tool itself,
+    // and when it's on `dynamicWorkflowSize` adds a fleet-size guideline line.
+    const allowWorkflows = getSetting(configRef.current.settings, 'dynamicWorkflows') !== false
+    const wfSize = allowWorkflows
+      ? workflowSizeDirective(String(getSetting(configRef.current.settings, 'dynamicWorkflowSize')))
+      : undefined
+    const system = [AGENT_SYSTEM, effort, outStyle, wfSize, preamble, configRef.current.system].filter(Boolean).join('\n\n')
     // Extended thinking: effort sets the budget, `thinkingMode` (auto/off/on)
     // overrides it — off forces 0, on forces it on. Providers that don't support
     // thinking ignore thinkingBudget (see providers/anthropic, settings).
@@ -293,6 +308,16 @@ export function useChat(initialConfig: AppConfig, initialMessages?: Message[], i
       // Swap to fallbackModel once if a message comes back flagged (refusal).
       switchModelOnFlag: getSetting(configRef.current.settings, 'switchModelOnFlag') === true,
       fallbackModel: String(getSetting(configRef.current.settings, 'fallbackModel') || '') || undefined,
+      // Workflow gating: withhold the `workflow` tool when dynamicWorkflows is off,
+      // and refuse standalone report saves when artifacts is off.
+      dynamicWorkflows: allowWorkflows,
+      artifacts: getSetting(configRef.current.settings, 'artifacts') !== false,
+      rewind: getSetting(configRef.current.settings, 'rewindCode') !== false,
+      // Permission gating: the mode + plan-auto flag steer decidePermission, and
+      // requestPermission surfaces an 'ask' decision to the interactive dialog.
+      permissionMode: String(getSetting(configRef.current.settings, 'permissionMode') || 'default'),
+      autoModeInPlan: getSetting(configRef.current.settings, 'autoModeInPlan') === true,
+      requestPermission: actions.requestPermission,
       // Live workflow progress → React state so the UI can render the tree(s).
       // Snapshots are keyed by id: replace the matching one, else append. The
       // list is cleared on turn end (a workflow's final snapshot has done=true).
@@ -488,7 +513,13 @@ export function useChat(initialConfig: AppConfig, initialMessages?: Message[], i
     setLive(null)
     retryRef.current = false
     setRetry(null)
-    setWorkflows([])
+    // Drop only FINISHED workflow trees at turn end. A workflow launched with
+    // `background: true` is usually still running when the turn ends (the tool
+    // returned a handle immediately); keep its live tree + p/s controls on screen
+    // — it emits a final done=true snapshot when it settles, and the app-level
+    // effect prunes done (unexpanded) trees then. Clearing unconditionally made a
+    // background workflow's tree vanish until its next progress tick.
+    setWorkflows((prev) => prev.filter((w) => !w.done))
     setStatus('idle')
     abortRef.current = null
     // Reflect whether background work outlives this turn — drives the idle

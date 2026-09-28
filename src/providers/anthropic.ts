@@ -1,6 +1,7 @@
 import type { AgentEvent, Message, Provider, StreamOpts } from '../types'
 import { loadConfig } from '../config'
 import { runTool, toolSchemas, type SpawnOpts, type SpawnResult } from '../tools'
+import { decidePermission, isPermissionMode } from '../tools/permission'
 import { estimateTokens } from '../lib/tokens'
 import { contextLimit, AUTO_COMPACT_RATIO } from '../lib/usage'
 import { parseRetryCodes, sleep, backoffMs, parseRetryAfter } from './retry'
@@ -214,6 +215,10 @@ async function* agent(messages: Message[], opts: StreamOpts, cfg: AnthropicOpts,
   const url = resolveUrl(cfg)
   let convo = toApiMessages(messages)
   const cwd = process.cwd()
+  // Permission mode governs whether each tool call runs freely, is denied, or
+  // prompts the user (see tools/permission). Sub-agents inherit it but only ever
+  // apply its deterministic part (plan mode denies mutations); they never prompt.
+  const permMode = isPermissionMode(opts.permissionMode) ? opts.permissionMode : 'default'
 
   // Retry policy is configurable per request (see settings retryStatusCodes /
   // retryMaxAttempts, threaded through StreamOpts); fall back to the built-ins.
@@ -227,7 +232,7 @@ async function* agent(messages: Message[], opts: StreamOpts, cfg: AnthropicOpts,
     ? undefined
     : async (sp) => {
         const subMessages: Message[] = [{ id: 'sub-user', role: 'user', content: sp.prompt }]
-        const subOpts: StreamOpts = { model: opts.model, system: sp.system, signal: sp.signal ?? opts.signal, retryStatusCodes: opts.retryStatusCodes, retryMaxAttempts: opts.retryMaxAttempts, continueAtUsageLimit: opts.continueAtUsageLimit, switchModelOnFlag: opts.switchModelOnFlag, fallbackModel: opts.fallbackModel }
+        const subOpts: StreamOpts = { model: opts.model, system: sp.system, signal: sp.signal ?? opts.signal, retryStatusCodes: opts.retryStatusCodes, retryMaxAttempts: opts.retryMaxAttempts, continueAtUsageLimit: opts.continueAtUsageLimit, switchModelOnFlag: opts.switchModelOnFlag, fallbackModel: opts.fallbackModel, permissionMode: opts.permissionMode, autoModeInPlan: opts.autoModeInPlan, rewind: opts.rewind }
         let text = ''
         let lastText = ''
         let steps = 0
@@ -297,7 +302,7 @@ async function* agent(messages: Message[], opts: StreamOpts, cfg: AnthropicOpts,
       max_tokens: think ? think + 4096 : 4096,
       stream: true,
       // Drop tools on the forced-summary step so the model can only answer in prose.
-      ...(summaryOnly ? {} : { tools: toolSchemas(!sub) }),
+      ...(summaryOnly ? {} : { tools: toolSchemas(!sub, opts.dynamicWorkflows !== false) }),
       ...(think ? { thinking: { type: 'enabled', budget_tokens: think } } : {}),
       ...(opts.system ? { system: opts.system } : {}),
       messages: convo,
@@ -442,7 +447,25 @@ async function* agent(messages: Message[], opts: StreamOpts, cfg: AnthropicOpts,
     const results: ApiBlock[] = []
     for (const tu of toolUses) {
       yield { type: 'tool_use', id: tu.id, name: tu.name, input: tu.input }
-      const r = await runTool(tu.name, tu.input, { cwd, signal: opts.signal, spawnAgent, onWorkflow: opts.onWorkflow, onAgent: opts.onAgent, allowBackground: !sub })
+      // Permission gate: decide whether this tool may run under the current mode.
+      // 'deny' (plan-mode mutation, or the user declined) short-circuits — the
+      // reason is fed back as an error tool_result so the model adapts instead of
+      // the tool actually running; 'ask' prompts the user via requestPermission.
+      const decision = decidePermission(permMode, tu.name, { autoModeInPlan: opts.autoModeInPlan, sub })
+      let denyReason: string | undefined
+      if (decision.action === 'deny') {
+        denyReason = decision.reason
+      } else if (decision.action === 'ask' && opts.requestPermission) {
+        const verdict = await opts.requestPermission({ tool: tu.name, input: tu.input, summary: summarizeToolCall(tu.name, tu.input) })
+        if (opts.signal?.aborted) return
+        if (verdict === 'deny') denyReason = '用户拒绝了本次工具调用。请据此调整方案，或改用其它方式。'
+      }
+      if (denyReason) {
+        yield { type: 'tool_result', id: tu.id, name: tu.name, content: denyReason, isError: true }
+        results.push({ type: 'tool_result', tool_use_id: tu.id, content: denyReason, is_error: true })
+        continue
+      }
+      const r = await runTool(tu.name, tu.input, { cwd, signal: opts.signal, spawnAgent, onWorkflow: opts.onWorkflow, onAgent: opts.onAgent, allowBackground: !sub, artifacts: opts.artifacts, rewind: opts.rewind })
       if (opts.signal?.aborted) return
       yield { type: 'tool_result', id: tu.id, name: tu.name, content: r.content, display: r.display, isError: r.isError, linesAdded: r.linesAdded, linesRemoved: r.linesRemoved, diff: r.diff }
       results.push({ type: 'tool_result', tool_use_id: tu.id, content: r.content, is_error: r.isError })

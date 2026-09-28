@@ -98,8 +98,3 @@ export function buildCompacted(plan: CompactPlan, summary: string): CompactResul
 // unchanged. This is the synchronous, network-free path (used by the mock
 // provider and as the fallback when a model summary is unavailable). For a
 // model-driven summary, callers use planCompaction + buildCompacted directly.
-export function compactMessages(all: Message[], keepRecent = KEEP_RECENT, opts?: { force?: boolean }): CompactResult {
-  const plan = planCompaction(all, keepRecent, opts)
-  if (!plan) return { messages: all, folded: 0 }
-  return buildCompacted(plan, heuristicSummary(plan.older))
-}

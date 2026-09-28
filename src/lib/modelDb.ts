@@ -106,10 +106,6 @@ export function lookupRemoteWindow(model: string): number | undefined {
   return best
 }
 
-/** Whether the online DB currently has any entries (cache hit or after a fetch). */
-export function hasRemoteWindows(): boolean {
-  return Object.keys(memWindows).length > 0
-}
 
 // Fetch the catalog once, updating the in-memory map + on-disk cache. Resolves
 // true when new data was stored. Network/parse failures resolve false (the old

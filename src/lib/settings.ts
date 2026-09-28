@@ -66,7 +66,7 @@ export const SETTINGS: SettingSpec[] = [
   { key: 'respectGitignore', label: 'Respect .gitignore in file picker', group: 'Editor & input', type: 'boolean', default: true, description: 'Hide ignored files from the picker' },
   { key: 'skipCopyPicker', label: 'Skip the /copy picker', group: 'Editor & input', type: 'boolean', default: false, description: 'Copy immediately without the picker step' },
   { key: 'copyOnSelect', label: 'Copy on select', group: 'Editor & input', type: 'boolean', default: false, description: 'Copy selected text to the clipboard automatically' },
-  { key: 'leftArrowOpensAgents', label: '← opens agents', group: 'Editor & input', type: 'boolean', default: false, description: 'Left arrow at column 0 opens the agents view' },
+  { key: 'leftArrowOpensAgents', label: '← opens agents', group: 'Editor & input', type: 'boolean', default: true, description: 'Left arrow at column 0 opens the agents view when sub-agents exist' },
   { key: 'lastResponseInEditor', label: 'Show last response in external editor', group: 'Editor & input', type: 'boolean', default: false, description: 'Open the last response in $EDITOR' },
   // Notifications & sessions
   { key: 'localNotifications', label: 'Local notifications', group: 'Notifications & sessions', type: 'boolean', default: true, description: 'Desktop notifications when the terminal is unfocused' },
@@ -227,4 +227,18 @@ const OUTPUT_STYLE_DIRECTIVE: Record<string, string> = {
 export function outputStyleDirective(style: string | undefined): string | undefined {
   if (!style || style === 'default') return undefined
   return OUTPUT_STYLE_DIRECTIVE[style]
+}
+
+// The system-preamble line for the `dynamicWorkflowSize` setting — a guideline
+// (not a hard cap) on how many sub-agents a single workflow should spawn, mirroring
+// how Claude Code nudges the fleet size. Only injected when `dynamicWorkflows` is
+// on (no point sizing workflows the agent can't spawn). Unknown size → undefined.
+const WORKFLOW_SIZE_DIRECTIVE: Record<string, string> = {
+  small: 'Workflow size guideline: small — keep any multi-agent workflow under 5 sub-agents; prefer solving directly or with one or two agents unless the task clearly needs more.',
+  medium: 'Workflow size guideline: medium — keep any multi-agent workflow under 10 sub-agents unless the task clearly calls for wider fan-out.',
+  large: 'Workflow size guideline: large — you may spawn many sub-agents (dozens) when the task genuinely benefits from broad parallelism.',
+}
+export function workflowSizeDirective(size: string | undefined): string | undefined {
+  if (!size) return undefined
+  return WORKFLOW_SIZE_DIRECTIVE[size]
 }

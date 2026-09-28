@@ -10,7 +10,16 @@ import { loadUserCommands } from '../lib/userCommands'
 import { loadCredentials, clearCredentials } from '../lib/credentials'
 import { logout as newapiLogout } from '../lib/newapi'
 import { revokeOAuth } from '../lib/oauth'
+import { copyToClipboard } from '../lib/clipboard'
+import { createWorktree, type WorktreeBaseRef } from '../lib/worktree'
+import { saveFeedback, feedbackCount } from '../lib/feedback'
+import { listCheckpoints, restoreCheckpoint, clearCheckpoints } from '../lib/checkpoints'
+import { getIdentity, livePeers, sendMail } from '../lib/mailbox'
+import { sendMessageFrame, subscribeTo, unsubscribeFrom, isSubscribed, isReachable } from '../lib/sessionSocket'
+import { detectIde } from '../lib/ide'
+import { detectChrome } from '../lib/chrome'
 import { t } from '../lib/i18n'
+import os from 'node:os'
 import {
   SETTINGS, SETTINGS_BY_KEY, settingGroups, getSetting,
   formatSettingValue, coerceSetting, settingHint, EFFORT_LEVELS, isEffortLevel,
@@ -404,7 +413,6 @@ const exit: SlashCommand = {
 // (see app.tsx onResume). `meowcode --continue` reopens the latest without the UI.
 const resume: SlashCommand = {
   name: 'resume',
-  aliases: ['sessions'],
   get description() { return t('cmd.resumeDesc') },
   run(ctx) {
     if (ctx.openResume) { ctx.openResume(); return }
@@ -475,19 +483,48 @@ const goal: SlashCommand = {
   },
 }
 
-// /plan: ask AnyCode to produce an implementation plan BEFORE touching code.
-// Mirrors Claude Code's plan mode: it runs a normal model turn but instructs the
-// model to use its read-only `plan` tool (or otherwise investigate read-only) and
-// return a concrete step-by-step plan without editing anything.
+// /plan: enter Claude Code–style plan mode and (optionally) kick off planning.
+// This does two things that must go together: (1) flip `permissionMode` to
+// 'plan' so the REAL enforcement engine (decidePermission) denies every mutating
+// tool for the rest of the session until the user leaves plan mode — the prompt
+// text alone is just a request the model could ignore; (2) instruct the model to
+// use its read-only `plan` tool and return a step-by-step plan.
+//
+// Remembers the mode we came from so `/plan off` restores it (e.g. back to
+// 'acceptEdits'), rather than blindly resetting to 'default'.
+let planPrevMode: string | null = null
+
 const plan: SlashCommand = {
   name: 'plan',
   get description() { return t('cmd.planDesc') },
   run(ctx) {
     const arg = ctx.args.trim()
-    if (!arg) {
-      ctx.print(t('cmd.planUsage'), 'system')
+    const low = arg.toLowerCase()
+    const s = { ...ctx.config.settings }
+    const cur = String(getSetting(ctx.config.settings, 'permissionMode') || 'default')
+
+    // /plan off|exit|done|end — leave plan mode, restoring the prior mode.
+    if (low === 'off' || low === 'exit' || low === 'done' || low === 'end' || low === 'stop' || low === 'none') {
+      const restore = planPrevMode ?? 'default'
+      planPrevMode = null
+      if (cur !== 'plan') { ctx.print(t('cmd.planNotActive'), 'system'); return }
+      ctx.setConfig({ settings: { ...s, permissionMode: restore } })
+      ctx.print(t('cmd.planExited', { mode: restore }), 'system')
       return
     }
+
+    // Entering plan mode: remember where we came from, then flip the real switch
+    // so decidePermission starts denying mutations on the next turn onward.
+    if (cur !== 'plan') planPrevMode = cur
+    ctx.setConfig({ settings: { ...s, permissionMode: 'plan' } })
+
+    // Bare /plan: just switch into plan mode and explain how to use / exit it.
+    if (!arg) {
+      ctx.print(t('cmd.planEntered'), 'system')
+      return
+    }
+
+    // /plan <task>: switch to plan mode AND launch the planning turn.
     const prompt =
       `Use the \`plan\` tool to produce a concrete implementation plan for the following task, then present that plan to me. ` +
       `Do NOT edit any files or run mutating commands yet — planning only.\n\nTask: ${arg}`
@@ -633,7 +670,249 @@ const logout: SlashCommand = {
   },
 }
 
-const builtins: SlashCommand[] = [help, clear, newSession, model, provider, login, logout, effort, theme, goal, plan, loop, memory, config, usage, status, stats, compact, autocompact, skill, resume, version, exit]
+// --- /copy: copy an assistant response to the clipboard (the `skipCopyPicker`
+// setting). With skipCopyPicker on — or when given an index — it copies straight
+// away; otherwise it prints a short picker of recent responses to choose from
+// (`/copy <n>`, 1 = most recent). Uses the OSC 52 + native clipboard bridge.
+const copy: SlashCommand = {
+  name: 'copy',
+  aliases: ['cp'],
+  get description() { return t('cmd.copyDesc') },
+  run(ctx) {
+    const assistants = ctx.messages.filter((m) => m.role === 'assistant' && m.content.trim())
+    if (!assistants.length) { ctx.print(t('cmd.copyNone'), 'system'); return }
+    const skip = getSetting(ctx.config.settings, 'skipCopyPicker') === true
+    const arg = ctx.args.trim()
+    if (arg || skip) {
+      let idx = assistants.length - 1
+      if (arg) {
+        const n = Number(arg)
+        if (!Number.isInteger(n) || n < 1 || n > assistants.length) {
+          ctx.print(t('cmd.copyBadIndex', { n: arg, max: assistants.length }), 'system', { error: true }); return
+        }
+        idx = assistants.length - n // 1 = most recent
+      }
+      const text = assistants[idx].content
+      copyToClipboard(text, process.stdout)
+      ctx.print(t('cmd.copyDone', { chars: text.length }), 'system')
+      return
+    }
+    const recent = assistants.slice(-9).reverse()
+    const lines = recent.map((m, i) => {
+      const preview = m.content.replace(/\s+/g, ' ').trim().slice(0, 60)
+      return `- \`/copy ${i + 1}\` — ${preview}${m.content.length > 60 ? '…' : ''}`
+    })
+    ctx.print([t('cmd.copyPickTitle'), '', ...lines, '', t('cmd.copyPickHint')].join('\n'), 'system')
+  },
+}
+
+// --- /worktree: create a git worktree (the `worktreeBaseRef` setting). `fresh`
+// branches from the origin default branch, `head` from the current local HEAD.
+// The worktree lands under `<repo>/.worktrees/<name>` on a new branch.
+const worktree: SlashCommand = {
+  name: 'worktree',
+  aliases: ['wt'],
+  get description() { return t('cmd.worktreeDesc') },
+  async run(ctx) {
+    const name = ctx.args.trim()
+    if (!name) { ctx.print(t('cmd.worktreeUsage'), 'system'); return }
+    const baseRef: WorktreeBaseRef = String(getSetting(ctx.config.settings, 'worktreeBaseRef')) === 'head' ? 'head' : 'fresh'
+    ctx.print(t('cmd.worktreeCreating', { name, base: baseRef }), 'system')
+    const r = await createWorktree(process.cwd(), name, baseRef)
+    if (!r.ok) { ctx.print(t('cmd.worktreeFailed', { error: r.error ?? '' }), 'system', { error: true }); return }
+    ctx.print(t('cmd.worktreeDone', { path: r.path!.replace(os.homedir(), '~'), branch: r.branch!, base: r.base! }), 'system')
+  },
+}
+
+// --- /editor: open the last assistant response in $EDITOR (the
+// `lastResponseInEditor` setting gates it; off → a note on how to enable). The
+// app suspends Ink's raw mode while the editor owns the terminal (see app.tsx).
+const editor: SlashCommand = {
+  name: 'editor',
+  get description() { return t('cmd.editorDesc') },
+  run(ctx) {
+    if (getSetting(ctx.config.settings, 'lastResponseInEditor') !== true) { ctx.print(t('cmd.editorDisabled'), 'system'); return }
+    const last = [...ctx.messages].reverse().find((m) => m.role === 'assistant' && m.content.trim())
+    if (!last) { ctx.print(t('cmd.editorNone'), 'system'); return }
+    if (!ctx.openEditor) { ctx.print(t('cmd.tuiOnly', { cmd: '/editor' }), 'system', { error: true }); return }
+    ctx.openEditor(last.content)
+  },
+}
+
+// --- /feedback: capture a feedback report to ~/.anycode/feedback/ (the
+// `draftedFeedback` setting). Bare `/feedback` with drafting on asks the model to
+// draft one for you to review; otherwise it prints usage. `/feedback <text>`
+// saves the report immediately.
+const feedback: SlashCommand = {
+  name: 'feedback',
+  get description() { return t('cmd.feedbackDesc') },
+  run(ctx) {
+    const body = ctx.args.trim()
+    const drafted = getSetting(ctx.config.settings, 'draftedFeedback') !== false
+    if (!body) {
+      if (drafted && ctx.send) {
+        ctx.send('请根据本次会话，帮我起草一条简洁的反馈报告（包含：遇到的问题、期望的行为、可复现步骤）。起草后展示给我确认，我再用 /feedback <内容> 保存。')
+        ctx.print(t('cmd.feedbackDrafting'), 'system')
+        return
+      }
+      ctx.print(t('cmd.feedbackUsage'), 'system')
+      return
+    }
+    const saved = saveFeedback(body, new Date().toISOString())
+    ctx.print(t('cmd.feedbackSaved', { file: saved.file.replace(os.homedir(), '~'), count: feedbackCount() }), 'system')
+  },
+}
+
+// --- /rewind: restore a file to its pre-edit state (the `rewindCode` setting).
+// Bare `/rewind` lists this session's checkpoints newest-first; `/rewind <n>`
+// restores one (writing the old contents back, or deleting a file that hadn't
+// existed); `/rewind clear` forgets them. Snapshots are captured automatically
+// before write_file/edit_file while rewindCode is on (see lib/checkpoints).
+const rewind: SlashCommand = {
+  name: 'rewind',
+  aliases: ['undo'],
+  get description() { return t('cmd.rewindDesc') },
+  run(ctx) {
+    if (getSetting(ctx.config.settings, 'rewindCode') === false) { ctx.print(t('cmd.rewindDisabled'), 'system'); return }
+    const arg = ctx.args.trim()
+    if (arg.toLowerCase() === 'clear') { clearCheckpoints(); ctx.print(t('cmd.rewindCleared'), 'system'); return }
+    const cps = listCheckpoints().reverse() // newest first
+    const rel = (p: string): string => p.replace(process.cwd() + '/', '').replace(os.homedir(), '~')
+    if (!arg) {
+      if (!cps.length) { ctx.print(t('cmd.rewindNone'), 'system'); return }
+      const lines = cps.slice(0, 20).map((c, i) => {
+        const kind = c.before === null ? t('cmd.rewindWasNew') : t('cmd.rewindWasEdit')
+        return `- \`/rewind ${i + 1}\` — ${rel(c.path)} (${kind})`
+      })
+      ctx.print([t('cmd.rewindTitle'), '', ...lines, '', t('cmd.rewindHint')].join('\n'), 'system')
+      return
+    }
+    const n = Number(arg)
+    if (!Number.isInteger(n) || n < 1 || n > cps.length) { ctx.print(t('cmd.rewindBadIndex', { n: arg, max: cps.length }), 'system', { error: true }); return }
+    const cp = cps[n - 1]
+    const r = restoreCheckpoint(cp.id)
+    if (!r.ok) { ctx.print(t('cmd.rewindFailed', { error: r.error ?? '' }), 'system', { error: true }); return }
+    ctx.print(t(r.action === 'deleted' ? 'cmd.rewindDeleted' : 'cmd.rewindRestored', { path: rel(r.path ?? cp.path) }), 'system')
+  },
+}
+
+// /dm — message your other running MeowCode sessions via the file mailbox (the
+// `otherSessionMessages` setting). Bare = list online peers; `/dm <n> <text>`
+// sends to peer #n; `/dm all <text>` broadcasts. Identity is set by the app's
+// mailbox effect, so this only works when the setting isn't 'off'.
+const dm: SlashCommand = {
+  name: 'dm',
+  aliases: ['msg'],
+  get description() { return t('cmd.dmDesc') },
+  run(ctx) {
+    if (!getIdentity()) { ctx.print(t('cmd.dmDisabled'), 'system'); return }
+    const now = Date.now()
+    const peers = livePeers(now)
+    const arg = ctx.args.trim()
+    if (!arg) {
+      if (!peers.length) { ctx.print(t('cmd.dmNoPeers'), 'system'); return }
+      const lines = peers.map((p, i) => `- \`/dm ${i + 1}\` — ${p.title}  ·  ${p.cwd}`)
+      ctx.print([t('cmd.dmPeersTitle'), '', ...lines, '', t('cmd.dmUsage')].join('\n'), 'system')
+      return
+    }
+    const sp = arg.indexOf(' ')
+    const target = (sp === -1 ? arg : arg.slice(0, sp)).toLowerCase()
+    const text = sp === -1 ? '' : arg.slice(sp + 1).trim()
+    if (!text) { ctx.print(t('cmd.dmUsage'), 'system'); return }
+    const rand = Math.random().toString(36).slice(2, 8)
+    const id = `${now}-${rand}`
+    if (target === 'all' || target === '*') {
+      if (!peers.length) { ctx.print(t('cmd.dmNoPeers'), 'system'); return }
+      // Real-time to every live peer, plus one durable broadcast mail (shared id
+      // → each receiver dedups its socket copy against the file copy).
+      for (const p of peers) sendMessageFrame(p.id, id, text, now)
+      const ok = sendMail('*', text, now, rand)
+      ctx.print(ok ? t('cmd.dmSent', { to: t('cmd.dmBroadcast') }) : t('cmd.dmFailed'), 'system', ok ? undefined : { error: true })
+      return
+    }
+    const n = Number(target)
+    if (!Number.isInteger(n) || n < 1 || n > peers.length) { ctx.print(t('cmd.dmBadIndex', { n: target, max: peers.length }), 'system', { error: true }); return }
+    const peer = peers[n - 1]
+    sendMessageFrame(peer.id, id, text, now) // instant if the peer's socket is up
+    const ok = sendMail(peer.id, text, now, rand) // durable fallback (same id)
+    ctx.print(ok ? t('cmd.dmSent', { to: peer.title }) : t('cmd.dmFailed'), 'system', ok ? undefined : { error: true })
+  },
+}
+
+// /sessions (alias /sess) — list live peer sessions and manage idle-notice
+// subscriptions over the socket hub. Bare lists them (● = socket reachable now,
+// ✓ = subscribed); `sub <n|all>` / `unsub <n|all>` toggle subscriptions. Messaging
+// stays on /dm; this is the "list + subscribe" surface.
+const sessions: SlashCommand = {
+  name: 'sessions',
+  aliases: ['sess'],
+  get description() { return t('cmd.sessionsDesc') },
+  run(ctx) {
+    if (!getIdentity()) { ctx.print(t('cmd.dmDisabled'), 'system'); return }
+    const now = Date.now()
+    const peers = livePeers(now)
+    const arg = ctx.args.trim()
+    const sp = arg.indexOf(' ')
+    const verb = (sp === -1 ? arg : arg.slice(0, sp)).toLowerCase()
+    const rest = (sp === -1 ? '' : arg.slice(sp + 1).trim()).toLowerCase()
+    if (verb === 'sub' || verb === 'unsub') {
+      if (!peers.length) { ctx.print(t('cmd.dmNoPeers'), 'system'); return }
+      let targets = peers
+      if (rest !== 'all' && rest !== '*') {
+        const n = Number(rest)
+        if (!Number.isInteger(n) || n < 1 || n > peers.length) { ctx.print(t('cmd.dmBadIndex', { n: rest || '?', max: peers.length }), 'system', { error: true }); return }
+        targets = [peers[n - 1]]
+      }
+      for (const p of targets) { if (verb === 'sub') subscribeTo(p.id, now); else unsubscribeFrom(p.id, now) }
+      const names = targets.map((p) => p.title).join('、')
+      ctx.print(t(verb === 'sub' ? 'cmd.sessionsSubbed' : 'cmd.sessionsUnsubbed', { names }), 'system')
+      return
+    }
+    if (!peers.length) { ctx.print(t('cmd.sessionsNone'), 'system'); return }
+    const lines = peers.map((p, i) => {
+      const marks = [isReachable(p.id) ? t('cmd.sessionsLiveMark') : '', isSubscribed(p.id) ? t('cmd.sessionsSubMark') : ''].filter(Boolean).join(' ')
+      return `- \`${i + 1}\` — ${p.title}  ·  ${p.cwd}${marks ? '  ' + marks : ''}`
+    })
+    ctx.print([t('cmd.sessionsTitle'), '', ...lines, '', t('cmd.sessionsUsage')].join('\n'), 'system')
+  },
+}
+
+// /ide — report the editor-integration status the `autoConnectIde` setting acts
+// on. Detection only: a live editor connection needs the (unbuilt) MeowCode IDE
+// extension, so this never claims a handshake it didn't make.
+const ide: SlashCommand = {
+  name: 'ide',
+  get description() { return t('cmd.ideDesc') },
+  run(ctx) {
+    const auto = getSetting(ctx.config.settings, 'autoConnectIde') === true
+    const s = detectIde()
+    const rel = (p?: string): string => (p ? p.replace(os.homedir(), '~') : '?')
+    if (s.integrated) { ctx.print(t('cmd.ideIntegrated', { name: s.ideName ?? 'IDE' }), 'system'); return }
+    if (s.external.length) {
+      const lines = s.external.map((l) => `- ${l.ideName ?? 'IDE'} · ${t('cmd.idePort', { port: l.port })}${l.workspace ? ` · ${rel(l.workspace)}` : ''}`)
+      ctx.print([t('cmd.ideFound'), '', ...lines, '', t('cmd.ideNeedsExt')].join('\n'), 'system')
+      return
+    }
+    ctx.print(auto ? t('cmd.ideNone') : t('cmd.ideNoneOff'), 'system')
+  },
+}
+
+// /chrome — report the "Claude in Chrome" integration status (`chromeEnabled`).
+// Locates a Chrome binary so we can say whether it COULD run; the actual browser
+// control needs a companion extension, which this honestly notes.
+const chrome: SlashCommand = {
+  name: 'chrome',
+  get description() { return t('cmd.chromeDesc') },
+  run(ctx) {
+    const on = getSetting(ctx.config.settings, 'chromeEnabled') === true
+    const c = detectChrome()
+    if (!on) { ctx.print(t('cmd.chromeOff'), 'system'); return }
+    const found = c.available ? t('cmd.chromeFound', { path: c.path ?? '' }) : t('cmd.chromeMissing')
+    ctx.print([t('cmd.chromeOn'), found, t('cmd.chromeNeedsExt')].join('\n'), 'system')
+  },
+}
+
+const builtins: SlashCommand[] = [help, clear, newSession, model, provider, login, logout, effort, theme, goal, plan, loop, memory, config, usage, status, stats, compact, autocompact, skill, copy, worktree, editor, feedback, rewind, dm, sessions, ide, chrome, resume, version, exit]
 
 // Merge user-defined commands (from ~/.anycode/commands and ./.anycode/commands)
 // into the registry, but never let them shadow a built-in name or alias. Loaded
