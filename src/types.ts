@@ -84,6 +84,38 @@ export interface StreamOpts {
   // top-level agent gets this (sub-agents never drain interjections). See app.tsx's
   // `queued` state and useChat's opts wiring.
   takePending?: () => string[]
+  // When false (the `dynamicWorkflows` setting turned off), the `workflow` tool is
+  // withheld from the top-level agent so it can still run one-off `task` sub-agents
+  // but not orchestrate multi-step workflows. Absent/true = workflows allowed.
+  dynamicWorkflows?: boolean
+  // When false (the `artifacts` setting turned off), saving a workflow run as a
+  // standalone Markdown report (the expanded workflow view's `s` control) is
+  // refused. Absent/true = artifacts allowed. Threaded into the tool context.
+  artifacts?: boolean
+  // When false (the `rewindCode` setting turned off), file tools skip snapshotting
+  // pre-edit state, so /rewind has nothing to restore. Absent/true = checkpoints
+  // kept. Threaded into the tool context.
+  rewind?: boolean
+  // Permission gating (the `permissionMode` + `autoModeInPlan` settings). The
+  // provider consults these before each TOP-LEVEL tool call (see tools/permission
+  // decidePermission): allow / deny (reason fed back to the model) / ask the user
+  // via `requestPermission`. Sub-agents inherit only the deterministic part (plan
+  // mode denies mutations) and never prompt. Absent permissionMode = 'default'.
+  permissionMode?: string
+  autoModeInPlan?: boolean
+  // Interactive permission prompt: called by the top-level agent loop when a tool
+  // needs the user's OK ('ask'). Resolves 'allow' to run it or 'deny' to skip it
+  // (the denial is fed back as an error tool_result so the model can adapt).
+  // Absent = no interactive gating (an 'ask' decision falls through to allow).
+  requestPermission?: (req: PermissionRequest) => Promise<'allow' | 'deny'>
+}
+
+// One pending permission prompt handed to the UI: which tool wants to run, its
+// raw input, and a short human-readable summary line (see summarizeToolCall).
+export interface PermissionRequest {
+  tool: string
+  input: Record<string, unknown>
+  summary: string
 }
 
 // One sub-agent inside a live `workflow` run, with its current state and timing
@@ -278,6 +310,8 @@ export interface CommandContext {
   openAutoCompact?: () => void
   /** Open the interactive /effort slider picker (interactive sessions only). */
   openEffortPicker?: () => void
+  /** Open the last assistant response in $EDITOR (the `lastResponseInEditor` setting; interactive sessions only). */
+  openEditor?: (text: string) => void
 }
 
 export interface SlashCommand {

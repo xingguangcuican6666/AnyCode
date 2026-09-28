@@ -13,6 +13,11 @@ interface Props {
   width: number
   /** Slash commands offered by the autocomplete menu when the line starts "/". */
   commands: readonly CommandSpec[]
+  // Workspace file completion for the `@`-mention picker: given the text typed
+  // after an `@`, return the workspace-relative paths to offer (already ranked,
+  // filtered and capped by the host, which also honors the `respectGitignore`
+  // setting). Absent = no file picker (typing `@` just inserts a literal `@`).
+  atFiles?: (query: string) => string[]
   onSubmit: (value: string) => void
   // Called on ↑ when the input is EMPTY: pulls the most recent type-ahead line the
   // user queued while the model was streaming back into the box, so they can edit
@@ -70,6 +75,17 @@ const MENU_MAX_ROWS = 8
 // moved on to arguments (e.g. `/model opus`) and the menu gets out of the way.
 const COMMAND_TOKEN = /^\/(\S*)$/
 
+// The @-mention picker is relevant while the caret sits inside an `@…` token:
+// the run of non-whitespace immediately left of the cursor that begins with `@`
+// (at line start or after a space). Returns the token's start grapheme index and
+// the query (text after the `@`), or null when the caret isn't in such a token.
+function atToken(g: string[], cursor: number): { start: number; query: string } | null {
+  let s = cursor
+  while (s > 0 && !/\s/.test(g[s - 1])) s--
+  if (g[s] !== '@') return null
+  return { start: s, query: g.slice(s + 1, cursor).join('') }
+}
+
 // Prefix matches first (ranked the way a user expects), then looser substring
 // matches, so `/mod` surfaces `model` at the top and `/x` still finds anything
 // containing an "x". Matching considers aliases too.
@@ -86,7 +102,7 @@ function filterCommands(commands: readonly CommandSpec[], query: string): Comman
   return [...starts, ...contains]
 }
 
-export function PromptInput({ active, placeholder, width, commands, onSubmit, recallPending, onOverflowDown, onLeftAtStart, editorMode = 'normal', screenRows = 0, bottomOffset = 0, mouseSelect = false, copyOnSelect = false }: Props): React.ReactElement {
+export function PromptInput({ active, placeholder, width, commands, atFiles, onSubmit, recallPending, onOverflowDown, onLeftAtStart, editorMode = 'normal', screenRows = 0, bottomOffset = 0, mouseSelect = false, copyOnSelect = false }: Props): React.ReactElement {
   const colors = useTheme()
   const [value, setValue] = useState('')
   // `cursor` is a grapheme-cluster index into `value`, never a UTF-16 offset,
@@ -219,6 +235,15 @@ export function PromptInput({ active, placeholder, width, commands, onSubmit, re
   const menuOpen = matches.length > 0
   const sel = menuOpen ? Math.min(selected, matches.length - 1) : 0
 
+  // The @-file picker shares `selected`/`dismissed` with the command menu — the
+  // two are mutually exclusive (a `/token` fills the whole line; an `@token` is
+  // mid-line), so one set of highlight/dismiss state serves both. Suppressed
+  // while the command menu is up or the host offers no file source.
+  const atTok = active && !menuOpen && atFiles ? atToken(toGraphemes(value), cursor) : null
+  const atMatches = atTok && !dismissed ? atFiles!(atTok.query) : []
+  const atOpen = atMatches.length > 0
+  const atSel = atOpen ? Math.min(selected, atMatches.length - 1) : 0
+
   const submit = (v: string): void => {
     if (v.trim().length === 0) return
     const h = history.current ?? (history.current = [])
@@ -239,6 +264,20 @@ export function PromptInput({ active, placeholder, width, commands, onSubmit, re
     const v = `/${name} `
     setValue(v)
     setCursor(toGraphemes(v).length)
+    setSelected(0)
+  }
+
+  // Replace the active `@…` token with the chosen workspace path (keeping the
+  // `@` marker) plus a trailing space, so the picker closes and the caret is
+  // ready for the next word. Recomputes the token from live state at call time.
+  const completeAt = (rel: string): void => {
+    const g = toGraphemes(value)
+    const tok = atToken(g, cursor)
+    if (!tok) return
+    const head = g.slice(0, tok.start).join('') + `@${rel} `
+    const v = head + g.slice(cursor).join('')
+    setValue(v)
+    setCursor(toGraphemes(head).length)
     setSelected(0)
   }
 
@@ -295,10 +334,21 @@ export function PromptInput({ active, placeholder, width, commands, onSubmit, re
       const n = matches.length
       if (key.upArrow) { setSelected((s) => (Math.min(s, n - 1) - 1 + n) % n); return }
       if (key.downArrow) { setSelected((s) => (Math.min(s, n - 1) + 1) % n); return }
-      if (key.tab) { complete(matches[sel].name); return }
+      if (key.tab && !key.shift) { complete(matches[sel].name); return }
       if (key.return) { submit(`/${matches[sel].name}`); return }
       if (key.escape) { setDismissed(true); return }
       // other keys (typing, backspace, cursor moves) fall through below
+    }
+
+    // --- @-file picker: same precedence as the command menu, but Enter/Tab
+    // INSERT the path (and keep editing) instead of submitting. ---
+    if (atOpen) {
+      const n = atMatches.length
+      if (key.upArrow) { setSelected((s) => (Math.min(s, n - 1) - 1 + n) % n); return }
+      if (key.downArrow) { setSelected((s) => (Math.min(s, n - 1) + 1) % n); return }
+      if ((key.tab && !key.shift) || key.return) { completeAt(atMatches[atSel]); return }
+      if (key.escape) { setDismissed(true); return }
+      // other keys fall through to normal editing (which re-opens the picker)
     }
 
     // Vim: Esc from insert mode drops into normal mode (handled above). Do this
@@ -461,7 +511,7 @@ export function PromptInput({ active, placeholder, width, commands, onSubmit, re
 
   return (
     <Box flexDirection="column" width={width}>
-      {menuOpen ? <CommandMenu matches={matches} selected={sel} width={width} /> : null}
+      {menuOpen ? <CommandMenu matches={matches} selected={sel} width={width} /> : atOpen ? <AtMenu matches={atMatches} selected={atSel} width={width} /> : null}
 
       {/* flexDirection="column" is load-bearing: each row is the cross-axis child
           and stretches to the box's full inner width, so wrap="truncate" measures
@@ -593,6 +643,50 @@ function CommandMenu({
         {'  '}
         {total > rows ? `${selected + 1}/${total} · ` : ''}
         {t('menu.footer')}
+      </Text>
+    </Box>
+  )
+}
+
+// The @-mention file picker dropdown, rendered above the input box like the
+// command menu. Shows workspace-relative paths; the basename is emphasized (that
+// is what the user is usually matching on) and the directory dimmed.
+function AtMenu({
+  matches,
+  selected,
+  width,
+}: {
+  matches: string[]
+  selected: number
+  width: number
+}): React.ReactElement {
+  const colors = useTheme()
+  const t = useT()
+  const total = matches.length
+  const rows = Math.min(MENU_MAX_ROWS, total)
+  const start =
+    total <= rows ? 0 : Math.min(Math.max(0, selected - Math.floor(rows / 2)), total - rows)
+  const windowed = matches.slice(start, start + rows)
+
+  return (
+    <Box flexDirection="column" width={width} paddingLeft={1}>
+      {windowed.map((f, i) => {
+        const isSel = start + i === selected
+        const cut = f.lastIndexOf('/') + 1
+        const dir = f.slice(0, cut)
+        const base = f.slice(cut)
+        return (
+          <Text key={f} wrap="truncate">
+            <Text color={isSel ? colors.accentBright : colors.dim}>{isSel ? '▸ ' : '  '}</Text>
+            {dir ? <Text color={colors.dim}>{dir}</Text> : null}
+            <Text color={isSel ? colors.accentBright : colors.text} bold={isSel}>{base}</Text>
+          </Text>
+        )
+      })}
+      <Text color={colors.dim} wrap="truncate">
+        {'  '}
+        {total > rows ? `${selected + 1}/${total} · ` : ''}
+        {t('menu.atFooter')}
       </Text>
     </Box>
   )

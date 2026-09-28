@@ -10,9 +10,12 @@ export { renderWorkflowReport } from './impl'
 // The Anthropic-format tool list handed to the model. Orchestration tools
 // (`task`, `workflow`) drive sub-agents; they're offered to the top-level agent
 // only and withheld from sub-agents (pass includeOrchestration=false) so a
-// sub-agent can't recurse into more sub-agents.
-export function toolSchemas(includeOrchestration = true): Array<{ name: string; description: string; input_schema: Record<string, unknown> }> {
-  return TOOLS.filter((t) => includeOrchestration || !t.orchestration).map((t) => ({
+// sub-agent can't recurse into more sub-agents. `allowWorkflow=false` (the
+// `dynamicWorkflows` setting turned off) additionally drops the `workflow` tool
+// so the agent can still delegate one-off `task`s but not orchestrate multi-step
+// workflows.
+export function toolSchemas(includeOrchestration = true, allowWorkflow = true): Array<{ name: string; description: string; input_schema: Record<string, unknown> }> {
+  return TOOLS.filter((t) => (includeOrchestration || !t.orchestration) && (allowWorkflow || t.name !== 'workflow')).map((t) => ({
     name: t.name,
     description: t.description,
     input_schema: t.input_schema,

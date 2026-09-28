@@ -45,6 +45,14 @@ export interface ToolContext {
   // lib/background). Withheld from sub-agents so background orchestration — like
   // ordinary orchestration — never nests.
   allowBackground?: boolean
+  // When false (the `artifacts` setting turned off), the workflow view's `s`
+  // control refuses to write a standalone report file. Threaded from
+  // StreamOpts.artifacts by the agent loop; absent/true = saving allowed.
+  artifacts?: boolean
+  // When false (the `rewindCode` setting turned off), file tools skip snapshotting
+  // the pre-edit state, so `/rewind` has nothing to restore. Threaded from
+  // StreamOpts.rewind by the agent loop; absent/true = checkpoints are kept.
+  rewind?: boolean
 }
 
 export interface SpawnOpts {

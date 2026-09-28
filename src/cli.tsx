@@ -186,7 +186,7 @@ async function runInteractive(initial: AppConfig, resume?: { snapshot: SessionSn
       // App owns ctrl+c (interrupt / press-twice-to-exit), so keep Ink from
       // exiting on the first ctrl+c itself.
       instance = render(
-        <App config={config} initial={snapshot} resumed={resumed} onClear={onClear} onRepaint={onRepaint} onSnapshot={onSnapshot} onResume={onResume} />,
+        <App config={config} initial={snapshot} resumed={resumed} sessionId={sessionId} onClear={onClear} onRepaint={onRepaint} onSnapshot={onSnapshot} onResume={onResume} />,
         { exitOnCtrlC: false, stdin: wrapped as unknown as NodeJS.ReadStream },
       )
       await instance.waitUntilExit()

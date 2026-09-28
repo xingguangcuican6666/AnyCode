@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { Box, Text, useApp, useInput, useStdin, useStdout } from 'ink'
-import type { AppConfig, Message as Msg, PanelTab, SessionUsage } from './types'
+import type { AppConfig, Message as Msg, PanelTab, PermissionRequest, SessionUsage } from './types'
 import { useChat, type ChatActions } from './hooks/useChat'
 import { StatusLine } from './components/StatusLine'
 import { PromptInput } from './components/PromptInput'
@@ -10,15 +10,24 @@ import { LoginPanel } from './components/LoginPanel'
 import { SessionPicker } from './components/SessionPicker'
 import { AutoCompactPicker, type AutoCompactChoice } from './components/AutoCompactPicker'
 import { EffortPicker, type EffortChoice } from './components/EffortPicker'
+import { PermissionDialog, type PermissionChoice } from './components/PermissionDialog'
 import { SettingsPanel } from './components/SettingsPanel'
 import { WorkflowView, WorkflowCollapsed } from './components/WorkflowView'
 import { AgentSwitcher } from './components/AgentSwitcher'
 import { getSetting, isEffortLevel, type EffortLevel } from './lib/settings'
+import { isPermissionMode, nextPermissionMode } from './tools/permission'
 import { contextState, contextLevel, contextLimit, AUTO_COMPACT_RATIO, fmtTokens, bar } from './lib/usage'
 import { ensureModelDb } from './lib/modelDb'
-import { setTermTitle, setTaskbarProgress, clearTermProgress } from './lib/termtitle'
+import { ensureUpdateCheck, availableUpdate, type UpdateChannel } from './lib/update'
+import { setTermTitle, clearTermProgress } from './lib/termtitle'
 import { tipFor } from './lib/tips'
 import { notifyDesktop } from './lib/notify'
+import { openInEditor } from './lib/editor'
+import { workspaceFiles, filterWorkspaceFiles } from './lib/workspaceFiles'
+import { setIdentity, announce, farewell, pollMail } from './lib/mailbox'
+import { startHub, notifyIdle, setSelfTitle, type SockFrame } from './lib/sessionSocket'
+import { detectIde } from './lib/ide'
+import { detectChrome } from './lib/chrome'
 import { prStatus } from './lib/gitpr'
 import { suggestFollowups } from './lib/suggest'
 import { planCompaction, buildCompacted, heuristicSummary } from './lib/compact'
@@ -72,12 +81,16 @@ interface Props {
   // True only when this instance was seeded by /resume or --continue (not a
   // /compact or resize remount), so App can show a one-time session recap.
   resumed?: boolean
+  // This session's id (from the CLI, stable across a run; rotates on /clear and
+  // is adopted from the reopened session on /resume). Used to identify us in the
+  // cross-session mailbox (the `otherSessionMessages` setting).
+  sessionId?: string
 }
 
-export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume, resumed }: Props): React.ReactElement {
+export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume, resumed, sessionId }: Props): React.ReactElement {
   const { exit } = useApp()
   const { stdout } = useStdout()
-  const { stdin } = useStdin()
+  const { stdin, setRawMode } = useStdin()
   const chat = useChat(config, initial?.messages, initial?.usage)
   const [elapsed, setElapsed] = useState(0)
   // Ticks every 250ms while a retry countdown is showing, so the "Retrying in
@@ -105,6 +118,15 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume,
   // The /effort slider overlay (opened by bare /effort). A Faster↔Smarter slider
   // over the five effort levels plus the "ultracode" stop (xhigh + workflows).
   const [effortOpen, setEffortOpen] = useState(false)
+  // A pending tool-permission prompt (the `permissionMode` gate). Holds the
+  // request and the provider's resolver; the inline PermissionDialog renders in
+  // place of the input box and calls `resolve` with the user's decision. Null =
+  // no prompt. Rendered while streaming (a tool call is mid-turn), so it is NOT
+  // part of `modalOpen`; it takes the input slot like the /effort picker.
+  const [permReq, setPermReq] = useState<{ req: PermissionRequest; resolve: (v: 'allow' | 'deny') => void } | null>(null)
+  // Bumped on every keypress while a dialog/overlay is open, so the `dialogExpiry`
+  // idle timer resets on activity (a truly idle dialog is what expires).
+  const [dlgActivity, setDlgActivity] = useState(0)
   // Live "Compacting conversation… ▱▱▱ N%" indicator shown above the prompt while
   // a model-driven /compact (or auto-compaction) is summarizing. Null when idle;
   // the remount that applies the fold tears the indicator down.
@@ -168,6 +190,11 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume,
   const goalRef = useRef(goal); goalRef.current = goal
   const panelRef = useRef(panel); panelRef.current = panel
   const effortOpenRef = useRef(effortOpen); effortOpenRef.current = effortOpen
+  // Live mirror of the pending permission prompt (so the global useInput can yield
+  // the keyboard to the dialog) plus the session allow-list of tools the user
+  // chose to "always allow" — those auto-resolve without re-prompting.
+  const permReqRef = useRef(permReq); permReqRef.current = permReq
+  const permAllowRef = useRef<Set<string>>(new Set())
   const scrollTopRef = useRef<number | null>(scrollTop); scrollTopRef.current = scrollTop
   // Terminal focus state, tracked from focus-reporting events (\x1b[I / \x1b[O,
   // enabled via ?1004h in cli.tsx). Drives the `localNotifications` setting so we
@@ -179,6 +206,9 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume,
   // One-line PR/branch status for the footer (the `prStatusFooter` setting),
   // refreshed on a slow poll; null while unknown or when the line is off.
   const [prLine, setPrLine] = useState<string | null>(null)
+  // The newer version available on the `autoUpdateChannel` release channel (null
+  // = up to date / unknown). Populated by a background registry check on startup.
+  const [updateVer, setUpdateVer] = useState<string | null>(null)
   // Tracks whether sub-agents existed on the previous render, so `openAgentsView`
   // can drop into the switcher exactly once on the none→some edge.
   const hadAgentsRef = useRef(false)
@@ -232,6 +262,13 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume,
   // on the transcript from one on the bottom cluster (input box, footer, …): a
   // transcript selection only STARTS when the press row is within the viewport.
   const viewportHRef = useRef(1)
+  // Screen-row geometry (1-based) of the clickable bottom-cluster blocks, set
+  // during render for the mouse listener. `agentSwTopRef` is the row of the
+  // switcher's `main` line (rows main..agents follow), `agentSwCountRef` how many
+  // such rows, and `wfRowsTopRef` the first collapsed-workflow row. -1 = absent.
+  const agentSwTopRef = useRef(-1)
+  const agentSwCountRef = useRef(0)
+  const wfRowsTopRef = useRef(-1)
 
   const streaming = chat.status === 'streaming'
 
@@ -333,6 +370,12 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume,
       // Non-destructive — just track state for `localNotifications`.
       if (s.includes('\x1b[I')) focusedRef.current = true
       if (s.includes('\x1b[O')) focusedRef.current = false
+      // End / ctrl+End: jump back to the live bottom and resume following. Ink's
+      // useInput doesn't surface End reliably and terminals encode it several
+      // ways (CSI F, SS3 OF, CSI 4~/8~, and ctrl+End as CSI 1;<mods>F), so we
+      // detect it off the raw stream — the same place the mouse/focus events are
+      // read. Mouse SGR (\x1b[<…) and focus (\x1b[I/O) never match these.
+      if (!modalOpenRef.current && /\x1b(?:\[(?:\d+(?:;\d+)*)?F|OF|\[[48]~)/.test(s)) { resumeFollow(); return }
       const re = /\x1b\[<(\d+);(\d+);(\d+)([Mm])/g
       let m: RegExpExecArray | null
       let delta = 0
@@ -361,6 +404,27 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume,
         if (modalOpenRef.current) continue
         if (b === 64) { delta -= 3; continue }
         if (b === 65) { delta += 3; continue }
+        // Bottom-cluster clicks (checked before any transcript-selection logic so
+        // a click below the input never starts a selection): a left press on an
+        // agent-switcher row swaps the viewport to that agent's view (row 0 =
+        // main), and a press on a collapsed workflow line expands its tree.
+        if (b === 0 && !release) {
+          const aTop = agentSwTopRef.current
+          if (aTop > 0 && y >= aTop && y < aTop + agentSwCountRef.current) {
+            const k = y - aTop
+            const ags = chatRef.current.agents
+            setViewingAgent(k === 0 ? null : ags[k - 1]?.id ?? null)
+            setAgentSel(null); setWfSel(null)
+            continue
+          }
+          const wTop = wfRowsTopRef.current
+          const wfs = chatRef.current.workflows
+          if (wTop > 0 && y >= wTop && y < wTop + wfs.length) {
+            const w = wfs[y - wTop]
+            if (w) { setWfExpanded(w.id); setWfSel(null); setAgentSel(null) }
+            continue
+          }
+        }
         const pt = { line: curRef.current + (y - vpTopRef.current), col: Math.max(0, x - 1) }
         if (b === 0 && !release) {
           // Only START a transcript selection when the press lands on a viewport
@@ -418,6 +482,10 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume,
   // so non-React code (commands, lib helpers) translates in the same language.
   const lang = resolveLang(getSetting(chat.config.settings, 'language') as string)
   useEffect(() => { setLang(lang) }, [lang])
+  // Cross-session visibility mode ('off' | 'notify' | 'deliver'); drives both the
+  // file mailbox and the real-time socket hub. Derived so effects can depend on
+  // the mode alone (not the whole settings object) and restart only when it flips.
+  const otherSessions = String(getSetting(chat.config.settings, 'otherSessionMessages') || 'notify')
   // App renders <LangProvider>, so it sits above its own context — translate with
   // the resolved `lang` directly (correct on the same render the setting changes).
   const t = (key: Parameters<typeof translate>[1], params?: Parameters<typeof translate>[2]): string => translate(lang, key, params)
@@ -432,6 +500,11 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume,
   // content area — you operate it rather than read the transcript behind it.
   const modalOpen = pickerOpen || modelOpen || loginOpen || resumeOpen || autoCompactOpen || !!panel || !!expandedWf
   modalOpenRef.current = modalOpen
+  // Any open dialog/overlay that the `dialogExpiry` idle-timer governs (the
+  // inline /effort picker included, but NOT the permission prompt — that has its
+  // own questionTimeout countdown).
+  const anyDialogOpen = modalOpen || effortOpen
+  const anyDialogOpenRef = useRef(anyDialogOpen); anyDialogOpenRef.current = anyDialogOpen
   const scrolled = scrollTop !== null
 
   // Follow-up suggestions (the `promptSuggestions` setting): a single dim line
@@ -452,6 +525,92 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume,
     onSnapshot?.({ config: chat.config, messages: chat.messages, goal, loop, usage: chat.usage })
   }, [chat.config, chat.messages, chat.usage, goal, loop, onSnapshot])
 
+  // Cross-session mailbox (`otherSessionMessages`): heartbeat our presence so
+  // other running sessions can /dm us, and poll for messages addressed to us.
+  // 'off' makes us invisible and silent; 'notify' prints a dim notice; 'deliver'
+  // also injects the message as a user turn so the model sees it next turn. The
+  // cursor starts at mount time, so only messages sent after we launched arrive.
+  const mailCursor = useRef<number>(0)
+  // Ids already surfaced, so a message arriving over BOTH the socket (real-time)
+  // and the file mailbox (durable fallback) — they share one id — surfaces once.
+  const seenMail = useRef<Set<string>>(new Set())
+  useEffect(() => {
+    if (!sessionId) return
+    if (mailCursor.current === 0) mailCursor.current = Date.now()
+    const title = (): string => {
+      const first = chatRef.current.messages.find((m) => m.role === 'user' && m.content.trim() && !m.content.startsWith('/'))
+      const txt = (first?.content ?? '').replace(/\s+/g, ' ').trim()
+      return txt ? (txt.length > 40 ? txt.slice(0, 39) + '…' : txt) : t('mail.untitled')
+    }
+    const tick = (): void => {
+      const mode = String(getSetting(chatRef.current.config.settings, 'otherSessionMessages') || 'notify')
+      if (mode === 'off') { farewell(); return }
+      const tt = title()
+      setIdentity(sessionId, tt, process.cwd())
+      setSelfTitle(tt)
+      const now = Date.now()
+      announce(now)
+      // Don't splice a delivered turn into a streaming reply — wait until idle.
+      if (chatRef.current.streaming) return
+      for (const m of pollMail(mailCursor.current, now)) {
+        mailCursor.current = Math.max(mailCursor.current, m.ts)
+        if (seenMail.current.has(m.id)) continue
+        seenMail.current.add(m.id)
+        const from = m.fromTitle || m.from
+        if (mode === 'deliver') chatRef.current.print(translate(lang, 'mail.delivered', { from, text: m.text }), 'user')
+        else chatRef.current.print(translate(lang, 'mail.notice', { from, text: m.text }), 'system')
+      }
+    }
+    tick()
+    const iv = setInterval(tick, 5000)
+    return () => { clearInterval(iv); farewell() }
+  }, [sessionId, lang])
+
+  // Real-time inter-session socket hub (lib/sessionSocket). Complements the file
+  // mailbox above with instant delivery + idle-subscription notices. Started while
+  // visible (mode !== 'off'), torn down on unmount or when the mode flips to 'off'.
+  // Messages arriving here AND via the file poll share an id → surfaced once
+  // (seenMail). While streaming we defer to the idle-time file poll (the durable
+  // mail twin still lands), so nothing splices into a running reply.
+  useEffect(() => {
+    if (!sessionId || otherSessions === 'off') return
+    const onFrame = (f: SockFrame): void => {
+      const mode = String(getSetting(chatRef.current.config.settings, 'otherSessionMessages') || 'notify')
+      if (mode === 'off') return
+      const from = f.fromTitle || f.from
+      if (f.kind === 'idle') { chatRef.current.print(translate(lang, 'mail.peerIdle', { from }), 'system'); return }
+      if (f.kind === 'sub') { chatRef.current.print(translate(lang, 'mail.peerSubbed', { from }), 'system'); return }
+      if (f.kind !== 'msg' || !f.text) return
+      if (chatRef.current.streaming) return // defer to the idle-time file poll
+      if (seenMail.current.has(f.id)) return
+      seenMail.current.add(f.id)
+      mailCursor.current = Math.max(mailCursor.current, f.ts)
+      if (mode === 'deliver') chatRef.current.print(translate(lang, 'mail.delivered', { from, text: f.text }), 'user')
+      else chatRef.current.print(translate(lang, 'mail.notice', { from, text: f.text }), 'system')
+    }
+    const stop = startHub(sessionId, t('mail.untitled'), onFrame)
+    return stop
+  }, [sessionId, lang, otherSessions])
+
+  // Startup integration notices for `autoConnectIde` / `chromeEnabled`. One-shot
+  // per mount, and skipped on resume/compact remounts (initial != null) to avoid
+  // re-announcing. Detection only — honest about what actually happened (see the
+  // /ide and /chrome commands and lib/ide, lib/chrome).
+  const integShown = useRef(false)
+  useEffect(() => {
+    if (integShown.current || initial) return
+    integShown.current = true
+    const s = chatRef.current.config.settings
+    if (getSetting(s, 'autoConnectIde') === true) {
+      const found = detectIde()
+      if (found.integrated) chatRef.current.print(t('cmd.ideIntegrated', { name: found.ideName ?? 'IDE' }), 'system')
+      else if (found.external.length) chatRef.current.print(t('cmd.ideStartupFound', { name: found.external[0].ideName ?? 'IDE' }), 'system')
+    }
+    if (getSetting(s, 'chromeEnabled') === true) {
+      chatRef.current.print(detectChrome().available ? t('cmd.chromeStartupOn') : t('cmd.chromeStartupMissing'), 'system')
+    }
+  }, [])
+
   // Rows below the viewport, all fixed to the terminal's bottom edge: the
   // transient status lines + the input box (3 rows for the empty single-line box)
   // + the collapsed workflow lines + the footer, plus a scroll indicator while
@@ -471,10 +630,13 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume,
     chat.workflows.length +
     (chat.agents.length > 0 ? chat.agents.length + 2 : 0) + // switcher: header + main row + agents
     1 + // footer
+    1 + // permission-mode indicator (always shown)
     (suggestLine ? 1 : 0) + // follow-up suggestions line
     (prLine && getSetting(chat.config.settings, 'prStatusFooter') !== false ? 1 : 0) + // PR status line
+    (updateVer ? 1 : 0) + // auto-update available banner
     (scrolled ? 1 : 0) + // bottom "jump to bottom" hint
-    (scrolled ? 1 : 0)   // top "previous message" hint (rendered above the viewport)
+    (scrolled ? 1 : 0) + // top "previous message" hint (rendered above the viewport)
+    1 // one blank row between the transcript output and the pinned bottom cluster
   const viewportH = Math.max(1, dims.rows - clusterH)
   viewportHRef.current = viewportH
   // Screen rows rendered BELOW the input box's bottom border (agent switcher +
@@ -487,7 +649,22 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume,
     chat.workflows.length +
     (suggestLine ? 1 : 0) +
     (prLine && getSetting(chat.config.settings, 'prStatusFooter') !== false ? 1 : 0) +
-    1 // footer
+    (updateVer ? 1 : 0) +
+    1 + // footer
+    1 // permission-mode indicator (always shown)
+  // Screen row of the input box's bottom border (the cluster below it is pinned
+  // to the terminal's last `bottomOffset` rows). The switcher + workflow lines
+  // sit just under it, contiguous and marginless, so their rows are exact.
+  const belowInputTop = dims.rows - bottomOffset
+  const swHasAgents = chat.agents.length > 0
+  // Switcher rows: title at belowInputTop+1, `main` at +2, agent i at +3+i. The
+  // clickable rows are [main, ...agents] → top = belowInputTop+2, count agents+1.
+  agentSwTopRef.current = swHasAgents ? belowInputTop + 2 : -1
+  agentSwCountRef.current = swHasAgents ? chat.agents.length + 1 : 0
+  // Collapsed workflows follow the whole switcher block (title+main+agents).
+  wfRowsTopRef.current = chat.workflows.length > 0
+    ? belowInputTop + (swHasAgents ? chat.agents.length + 2 : 0) + 1
+    : -1
   // Screen row of the viewport's first content row: 1 normally, 2 when the top
   // "previous message" hint occupies row 1 (only while scrolled, non-modal).
   vpTopRef.current = scrolled && !modalOpen ? 2 : 1
@@ -620,6 +797,31 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume,
   // so the context bar picks up the accurate window. Never blocks a turn.
   useEffect(() => { ensureModelDb(() => setDbTick((n) => n + 1)) }, [])
 
+  // Auto-update check (the `autoUpdateChannel` setting): on startup — and when the
+  // channel changes — query the release registry in the background and, when a
+  // newer build exists on that channel, surface a one-line footer banner. Never
+  // blocks; a failed/absent lookup just leaves the banner hidden.
+  useEffect(() => {
+    const channel = (String(getSetting(chat.config.settings, 'autoUpdateChannel')) === 'latest' ? 'latest' : 'stable') as UpdateChannel
+    const refresh = (): void => setUpdateVer(availableUpdate(channel))
+    ensureUpdateCheck(channel, refresh)
+    refresh()
+  }, [chat.config.settings])
+
+  // `dialogExpiry`: an idle dialog/overlay auto-dismisses after N seconds with no
+  // input. The timer resets on every keypress (dlgActivity) so only a genuinely
+  // idle dialog expires; 0 = never. The permission prompt is excluded — it has its
+  // own questionTimeout countdown.
+  useEffect(() => {
+    const secs = Number(getSetting(chat.config.settings, 'dialogExpiry')) || 0
+    if (secs <= 0 || !anyDialogOpen) return
+    const id = setTimeout(() => {
+      setPickerOpen(false); setModelOpen(false); setLoginOpen(false); setResumeOpen(false)
+      setAutoCompactOpen(false); setEffortOpen(false); setPanel(null); setWfExpanded(null)
+    }, secs * 1000)
+    return () => clearTimeout(id)
+  }, [chat.config.settings, anyDialogOpen, dlgActivity])
+
   // Elapsed-time ticker while the model is working.
   useEffect(() => {
     if (!streaming) { setElapsed(0); return }
@@ -639,14 +841,21 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume,
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [streaming])
 
-  // Terminal title + taskbar progress (the `progressBar` setting): advertise a
-  // working indicator while a turn streams, and reset to a clean idle title
-  // otherwise. Disabled (and cleared) when the setting is off.
+  // Terminal window title (the `progressBar` setting): advertise a working
+  // indicator in the title bar while a turn streams, and reset to a clean idle
+  // title otherwise. Disabled (and cleared) when the setting is off.
+  //
+  // We deliberately do NOT emit the OSC 9;4 indeterminate taskbar-progress pulse
+  // anymore: on terminals that honor it, the "indeterminate" state renders as a
+  // gray bar that bounces left-right along the top edge of the window the whole
+  // time the model runs — visually noisy and distracting ("顶部一直来回左右移动
+  // 的灰条"). The window title alone carries the same "working" signal without
+  // the animation. clearTermProgress still fires to wipe any stale bar a prior
+  // run (or another terminal) may have left set.
   useEffect(() => {
     const on = getSetting(chat.config.settings, 'progressBar') !== false
     if (!on) { clearTermProgress('MeowCode'); return }
     if (streaming) {
-      setTaskbarProgress(true)
       setTermTitle(`✻ ${chat.statusWord || 'Working'}… · MeowCode`)
     } else {
       clearTermProgress('MeowCode')
@@ -662,6 +871,9 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume,
     if (streaming) { wasStreamingRef.current = true; return }
     if (!wasStreamingRef.current) return
     wasStreamingRef.current = false
+    // Tell any session subscribed to us (via the socket hub) that we just went
+    // idle — the inter-session equivalent of "finished a turn".
+    notifyIdle(Date.now())
     if (getSetting(chat.config.settings, 'localNotifications') === false) return
     if (focusedRef.current) return
     notifyDesktop('MeowCode', translate(lang, 'notify.turnDone'))
@@ -776,6 +988,11 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume,
   // Global keys: esc interrupts a streaming turn (never clears the goal — that's
   // /goal's job, so autonomous work isn't lost to a stray esc); ctrl+c twice exits.
   useInput((input, key) => {
+    // A pending permission prompt owns the keyboard entirely (its own useInput
+    // handles ↑↓/y/a/n/↵/esc). Swallow everything here so App's esc/ctrl+c neither
+    // interrupt the paused turn nor arm exit while the user is deciding — the only
+    // way forward is to answer the dialog.
+    if (permReqRef.current) return
     // The expanded workflow tree owns the keyboard (its own useInput handles
     // ↑↓/x/esc) while open.
     if (wfExpandedRef.current) return
@@ -806,7 +1023,17 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume,
       // the single ↓ that entered selection via onOverflowDown); otherwise it
       // moves the cursor up one line. Without the escape-at-0, ↑ clamped at 0 and
       // the input became unreachable — you could only leave selection via esc.
-      if (key.upArrow) { setWfSel((s) => ((s ?? 0) <= 0 ? null : (s as number) - 1)); return }
+      if (key.upArrow) {
+        // Above the first workflow line: step back up to the agent switcher's last
+        // row when sub-agents exist (so main → agents → workflows is one ↑↓ chain),
+        // else return focus to the input box.
+        if ((wfSelRef.current ?? 0) <= 0) {
+          const ags = chatRef.current.agents
+          if (ags.length > 0) { setWfSel(null); setAgentSel(ags.length); return }
+          setWfSel(null); return
+        }
+        setWfSel((s) => (s as number) - 1); return
+      }
       if (key.downArrow) { setWfSel((s) => Math.min(wfs.length - 1, (s ?? 0) + 1)); return }
       if (key.return) {
         const w = wfs[Math.min(wfSelRef.current ?? 0, wfs.length - 1)]
@@ -826,7 +1053,17 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume,
       const listLen = ags.length + 1
       if (key.escape) { setAgentSel(null); return }
       if (key.upArrow) { setAgentSel((s) => ((s ?? 0) <= 0 ? null : (s as number) - 1)); return }
-      if (key.downArrow) { setAgentSel((s) => Math.min(listLen - 1, (s ?? 0) + 1)); return }
+      if (key.downArrow) {
+        // Past the last agent row, continue into workflow selection when any
+        // workflows exist, so all three (main + sub-agents + workflows) are
+        // reachable in one ↓ sweep; otherwise clamp at the last agent.
+        if ((agentSelRef.current ?? 0) >= listLen - 1) {
+          const wfs = chatRef.current.workflows
+          if (wfs.length > 0) { setAgentSel(null); setWfSel(0); return }
+          return
+        }
+        setAgentSel((s) => Math.min(listLen - 1, (s ?? 0) + 1)); return
+      }
       if (key.return) {
         const idx = Math.min(agentSelRef.current ?? 0, listLen - 1)
         setViewingAgent(idx === 0 ? null : ags[idx - 1].id)
@@ -840,6 +1077,18 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume,
       }
       return // swallow other keys while selecting
     }
+    // shift+tab cycles the permission mode (default → acceptEdits → plan →
+    // bypassPermissions → …), mirroring Claude Code. The active mode shows in the
+    // footer. Plain tab stays with PromptInput (completion); only shift+tab here.
+    // Session-only (not persisted), like /autocompact — the choice lives for this
+    // run. Terminals send shift+tab as CBT (ESC [ Z); Ink flags it key.tab+key.shift.
+    if (key.tab && key.shift) {
+      const bag = chatRef.current.config.settings
+      const cur = String(getSetting(bag, 'permissionMode') || 'default')
+      const next = nextPermissionMode(isPermissionMode(cur) ? cur : 'default')
+      chatRef.current.setConfig({ settings: { ...bag, permissionMode: next } })
+      return
+    }
     // Transcript scrolling. The owned viewport windows the flattened transcript
     // in place, so PageUp/PageDown move the first-visible line while the input bar
     // stays fixed at the bottom — even mid-stream (scrolling pins the view while
@@ -847,9 +1096,8 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume,
     // mouse wheel scrolls too (see the SGR listener above).
     if (key.pageUp && !pickerOpen) { applyScroll(-pageStepRef.current); return }
     if (key.pageDown && !pickerOpen) { applyScroll(pageStepRef.current); return }
-    // ctrl+End (best-effort ctrl+F/~, since terminals surface End inconsistently)
-    // jumps back to the live bottom and resumes following.
-    if (key.ctrl && /F|~/.test(input)) { resumeFollow(); return }
+    // (End / ctrl+End "jump to bottom" is handled reliably off the raw stdin
+    // stream in the onData effect above — Ink's useInput doesn't surface End.)
     // A running goal is AUTONOMOUS — one esc or ctrl+c must be able to halt it,
     // even while scrolled up reading its output. So this comes before the
     // selection-clear / scroll-snap esc steps (which would otherwise eat the
@@ -903,6 +1151,11 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume,
     }
   })
 
+  // Reset the `dialogExpiry` idle timer on any keypress while a dialog is open.
+  // A separate, always-active handler (Ink fans input to every useInput), so it
+  // records activity regardless of which overlay currently owns the keys.
+  useInput(() => { if (anyDialogOpenRef.current) setDlgActivity((x) => x + 1) })
+
   // Build the action bundle handed to every submit (exit/clear/theme/loop hooks).
   const makeActions = (): ChatActions => ({
     exit,
@@ -945,6 +1198,24 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume,
     openResume: () => setResumeOpen(true),
     openAutoCompact: () => setAutoCompactOpen(true),
     openEffortPicker: () => setEffortOpen(true),
+    // Open the last response in $EDITOR (the `lastResponseInEditor` setting). We
+    // drop Ink's raw mode + clear the screen so the editor owns the terminal, then
+    // restore and repaint; spawnSync inside openInEditor blocks Ink meanwhile.
+    openEditor: (text: string) => {
+      const wipe = (): void => { try { stdout.write('\x1b[2J\x1b[3J\x1b[H') } catch { /* ignore */ } }
+      const edited = openInEditor(text, {
+        suspend: () => { try { setRawMode?.(false) } catch { /* ignore */ } wipe() },
+        resume: () => { try { setRawMode?.(true) } catch { /* ignore */ } wipe() },
+      })
+      chatRef.current.print(edited === null ? t('cmd.editorFailed') : t('cmd.editorClosed'), 'system', edited === null ? { error: true } : undefined)
+    },
+    // Interactive permission gate (the `permissionMode` setting). A tool the user
+    // has "always allowed" this session runs without prompting; otherwise we raise
+    // the inline dialog and resolve once they choose (see PermissionDialog render).
+    requestPermission: (req: PermissionRequest): Promise<'allow' | 'deny'> => {
+      if (permAllowRef.current.has(req.tool)) return Promise.resolve('allow')
+      return new Promise<'allow' | 'deny'>((resolve) => setPermReq({ req, resolve }))
+    },
   })
 
   // Submitting while a response streams queues the line (type-ahead) rather than
@@ -1208,6 +1479,13 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume,
               </Box>
             ) : null}
 
+            {/* Breathing room between the transcript output above and the pinned
+                bottom cluster (status lines + input box). Without it the last
+                output line butts right up against the input box, which reads as
+                cramped ("底部输入框和上方模型输出之间加点间隔"). Counted in
+                clusterH so the viewport shrinks by this row instead of clipping. */}
+            <Box><Text> </Text></Box>
+
             {goal ? (
               <Box paddingLeft={1}>
                 <Text color={colors.accentBright} wrap="truncate">{formatGoal(goal, goalElapsed, judging)}</Text>
@@ -1281,7 +1559,23 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume,
               </Box>
             ) : null}
 
-            {effortOpen ? (
+            {permReq ? (
+              <PermissionDialog
+                tool={permReq.req.tool}
+                summary={permReq.req.summary}
+                input={permReq.req.input}
+                mode={String(getSetting(chat.config.settings, 'permissionMode') || 'default')}
+                width={width}
+                autoContinueSecs={Number(getSetting(chat.config.settings, 'questionTimeout')) || 0}
+                onDecide={(choice: PermissionChoice) => {
+                  const cur = permReq
+                  if (!cur) return
+                  if (choice === 'always') permAllowRef.current.add(cur.req.tool)
+                  cur.resolve(choice === 'deny' ? 'deny' : 'allow')
+                  setPermReq(null)
+                }}
+              />
+            ) : effortOpen ? (
               <EffortPicker
                 width={width}
                 current={
@@ -1308,6 +1602,14 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume,
                 width={width}
                 commands={registry}
                 placeholder={t('app.placeholder')}
+                atFiles={(query) => {
+                  // @-mention workspace file completion. `respectGitignore`
+                  // (default on) decides whether ignored files are hidden; the
+                  // lister caches the walk for a few seconds so this stays cheap
+                  // on every keystroke.
+                  const respect = getSetting(chatRef.current.config.settings, 'respectGitignore') !== false
+                  return filterWorkspaceFiles(workspaceFiles(process.cwd(), respect), query)
+                }}
                 editorMode={String(getSetting(chat.config.settings, 'editorMode') || 'normal')}
                 screenRows={dims.rows}
                 bottomOffset={bottomOffset}
@@ -1338,9 +1640,10 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume,
                   return true
                 }}
                 onLeftAtStart={() => {
-                  // `leftArrowOpensAgents`: ← at column 0 drops into the agent
-                  // switcher when sub-agents exist, mirroring onOverflowDown.
-                  if (getSetting(chatRef.current.config.settings, 'leftArrowOpensAgents') !== true) return false
+                  // `leftArrowOpensAgents` (default on): ← at column 0 drops into
+                  // the agent switcher when sub-agents exist, mirroring
+                  // onOverflowDown. The footer advertises this as "← N agents".
+                  if (getSetting(chatRef.current.config.settings, 'leftArrowOpensAgents') === false) return false
                   if (chatRef.current.agents.length === 0) return false
                   setAgentSel(0)
                   return true
@@ -1376,6 +1679,34 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume,
                 <Text color={colors.dim} wrap="truncate">{prLine}</Text>
               </Box>
             ) : null}
+
+            {updateVer ? (
+              <Box paddingLeft={1}>
+                <Text color={colors.accent} wrap="truncate">
+                  {t('footer.update', {
+                    version: updateVer,
+                    channel: String(getSetting(chat.config.settings, 'autoUpdateChannel')) === 'latest' ? 'latest' : 'stable',
+                  })}
+                </Text>
+              </Box>
+            ) : null}
+
+            {/* Persistent permission-mode indicator (mirrors Claude Code's footer):
+                shows the active mode, the shift+tab-to-cycle hint, and a "← N agents"
+                affordance when sub-agents exist (← at column 0 opens the switcher). */}
+            {(() => {
+              const pm = String(getSetting(chat.config.settings, 'permissionMode') || 'default')
+              const mode = isPermissionMode(pm) ? pm : 'default'
+              const agents = chat.agents.length
+              const line = t('footer.permMode', { mode: t(`perm.${mode}`) })
+                + (agents > 0 ? '  ·  ' + t('footer.permAgents', { n: agents }) : '')
+              const col = mode === 'bypassPermissions' ? colors.warning : mode === 'default' ? colors.dim : colors.accent
+              return (
+                <Box paddingLeft={1}>
+                  <Text color={col} wrap="truncate">{line}</Text>
+                </Box>
+              )
+            })()}
 
             <Box paddingLeft={1}>
               <Text color={colors.dim} wrap="truncate">

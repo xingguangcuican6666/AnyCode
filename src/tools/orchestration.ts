@@ -107,6 +107,8 @@ async function runAgentBatch(
     pause: (): void => { if (!paused) { paused = true; emit() } },
     resume: (): void => { if (paused) { paused = false; wake(); emit() } },
     save: async (): Promise<string> => {
+      // `artifacts` setting off → refuse to write a standalone report file.
+      if (ctx.artifacts === false) return '(artifacts 已在 /config 中关闭，未保存报告)'
       const file = path.join(ctx.cwd, '.anycode', 'workflows', `${wfId}.md`)
       await fsp.mkdir(path.dirname(file), { recursive: true })
       await fsp.writeFile(file, renderWorkflowReport(title, agents, texts), 'utf8')
