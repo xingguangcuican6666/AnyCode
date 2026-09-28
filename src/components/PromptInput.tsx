@@ -1,10 +1,11 @@
-import React, { useRef, useState } from 'react'
-import { Box, Text, useInput } from 'ink'
+import React, { useEffect, useRef, useState } from 'react'
+import { Box, Text, useInput, useStdin, useStdout } from 'ink'
 import { symbols, useTheme } from '../theme'
 import { useT } from '../lib/i18n'
 import type { CommandSpec } from '../types'
 import { toGraphemes, truncateToWidth, displayWidth } from '../lib/text'
 import { loadHistory, appendHistory } from '../lib/history'
+import { copyToClipboard } from '../lib/clipboard'
 
 interface Props {
   active: boolean
@@ -29,6 +30,17 @@ interface Props {
   // default, plain editing), 'emacs' (adds the standard C-b/f/d/w, M-b/f, C-p/n
   // motions), or 'vim' (modal — Esc enters normal mode, i/a/I/A return to insert).
   editorMode?: string
+  // Mouse text-selection inside the input box (the "对话框" area). The box is
+  // bottom-anchored, so we locate its rows from the screen bottom: `screenRows`
+  // is the terminal height and `bottomOffset` the number of screen rows rendered
+  // BELOW the box's bottom border (agent switcher + workflows + suggest + PR +
+  // footer). App keeps its own transcript selection off these rows so the two
+  // never fight. `copyOnSelect` mirrors the setting: a drag always copies on
+  // release, and additionally clears the highlight when this is on.
+  screenRows?: number
+  bottomOffset?: number
+  mouseSelect?: boolean
+  copyOnSelect?: boolean
 }
 
 // Word boundaries for vim/emacs word motion: treat runs of non-space as words.
@@ -74,7 +86,7 @@ function filterCommands(commands: readonly CommandSpec[], query: string): Comman
   return [...starts, ...contains]
 }
 
-export function PromptInput({ active, placeholder, width, commands, onSubmit, recallPending, onOverflowDown, onLeftAtStart, editorMode = 'normal' }: Props): React.ReactElement {
+export function PromptInput({ active, placeholder, width, commands, onSubmit, recallPending, onOverflowDown, onLeftAtStart, editorMode = 'normal', screenRows = 0, bottomOffset = 0, mouseSelect = false, copyOnSelect = false }: Props): React.ReactElement {
   const colors = useTheme()
   const [value, setValue] = useState('')
   // `cursor` is a grapheme-cluster index into `value`, never a UTF-16 offset,
@@ -89,6 +101,110 @@ export function PromptInput({ active, placeholder, width, commands, onSubmit, re
   // pending 'd' waits for the second key of a `dd` (clear line).
   const [vimNormal, setVimNormal] = useState(false)
   const pendingD = useRef(false)
+  // Mouse text-selection over the input's own content, as an (anchor, head) pair
+  // of grapheme indices into `value` (null = nothing selected). A left press in
+  // the box anchors it, a left-drag moves the head, release copies it. Cleared
+  // whenever `value` changes (i.e. the user edits), so a stale highlight never
+  // lingers over freshly-typed text.
+  const [msel, setMsel] = useState<{ a: number; b: number } | null>(null)
+  const { stdin } = useStdin()
+  const { stdout } = useStdout()
+  // Refs so the stdin mouse listener (attached once) always reads live values
+  // rather than its mount-time closure.
+  const mselRef = useRef(msel); mselRef.current = msel
+  const valueRef = useRef(value); valueRef.current = value
+  const activeRef = useRef(active); activeRef.current = active
+  const mouseSelectRef = useRef(mouseSelect); mouseSelectRef.current = mouseSelect
+  const copyOnSelectRef = useRef(copyOnSelect); copyOnSelectRef.current = copyOnSelect
+  const selectingRef = useRef(false)
+  const draggedRef = useRef(false)
+  const pressIdxRef = useRef(0)
+  // Live input-box geometry (screen rows the content occupies + wrap layout),
+  // refreshed each render below so the listener can map a click to a grapheme.
+  const geomRef = useRef<{ rows: string[][]; rowStart: number[]; startRow: number; contentRows: number; contentTop: number }>(
+    { rows: [[]], rowStart: [0], startRow: 0, contentRows: 1, contentTop: 0 },
+  )
+
+  // Map a click at display column `x` (1-based screen col) on visible row `j`
+  // (0-based, top of the box's content) to a grapheme index into `value`.
+  const ptToIndex = (j: number, x: number): number => {
+    const g = geomRef.current
+    const absRow = g.startRow + j
+    const rowG = g.rows[absRow] ?? []
+    const gs0 = g.rowStart[absRow] ?? 0
+    // Content starts after the border (1) + padding (1) + 2-col "> "/"  " marker.
+    const c = Math.max(0, x - 1 - 4)
+    let acc = 0
+    let off = rowG.length
+    for (let k = 0; k < rowG.length; k++) {
+      const w = Math.max(1, displayWidth(rowG[k]))
+      if (acc + w > c) { off = k; break }
+      acc += w
+    }
+    return gs0 + off
+  }
+
+  useEffect(() => {
+    if (!stdin) return
+    const onData = (data: Buffer): void => {
+      if (!activeRef.current || !mouseSelectRef.current) return
+      const s = data.toString('utf8')
+      const re = /\x1b\[<(\d+);(\d+);(\d+)([Mm])/g
+      let m: RegExpExecArray | null
+      while ((m = re.exec(s)) !== null) {
+        const b = Number(m[1])
+        const x = Number(m[2])
+        const y = Number(m[3])
+        const release = m[4] === 'm'
+        const g = geomRef.current
+        const j = y - g.contentTop
+        const inBox = j >= 0 && j < g.contentRows
+        if (b === 0 && !release) {
+          // Left press: anchor a selection here — but only inside the box. A press
+          // elsewhere clears any highlight and lets App's transcript handler run.
+          if (!inBox) { setMsel(null); continue }
+          const idx = ptToIndex(j, x)
+          selectingRef.current = true
+          draggedRef.current = false
+          pressIdxRef.current = idx
+          setMsel({ a: idx, b: idx })
+        } else if (b === 32 && !release) {
+          // Left-drag: extend the head (clamped to the box's rows).
+          if (!selectingRef.current) continue
+          draggedRef.current = true
+          const jj = Math.max(0, Math.min(g.contentRows - 1, j))
+          const idx = ptToIndex(jj, x)
+          setMsel((cur) => (cur ? { a: cur.a, b: idx } : { a: idx, b: idx }))
+        } else if (release) {
+          const was = selectingRef.current
+          selectingRef.current = false
+          if (!was) continue
+          if (draggedRef.current) {
+            // A real drag: copy the highlight to the clipboard. Keep the highlight
+            // visible (unlike the transcript's copyOnSelect, which clears it) so
+            // the user can see what was copied; typing clears it.
+            const cur = mselRef.current
+            if (cur && cur.a !== cur.b) {
+              const gs = toGraphemes(valueRef.current)
+              const lo = Math.min(cur.a, cur.b), hi = Math.max(cur.a, cur.b)
+              copyToClipboard(gs.slice(lo, hi).join(''), stdout)
+              if (copyOnSelectRef.current) setMsel(null)
+            }
+          } else {
+            // A no-drag click just moves the caret there (and clears any highlight).
+            setCursor(pressIdxRef.current)
+            setMsel(null)
+          }
+        }
+      }
+    }
+    stdin.on('data', onData)
+    return () => { stdin.off('data', onData) }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [stdin])
+
+  // Any edit to the line dismisses a stale selection highlight.
+  useEffect(() => { setMsel(null) }, [value])
   // Prompt history for ↑/↓ recall, newest-first. Loaded from disk once (lazy ref
   // init) so recall spans restarts like a shell / Claude Code; `histIdx` is the
   // browse cursor (-1 = editing a fresh line, not in history).
@@ -287,6 +403,11 @@ export function PromptInput({ active, placeholder, width, commands, onSubmit, re
     // here (ESC stripped), which would otherwise insert literal junk like
     // "[<65;10;10M". Drop the SGR (\x1b[<b;x;yM/m) and legacy (\x1b[M…) forms.
     if (/\x1b?\[<\d+;\d+;\d+[Mm]/.test(input) || /\x1b?\[M/.test(input)) return
+    // Same for terminal focus-reporting (?1004h in cli.tsx): CSI I / CSI O arrive
+    // on every focus change. App reads them off stdin for notification gating, but
+    // Ink surfaces them here too (as \x1b[I / \x1b[O, or ESC-stripped [I / [O) and
+    // would otherwise insert literal "[I"/"[O" junk into the line — drop them.
+    if (/^(?:\x1b?\[[IO])+$/.test(input)) return
     // Paste or bulk input can deliver a chunk with embedded CR/LF. The input is
     // multi-line now, so insert the whole thing at the cursor (normalising line
     // endings to '\n') instead of submitting the first line.
@@ -312,7 +433,7 @@ export function PromptInput({ active, placeholder, width, commands, onSubmit, re
   // "> "/indent prefix every row carries. `value` soft-wraps to this width and
   // also breaks on the manual '\n' newlines from shift/ctrl+Enter.
   const inner = Math.max(8, width - 6)
-  const { rows, cRow, cCol } = layoutInput(value, cursor, inner)
+  const { rows, cRow, cCol, rowStart } = layoutInput(value, cursor, inner)
   // Cap the visible height and window to keep the cursor row on screen, so a very
   // long prompt scrolls inside the box instead of pushing the transcript away.
   let startRow = 0
@@ -323,6 +444,20 @@ export function PromptInput({ active, placeholder, width, commands, onSubmit, re
   // Reserve one extra column for the inverse cursor block that precedes the hint
   // while the input is active, so marker + cursor + hint can never exceed width.
   const hint = truncateToWidth(placeholder, Math.max(8, inner - (active ? 1 : 0)))
+
+  // Stash live geometry for the mouse listener: how many screen rows the content
+  // occupies and the screen row of its first line. The box is bottom-anchored, so
+  // its bottom border sits at screen row (screenRows - bottomOffset) and the top
+  // content row is that many rows above the content height — no fragile top-down
+  // math. contentTop is 1-based to match SGR mouse y coordinates.
+  const contentRows = isEmpty ? 1 : visibleRows.length
+  const contentTop = screenRows > 0 ? screenRows - bottomOffset - contentRows : 0
+  geomRef.current = { rows, rowStart, startRow, contentRows, contentTop }
+
+  // Selection span in absolute grapheme indices (empty when a==b or unset).
+  const selLo = msel && msel.a !== msel.b ? Math.min(msel.a, msel.b) : -1
+  const selHi = msel && msel.a !== msel.b ? Math.max(msel.a, msel.b) : -1
+  const hasSel = selLo >= 0
 
   return (
     <Box flexDirection="column" width={width}>
@@ -344,24 +479,36 @@ export function PromptInput({ active, placeholder, width, commands, onSubmit, re
           visibleRows.map((rowG, i) => {
             const absRow = startRow + i
             const marker = absRow === 0 ? `${promptGlyph} ` : '  '
-            const text = rowG.join('')
-            if (!active || absRow !== cRow) {
+            const gStart = rowStart[absRow] ?? 0
+            // Draw the caret block only when nothing is highlighted, so a live
+            // selection doesn't show two competing inverse spans.
+            const isCursorRow = active && absRow === cRow && !hasSel
+            const rowLo = gStart, rowHi = gStart + rowG.length
+            const selTouches = hasSel && selHi > rowLo && selLo < rowHi
+            // Fast path: plain row (no highlight, not the cursor row).
+            if (!isCursorRow && !selTouches) {
               return (
                 <Text key={absRow} wrap="truncate">
                   <Text color={colors.accent}>{marker}</Text>
-                  <Text color={colors.text}>{text}</Text>
+                  <Text color={colors.text}>{rowG.join('')}</Text>
                 </Text>
               )
             }
-            // Cursor row: draw the inverse block on the grapheme at cCol (a space
-            // when the caret sits at the row's end).
-            const before = rowG.slice(0, cCol).join('')
-            const atG = rowG[cCol]
-            const after = atG !== undefined ? rowG.slice(cCol + 1).join('') : ''
+            // Per-grapheme render so the selection highlight (and/or caret block)
+            // lands on exactly the right cells.
+            const parts: React.ReactElement[] = []
+            for (let k = 0; k < rowG.length; k++) {
+              const idx = gStart + k
+              const inSel = hasSel && idx >= selLo && idx < selHi
+              const isCur = isCursorRow && k === cCol
+              parts.push(<Text key={k} inverse={inSel || isCur} color={colors.text}>{rowG[k]}</Text>)
+            }
+            // Caret parked at the row's end (no grapheme under it).
+            if (isCursorRow && cCol >= rowG.length) parts.push(<Text key="end" inverse> </Text>)
             return (
               <Text key={absRow} wrap="truncate">
                 <Text color={colors.accent}>{marker}</Text>
-                <Text color={colors.text}>{before}<Text inverse>{atG ?? ' '}</Text>{after}</Text>
+                {parts}
               </Text>
             )
           })
@@ -380,9 +527,12 @@ const MAX_INPUT_ROWS = 10
 // lines on grapheme boundaries. Returns the rows (as grapheme arrays) plus the
 // cursor's visual position — row index and grapheme offset within that row — so
 // the inverse cursor block lands exactly where the terminal will draw the caret.
-function layoutInput(value: string, cursor: number, inner: number): { rows: string[][]; cRow: number; cCol: number } {
+function layoutInput(value: string, cursor: number, inner: number): { rows: string[][]; cRow: number; cCol: number; rowStart: number[] } {
   const gs = toGraphemes(value)
   const rows: string[][] = [[]]
+  // rowStart[r] = grapheme index in `value` at which visual row r begins, so a
+  // mouse click on row r, column c maps back to an absolute grapheme index.
+  const rowStart: number[] = [0]
   let colW = 0
   let cRow = 0
   let cCol = 0
@@ -391,14 +541,14 @@ function layoutInput(value: string, cursor: number, inner: number): { rows: stri
     if (i === cursor) { cRow = rows.length - 1; cCol = rows[rows.length - 1].length; placed = true }
     if (i === gs.length) break
     const ch = gs[i]
-    if (ch === '\n') { rows.push([]); colW = 0; continue }
+    if (ch === '\n') { rows.push([]); rowStart.push(i + 1); colW = 0; continue }
     const w = Math.max(1, displayWidth(ch))
-    if (colW + w > inner && rows[rows.length - 1].length > 0) { rows.push([]); colW = 0 }
+    if (colW + w > inner && rows[rows.length - 1].length > 0) { rows.push([]); rowStart.push(i); colW = 0 }
     rows[rows.length - 1].push(ch)
     colW += w
   }
   if (!placed) { cRow = rows.length - 1; cCol = rows[rows.length - 1].length }
-  return { rows, cRow, cCol }
+  return { rows, cRow, cCol, rowStart }
 }
 
 // The dropdown of slash-command suggestions, rendered just above the input box.

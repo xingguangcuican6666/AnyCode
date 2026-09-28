@@ -228,6 +228,10 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume,
   // down to row 2. The mouse listener uses this to map an SGR y to a transcript
   // line, and the bottom-hint row shifts by the same offset.
   const vpTopRef = useRef(1)
+  // Live viewport height (content rows), so the mouse listener can tell a press
+  // on the transcript from one on the bottom cluster (input box, footer, …): a
+  // transcript selection only STARTS when the press row is within the viewport.
+  const viewportHRef = useRef(1)
 
   const streaming = chat.status === 'streaming'
 
@@ -359,6 +363,12 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume,
         if (b === 65) { delta += 3; continue }
         const pt = { line: curRef.current + (y - vpTopRef.current), col: Math.max(0, x - 1) }
         if (b === 0 && !release) {
+          // Only START a transcript selection when the press lands on a viewport
+          // row. A press on the bottom cluster — above all, inside the input box —
+          // belongs to PromptInput's own in-box selection handler, so leave it be
+          // here (the two listeners partition presses by screen row this way).
+          const top = vpTopRef.current
+          if (y < top || y >= top + viewportHRef.current) continue
           // Left press: begin (or restart) a selection anchored here. An
           // immediate release with no drag leaves anchor===head (empty) → the
           // prior highlight is cleared and nothing new is shown.
@@ -466,6 +476,18 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume,
     (scrolled ? 1 : 0) + // bottom "jump to bottom" hint
     (scrolled ? 1 : 0)   // top "previous message" hint (rendered above the viewport)
   const viewportH = Math.max(1, dims.rows - clusterH)
+  viewportHRef.current = viewportH
+  // Screen rows rendered BELOW the input box's bottom border (agent switcher +
+  // collapsed workflows + suggestion line + PR line + footer). PromptInput uses
+  // this to locate its own content rows from the screen bottom for in-box mouse
+  // selection — the box is bottom-anchored, so this is exact regardless of how
+  // tall the transcript above it is or whether the command menu is open.
+  const bottomOffset =
+    (chat.agents.length > 0 ? chat.agents.length + 2 : 0) +
+    chat.workflows.length +
+    (suggestLine ? 1 : 0) +
+    (prLine && getSetting(chat.config.settings, 'prStatusFooter') !== false ? 1 : 0) +
+    1 // footer
   // Screen row of the viewport's first content row: 1 normally, 2 when the top
   // "previous message" hint occupies row 1 (only while scrolled, non-modal).
   vpTopRef.current = scrolled && !modalOpen ? 2 : 1
@@ -1287,6 +1309,10 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume,
                 commands={registry}
                 placeholder={t('app.placeholder')}
                 editorMode={String(getSetting(chat.config.settings, 'editorMode') || 'normal')}
+                screenRows={dims.rows}
+                bottomOffset={bottomOffset}
+                mouseSelect
+                copyOnSelect={getSetting(chat.config.settings, 'copyOnSelect') === true}
                 onSubmit={handleSubmit}
                 recallPending={() => {
                   // ↑ with the input empty pulls the most recent type-ahead line
