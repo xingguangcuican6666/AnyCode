@@ -16,6 +16,11 @@ import { AgentSwitcher } from './components/AgentSwitcher'
 import { getSetting, isEffortLevel, type EffortLevel } from './lib/settings'
 import { contextState, contextLevel, contextLimit, AUTO_COMPACT_RATIO, fmtTokens, bar } from './lib/usage'
 import { ensureModelDb } from './lib/modelDb'
+import { setTermTitle, setTaskbarProgress, clearTermProgress } from './lib/termtitle'
+import { tipFor } from './lib/tips'
+import { notifyDesktop } from './lib/notify'
+import { prStatus } from './lib/gitpr'
+import { suggestFollowups } from './lib/suggest'
 import { planCompaction, buildCompacted, heuristicSummary } from './lib/compact'
 import { summarizeConversation } from './lib/summarize'
 import { flattenMessages, thinkingLines, messagesFromEvents, type LineKind, type FlatLine } from './lib/transcript'
@@ -85,9 +90,12 @@ interface Props {
   // instance seeded with that snapshot and adopts its session id so continued
   // autosaves keep updating the same file.
   onResume?: (snapshot: SessionSnapshot, sessionId: string) => void
+  // True only when this instance was seeded by /resume or --continue (not a
+  // /compact or resize remount), so App can show a one-time session recap.
+  resumed?: boolean
 }
 
-export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume }: Props): React.ReactElement {
+export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume, resumed }: Props): React.ReactElement {
   const { exit } = useApp()
   const { stdout } = useStdout()
   const { stdin } = useStdin()
@@ -137,8 +145,9 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume 
   // line-index + display-column space (see lib/selection). null = nothing
   // selected. A left press starts it, a left-drag extends the head, release
   // finalizes; because the coordinates are absolute, the highlight stays put as
-  // the transcript scrolls. Auto-copy on release is a deferred config
-  // (`copyOnSelect`, default off) — we render the highlight, not the clipboard.
+  // the transcript scrolls. When the `copyOnSelect` setting is on, a drag-release
+  // copies the highlight to the clipboard immediately; otherwise we just render
+  // the highlight (copy stays an explicit action).
   const [sel, setSel] = useState<Selection | null>(null)
   // Ids of collapsed activity groups / diff views the user has toggled from their
   // default state (see lib/transcript FlattenOpts.expanded). A no-drag click on a
@@ -178,6 +187,19 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume 
   const panelRef = useRef(panel); panelRef.current = panel
   const effortOpenRef = useRef(effortOpen); effortOpenRef.current = effortOpen
   const scrollTopRef = useRef<number | null>(scrollTop); scrollTopRef.current = scrollTop
+  // Terminal focus state, tracked from focus-reporting events (\x1b[I / \x1b[O,
+  // enabled via ?1004h in cli.tsx). Drives the `localNotifications` setting so we
+  // only notify when the user has switched away from the terminal.
+  const focusedRef = useRef(true)
+  // Tracks whether the previous render was mid-stream, so the notification effect
+  // can fire exactly once on the streaming→idle edge.
+  const wasStreamingRef = useRef(false)
+  // One-line PR/branch status for the footer (the `prStatusFooter` setting),
+  // refreshed on a slow poll; null while unknown or when the line is off.
+  const [prLine, setPrLine] = useState<string | null>(null)
+  // Tracks whether sub-agents existed on the previous render, so `openAgentsView`
+  // can drop into the switcher exactly once on the none→some edge.
+  const hadAgentsRef = useRef(false)
   const wfExpandedRef = useRef(wfExpanded); wfExpandedRef.current = wfExpanded
   const wfSelRef = useRef(wfSel); wfSelRef.current = wfSel
   const viewingAgentRef = useRef(viewingAgent); viewingAgentRef.current = viewingAgent
@@ -321,6 +343,10 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume 
     if (!stdin) return
     const onData = (data: Buffer): void => {
       const s = data.toString('utf8')
+      // Terminal focus reporting (?1004h): CSI I = focus in, CSI O = focus out.
+      // Non-destructive — just track state for `localNotifications`.
+      if (s.includes('\x1b[I')) focusedRef.current = true
+      if (s.includes('\x1b[O')) focusedRef.current = false
       const re = /\x1b\[<(\d+);(\d+);(\d+)([Mm])/g
       let m: RegExpExecArray | null
       let delta = 0
@@ -373,6 +399,15 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume 
               setExpanded((prev) => { const next = new Set(prev); if (next.has(grp)) next.delete(grp); else next.add(grp); return next })
               setSel(null)
             }
+          } else if (wasSelecting && draggedRef.current && getSetting(chatRef.current.config.settings, 'copyOnSelect') === true) {
+            // Auto-copy on release (the `copyOnSelect` setting): a drag that
+            // produced a real highlight is copied to the clipboard immediately,
+            // then cleared — no explicit copy key needed.
+            const cur = selRef.current
+            if (cur && !isEmpty(cur)) {
+              copyToClipboard(selectedText(cur, linesRef.current), stdout)
+              setSel(null)
+            }
           }
         }
       }
@@ -407,6 +442,18 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume 
   modalOpenRef.current = modalOpen
   const scrolled = scrollTop !== null
 
+  // Follow-up suggestions (the `promptSuggestions` setting): a single dim line
+  // of contextual next-prompts derived from the last assistant reply. Shown only
+  // when idle after at least one answer; empty otherwise (falls back to tips).
+  let suggestLine = ''
+  if (!streaming && getSetting(chat.config.settings, 'promptSuggestions') !== false) {
+    const lastAssistant = [...chat.messages].reverse().find((m) => m.role === 'assistant')
+    if (lastAssistant) {
+      const items = suggestFollowups(stripAnsi(lastAssistant.content))
+      if (items.length) suggestLine = translate(lang, 'footer.suggest', { items: items.join(' · ') })
+    }
+  }
+
   // Report the latest transcript so the CLI can dump it to the normal buffer on
   // exit (the alternate screen buffer is discarded when we leave it).
   useEffect(() => {
@@ -432,6 +479,8 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume 
     chat.workflows.length +
     (chat.agents.length > 0 ? chat.agents.length + 2 : 0) + // switcher: header + main row + agents
     1 + // footer
+    (suggestLine ? 1 : 0) + // follow-up suggestions line
+    (prLine && getSetting(chat.config.settings, 'prStatusFooter') !== false ? 1 : 0) + // PR status line
     (scrolled ? 1 : 0) + // bottom "jump to bottom" hint
     (scrolled ? 1 : 0)   // top "previous message" hint (rendered above the viewport)
   const viewportH = Math.max(1, dims.rows - clusterH)
@@ -574,6 +623,87 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume 
     const t = setInterval(() => setElapsed(Math.floor((Date.now() - start) / 1000)), 250)
     return () => clearInterval(t)
   }, [streaming])
+
+  // Auto-scroll (the `autoScroll` setting): when it's off, the viewport should
+  // not chase the streaming bottom. On each turn start we freeze the scroll
+  // position at the current bottom (if we were following) so new output lands
+  // below the fold; the user can ctrl+F / click "jump to bottom" to catch up.
+  useEffect(() => {
+    if (!streaming) return
+    if (getSetting(chat.config.settings, 'autoScroll') !== false) return
+    if (scrollTopRef.current === null) setScrollTop(maxTopRef.current)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [streaming])
+
+  // Terminal title + taskbar progress (the `progressBar` setting): advertise a
+  // working indicator while a turn streams, and reset to a clean idle title
+  // otherwise. Disabled (and cleared) when the setting is off.
+  useEffect(() => {
+    const on = getSetting(chat.config.settings, 'progressBar') !== false
+    if (!on) { clearTermProgress('MeowCode'); return }
+    if (streaming) {
+      setTaskbarProgress(true)
+      setTermTitle(`✻ ${chat.statusWord || 'Working'}… · MeowCode`)
+    } else {
+      clearTermProgress('MeowCode')
+    }
+    return () => clearTermProgress('MeowCode')
+  }, [streaming, chat.statusWord, chat.config.settings])
+
+  // Desktop notification when a turn finishes while the terminal is unfocused
+  // (the `localNotifications` setting). We fire on the streaming true→false edge
+  // and only when focus reporting says the user has switched away, so an active
+  // watcher isn't pinged. Best-effort escapes (see lib/notify); no-op off-TTY.
+  useEffect(() => {
+    if (streaming) { wasStreamingRef.current = true; return }
+    if (!wasStreamingRef.current) return
+    wasStreamingRef.current = false
+    if (getSetting(chat.config.settings, 'localNotifications') === false) return
+    if (focusedRef.current) return
+    notifyDesktop('MeowCode', translate(lang, 'notify.turnDone'))
+  }, [streaming, chat.config.settings])
+
+  // One-time session recap (the `sessionRecap` setting): when this instance was
+  // seeded by /resume or --continue, print a short system line summarizing what
+  // was reopened. role 'system' keeps it out of the API history; runs once.
+  const recapDoneRef = useRef(false)
+  useEffect(() => {
+    if (recapDoneRef.current) return
+    recapDoneRef.current = true
+    if (!resumed) return
+    if (getSetting(chatRef.current.config.settings, 'sessionRecap') === false) return
+    const real = chatRef.current.messages.filter((m) => m.role === 'user' || m.role === 'assistant')
+    if (real.length === 0) return
+    const lastUser = [...real].reverse().find((m) => m.role === 'user')
+    const preview = lastUser ? stripAnsi(lastUser.content).trim().replace(/\s+/g, ' ').slice(0, 60) : ''
+    chatRef.current.print(translate(lang, 'app.sessionRecap', { n: real.length, last: preview }), 'system')
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // PR/branch footer line (the `prStatusFooter` setting). Shelling out to git/gh
+  // is slow, so we poll — once on mount and every 30s — rather than per render,
+  // and only while the setting is on. Turning it off clears the line immediately.
+  useEffect(() => {
+    if (getSetting(chat.config.settings, 'prStatusFooter') === false) { setPrLine(null); return }
+    let alive = true
+    const refresh = (): void => { prStatus(process.cwd()).then((s) => { if (alive) setPrLine(s) }) }
+    refresh()
+    const id = setInterval(refresh, 30000)
+    return () => { alive = false; clearInterval(id) }
+  }, [chat.config.settings])
+
+  // `openAgentsView`: when sub-agents first appear (none→some), drop straight
+  // into the switcher so the user lands on the agent list. Fires once per edge
+  // and never while a modal picker owns the keyboard.
+  useEffect(() => {
+    const has = chat.agents.length > 0
+    const had = hadAgentsRef.current
+    hadAgentsRef.current = has
+    if (has && !had && !pickerOpen && agentSel === null && getSetting(chat.config.settings, 'openAgentsView') === true) {
+      setAgentSel(0)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [chat.agents.length])
 
   // Drive the retry countdown: tick every 250ms while a retry notice is live so
   // the "Retrying in Ns" text ticks down toward its target time.
@@ -1056,6 +1186,7 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume 
                 tokens={chat.live?.tokens ?? 0}
                 dir={chat.live?.dir ?? 'up'}
                 suffix={chat.live?.thinking ? t('app.thinkingSuffix', { effort: String(getSetting(chat.config.settings, 'effort')) }) : undefined}
+                reduceMotion={getSetting(chat.config.settings, 'reduceMotion') === true}
               />
             ) : null}
 
@@ -1124,6 +1255,7 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume 
                 width={width}
                 commands={registry}
                 placeholder={t('app.placeholder')}
+                editorMode={String(getSetting(chat.config.settings, 'editorMode') || 'normal')}
                 onSubmit={handleSubmit}
                 onOverflowDown={() => {
                   // A single ↓ past the input drops into a selectable region below
@@ -1133,6 +1265,14 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume 
                   const wfs = chatRef.current.workflows
                   if (wfs.length === 0) return false
                   setWfSel(0)
+                  return true
+                }}
+                onLeftAtStart={() => {
+                  // `leftArrowOpensAgents`: ← at column 0 drops into the agent
+                  // switcher when sub-agents exist, mirroring onOverflowDown.
+                  if (getSetting(chatRef.current.config.settings, 'leftArrowOpensAgents') !== true) return false
+                  if (chatRef.current.agents.length === 0) return false
+                  setAgentSel(0)
                   return true
                 }}
               />
@@ -1152,6 +1292,18 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume 
                 {chat.workflows.map((w, i) => (
                   <WorkflowCollapsed key={w.id} snapshot={w} selected={wfSel === i} />
                 ))}
+              </Box>
+            ) : null}
+
+            {suggestLine ? (
+              <Box paddingLeft={1}>
+                <Text color={colors.dim} wrap="truncate">{suggestLine}</Text>
+              </Box>
+            ) : null}
+
+            {prLine && getSetting(chat.config.settings, 'prStatusFooter') !== false ? (
+              <Box paddingLeft={1}>
+                <Text color={colors.dim} wrap="truncate">{prLine}</Text>
               </Box>
             ) : null}
 
@@ -1175,7 +1327,9 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume 
                                 : t('footer.streaming')
                             : chat.agents.length > 0
                               ? t('footer.idleAgents')
-                              : t('footer.idle')}
+                              : getSetting(chat.config.settings, 'showTips') !== false
+                                ? tipFor(chat.usage.turns)
+                                : t('footer.idle')}
               </Text>
             </Box>
           </Box>

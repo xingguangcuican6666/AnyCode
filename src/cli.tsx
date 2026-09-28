@@ -24,9 +24,10 @@ import { KITTY_ON, KITTY_OFF, createKittyTranslator } from './lib/kittykeys'
 const ALT_ON = '\x1b[?1049h'
 const ALT_OFF = '\x1b[?1049l'
 // ?1000h button events + ?1002h button-event MOTION (so a left-drag streams as
-// button 32, which App turns into a text selection) + ?1006h SGR coordinates.
-const MOUSE_ON = '\x1b[?1000h\x1b[?1002h\x1b[?1006h'
-const MOUSE_OFF = '\x1b[?1000l\x1b[?1002l\x1b[?1006l'
+// button 32, which App turns into a text selection) + ?1006h SGR coordinates +
+// ?1004h focus reporting (CSI I/O in & out, so App can gate notifications).
+const MOUSE_ON = '\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?1004h'
+const MOUSE_OFF = '\x1b[?1000l\x1b[?1002l\x1b[?1006l\x1b[?1004l'
 const CLEAR = '\x1b[2J\x1b[3J\x1b[H'
 
 const argv = process.argv.slice(2)
@@ -102,6 +103,9 @@ async function readStdin(): Promise<string> {
 async function runInteractive(initial: AppConfig, resume?: { snapshot: SessionSnapshot; id: string }): Promise<void> {
   let config = initial
   let snapshot: SessionSnapshot | null = resume?.snapshot ?? null
+  // True only while `snapshot` came from /resume or --continue (not a /compact
+  // remount), so App shows the session recap exactly once on a real reopen.
+  let resumed = !!resume
   // Latest live session state, kept current by App via onSnapshot, so the exit
   // dump prints the final transcript after we leave the alternate screen.
   let last: SessionSnapshot | null = null
@@ -164,21 +168,22 @@ async function runInteractive(initial: AppConfig, resume?: { snapshot: SessionSn
       }
       // /clear: drop the transcript AND start a brand-new session file (the old one
       // stays saved on disk and is reachable via /resume).
-      const onClear = (next: AppConfig): void => { sessionId = newSessionId(); last = null; remount(next, null) }
+      const onClear = (next: AppConfig): void => { sessionId = newSessionId(); last = null; resumed = false; remount(next, null) }
       // /compact: keep the (folded) transcript, remount cleanly (same session).
-      const onRepaint = (snap: SessionSnapshot): void => remount(snap.config, snap)
+      const onRepaint = (snap: SessionSnapshot): void => { resumed = false; remount(snap.config, snap) }
       // /resume: reopen a saved session — adopt its id so autosaves keep updating
       // that file, and re-inject the env API key the stored config never carries.
       const onResume = (snap: SessionSnapshot, id: string): void => {
         sessionId = id
         last = null
+        resumed = true
         remount({ ...snap.config, apiKey: process.env.ANTHROPIC_API_KEY }, snap)
       }
       const onSnapshot = (snap: SessionSnapshot): void => { last = snap; scheduleSave() }
       // App owns ctrl+c (interrupt / press-twice-to-exit), so keep Ink from
       // exiting on the first ctrl+c itself.
       instance = render(
-        <App config={config} initial={snapshot} onClear={onClear} onRepaint={onRepaint} onSnapshot={onSnapshot} onResume={onResume} />,
+        <App config={config} initial={snapshot} resumed={resumed} onClear={onClear} onRepaint={onRepaint} onSnapshot={onSnapshot} onResume={onResume} />,
         { exitOnCtrlC: false, stdin: wrapped as unknown as NodeJS.ReadStream },
       )
       await instance.waitUntilExit()

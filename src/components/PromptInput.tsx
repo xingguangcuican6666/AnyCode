@@ -17,6 +17,31 @@ interface Props {
   // host can repurpose it (here: enter workflow-selection mode). Returning true
   // means the host consumed the key; PromptInput then leaves the line untouched.
   onOverflowDown?: () => boolean
+  // Called when ← is pressed at column 0. Returning true means the host consumed
+  // it (e.g. opened the agent switcher) and the cursor should stay put.
+  onLeftAtStart?: () => boolean
+  // Key-binding scheme for the input (the `editorMode` setting): 'normal' (the
+  // default, plain editing), 'emacs' (adds the standard C-b/f/d/w, M-b/f, C-p/n
+  // motions), or 'vim' (modal — Esc enters normal mode, i/a/I/A return to insert).
+  editorMode?: string
+}
+
+// Word boundaries for vim/emacs word motion: treat runs of non-space as words.
+// `nextWord` lands on the start of the next word after the cursor; `prevWord`
+// on the start of the current/previous word — matching vim's w and b closely
+// enough for a prompt line.
+function nextWord(g: string[], cursor: number): number {
+  let i = cursor
+  while (i < g.length && /\s/.test(g[i])) i++      // skip leading space (rare at cursor)
+  while (i < g.length && !/\s/.test(g[i])) i++      // skip the current word
+  while (i < g.length && /\s/.test(g[i])) i++       // skip the gap to the next word
+  return i
+}
+function prevWord(g: string[], cursor: number): number {
+  let i = cursor - 1
+  while (i > 0 && /\s/.test(g[i])) i--              // skip trailing space behind us
+  while (i > 0 && !/\s/.test(g[i - 1])) i--         // walk to the word's start
+  return Math.max(0, i)
 }
 
 // Highest number of command rows shown at once; longer match lists scroll to
@@ -44,7 +69,7 @@ function filterCommands(commands: readonly CommandSpec[], query: string): Comman
   return [...starts, ...contains]
 }
 
-export function PromptInput({ active, placeholder, width, commands, onSubmit, onOverflowDown }: Props): React.ReactElement {
+export function PromptInput({ active, placeholder, width, commands, onSubmit, onOverflowDown, onLeftAtStart, editorMode = 'normal' }: Props): React.ReactElement {
   const colors = useTheme()
   const [value, setValue] = useState('')
   // `cursor` is a grapheme-cluster index into `value`, never a UTF-16 offset,
@@ -54,6 +79,11 @@ export function PromptInput({ active, placeholder, width, commands, onSubmit, on
   // dismissed the menu for the current query (Esc). Any edit re-opens it.
   const [selected, setSelected] = useState(0)
   const [dismissed, setDismissed] = useState(false)
+  // Vim modal state (only meaningful when editorMode === 'vim'). We start in
+  // insert mode so the prompt behaves normally until the user presses Esc; a
+  // pending 'd' waits for the second key of a `dd` (clear line).
+  const [vimNormal, setVimNormal] = useState(false)
+  const pendingD = useRef(false)
   // Prompt history for ↑/↓ recall, newest-first. Loaded from disk once (lazy ref
   // init) so recall spans restarts like a shell / Claude Code; `histIdx` is the
   // browse cursor (-1 = editing a fresh line, not in history).
@@ -78,6 +108,7 @@ export function PromptInput({ active, placeholder, width, commands, onSubmit, on
     setCursor(0)
     setSelected(0)
     setDismissed(false)
+    setVimNormal(false); pendingD.current = false // next prompt starts in insert
     onSubmit(v)
   }
 
@@ -93,6 +124,36 @@ export function PromptInput({ active, placeholder, width, commands, onSubmit, on
   useInput((input, key) => {
     const g = toGraphemes(value)
 
+    // --- Vim normal mode (editorMode === 'vim' after an Esc) ---
+    // Owns the keyboard entirely: motions/edits here, and i/a/I/A (or Enter to
+    // submit) return to insert. Insert mode itself is the plain editing below.
+    if (editorMode === 'vim' && vimNormal) {
+      if (key.return) { submit(value); return }
+      // Second key of a `dd`: clear the whole line.
+      if (pendingD.current) {
+        pendingD.current = false
+        if (input === 'd') { setValue(''); setCursor(0); return }
+      }
+      switch (input) {
+        case 'i': setVimNormal(false); return
+        case 'a': setVimNormal(false); setCursor((c) => Math.min(g.length, c + 1)); return
+        case 'I': setVimNormal(false); setCursor(0); return
+        case 'A': setVimNormal(false); setCursor(g.length); return
+        case 'h': setCursor((c) => Math.max(0, c - 1)); return
+        case 'l': setCursor((c) => Math.min(g.length, c + 1)); return
+        case '0': setCursor(0); return
+        case '$': setCursor(g.length); return
+        case 'w': setCursor(nextWord(g, cursor)); return
+        case 'b': setCursor(prevWord(g, cursor)); return
+        case 'x':
+          if (cursor < g.length) { setValue(g.slice(0, cursor).join('') + g.slice(cursor + 1).join('')) }
+          return
+        case 'D': setValue(g.slice(0, cursor).join('')); return
+        case 'd': pendingD.current = true; return
+        default: return // swallow everything else while in normal mode
+      }
+    }
+
     // --- Autocomplete menu takes priority over history / submit while open ---
     if (menuOpen) {
       const n = matches.length
@@ -103,6 +164,10 @@ export function PromptInput({ active, placeholder, width, commands, onSubmit, on
       if (key.escape) { setDismissed(true); return }
       // other keys (typing, backspace, cursor moves) fall through below
     }
+
+    // Vim: Esc from insert mode drops into normal mode (handled above). Do this
+    // before the generic control-key swallow further down.
+    if (editorMode === 'vim' && key.escape) { setVimNormal(true); return }
 
     // Manual newline (shift/alt/ctrl+Enter) vs submit (plain Enter). Terminals
     // don't agree on shift+Enter, and Ink can't see a shift modifier on Return
@@ -119,7 +184,12 @@ export function PromptInput({ active, placeholder, width, commands, onSubmit, on
       return
     }
     if (key.return) { submit(value); return }
-    if (key.leftArrow) { setCursor((c) => Math.max(0, c - 1)); return }
+    if (key.leftArrow) {
+      // At column 0 the host may repurpose ← (the `leftArrowOpensAgents` setting
+      // opens the agent switcher). If it consumes the key, leave the line be.
+      if (cursor === 0 && onLeftAtStart?.()) return
+      setCursor((c) => Math.max(0, c - 1)); return
+    }
     if (key.rightArrow) { setCursor((c) => Math.min(g.length, c + 1)); return }
     if (key.upArrow) {
       const h = history.current ?? []
@@ -155,6 +225,36 @@ export function PromptInput({ active, placeholder, width, commands, onSubmit, on
     if (key.ctrl && input === 'e') { setCursor(g.length); return }
     if (key.ctrl && input === 'u') { setValue(''); setCursor(0); setDismissed(false); setSelected(0); return }
     if (key.ctrl && input === 'k') { setValue(g.slice(0, cursor).join('')); return }
+    // Emacs mode adds the motions/edits the default scheme lacks. All additive
+    // and gated on editorMode === 'emacs', so they never shadow normal editing.
+    if (editorMode === 'emacs' && key.ctrl) {
+      if (input === 'b') { setCursor((c) => Math.max(0, c - 1)); return }
+      if (input === 'f') { setCursor((c) => Math.min(g.length, c + 1)); return }
+      if (input === 'd') {
+        if (cursor < g.length) setValue(g.slice(0, cursor).join('') + g.slice(cursor + 1).join(''))
+        return
+      }
+      if (input === 'w') {
+        const start = prevWord(g, cursor)
+        setValue(g.slice(0, start).join('') + g.slice(cursor).join('')); setCursor(start); return
+      }
+      if (input === 'p') { // like ↑ (older history)
+        const h = history.current ?? []
+        if (h.length === 0) return
+        histIdx.current = Math.min(h.length - 1, histIdx.current + 1)
+        const v = h[histIdx.current] ?? ''; setValue(v); setCursor(toGraphemes(v).length); return
+      }
+      if (input === 'n') { // like ↓ (newer history)
+        const h = history.current ?? []
+        if (histIdx.current <= 0) { histIdx.current = -1; setValue(''); setCursor(0); return }
+        histIdx.current -= 1; const v = h[histIdx.current] ?? ''
+        setValue(v); setCursor(toGraphemes(v).length); return
+      }
+    }
+    if (editorMode === 'emacs' && key.meta) {
+      if (input === 'b') { setCursor(prevWord(g, cursor)); return }
+      if (input === 'f') { setCursor(nextWord(g, cursor)); return }
+    }
     // ignore other control/navigation keys
     if (key.ctrl || key.meta || key.escape || key.tab || key.pageUp || key.pageDown) return
     if (!input) return
@@ -181,6 +281,9 @@ export function PromptInput({ active, placeholder, width, commands, onSubmit, on
 
   const border = active ? colors.accent : colors.dim
   const isEmpty = value.length === 0
+  // In vim normal mode the prompt glyph flips to a filled block as a mode cue.
+  const vimNorm = editorMode === 'vim' && vimNormal && active
+  const promptGlyph = vimNorm ? '▮' : symbols.userPrompt
 
   // Inner text width = box width minus borders (2), padding (2) and the 2-col
   // "> "/indent prefix every row carries. `value` soft-wraps to this width and
@@ -210,14 +313,14 @@ export function PromptInput({ active, placeholder, width, commands, onSubmit, on
       <Box borderStyle="round" borderColor={border} paddingX={1} flexDirection="column" width={width}>
         {isEmpty ? (
           <Text wrap="truncate">
-            <Text color={colors.accent}>{symbols.userPrompt} </Text>
+            <Text color={colors.accent}>{promptGlyph} </Text>
             {active ? <Text inverse> </Text> : null}
             <Text color={colors.dim}>{hint}</Text>
           </Text>
         ) : (
           visibleRows.map((rowG, i) => {
             const absRow = startRow + i
-            const marker = absRow === 0 ? `${symbols.userPrompt} ` : '  '
+            const marker = absRow === 0 ? `${promptGlyph} ` : '  '
             const text = rowG.join('')
             if (!active || absRow !== cRow) {
               return (
