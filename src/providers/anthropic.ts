@@ -11,6 +11,9 @@ const API_VERSION = '2023-06-01'
 // the user's interrupt, not a small fixed step count.
 const MAX_STEPS = 1000
 const MAX_ATTEMPTS = 10 // default total tries per request before giving up
+// Max times a single turn will wait out a usage limit when continueAtUsageLimit
+// is on, so a permanent cap eventually surfaces as an error instead of hanging.
+const USAGE_WAIT_CAP = 30
 // Default transient HTTP statuses worth retrying (rate limit, overload, gateway
 // churn). Overridable per-request via StreamOpts.retryStatusCodes.
 const DEFAULT_RETRY_CODES = '408,409,429,500-599'
@@ -333,7 +336,7 @@ async function* agent(messages: Message[], opts: StreamOpts, cfg: AnthropicOpts,
     ? undefined
     : async (sp) => {
         const subMessages: Message[] = [{ id: 'sub-user', role: 'user', content: sp.prompt }]
-        const subOpts: StreamOpts = { model: opts.model, system: sp.system, signal: opts.signal, retryStatusCodes: opts.retryStatusCodes, retryMaxAttempts: opts.retryMaxAttempts }
+        const subOpts: StreamOpts = { model: opts.model, system: sp.system, signal: opts.signal, retryStatusCodes: opts.retryStatusCodes, retryMaxAttempts: opts.retryMaxAttempts, continueAtUsageLimit: opts.continueAtUsageLimit, switchModelOnFlag: opts.switchModelOnFlag, fallbackModel: opts.fallbackModel }
         let text = ''
         let lastText = ''
         let steps = 0
@@ -355,6 +358,13 @@ async function* agent(messages: Message[], opts: StreamOpts, cfg: AnthropicOpts,
   // At most one forced token refresh per turn (on a 401), so an unrecoverable
   // auth failure surfaces as an error instead of looping. OAuth logins only.
   let refreshedAuth = false
+  // The model in use for this turn. Normally opts.model, but switchModelOnFlag
+  // may swap it to opts.fallbackModel once if a message comes back flagged.
+  let activeModel = opts.model
+  let switchedModel = false
+  // How many times we've waited out a usage limit (continueAtUsageLimit). Bounded
+  // by USAGE_WAIT_CAP so a permanent cap can't loop forever.
+  let usageWaits = 0
   // Convo length at the last mid-turn compaction — only re-compact once the
   // convo has grown again, so we never thrash on an already-folded transcript.
   let compactedLen = 0
@@ -375,7 +385,7 @@ async function* agent(messages: Message[], opts: StreamOpts, cfg: AnthropicOpts,
     // them lean). max_tokens must exceed the thinking budget, so add headroom.
     const think = !sub && opts.thinkingBudget && opts.thinkingBudget >= 1024 ? opts.thinkingBudget : 0
     const body = {
-      model: opts.model,
+      model: activeModel,
       max_tokens: think ? think + 4096 : 4096,
       stream: true,
       tools: toolSchemas(!sub),
@@ -420,6 +430,18 @@ async function* agent(messages: Message[], opts: StreamOpts, cfg: AnthropicOpts,
           yield { type: 'error', message: `登录已失效或权限不足（HTTP ${status}）。请运行 /login 重新登录（OAuth 应用需具备 models.invoke 权限）。` }
           return
         }
+        // A usage/rate limit (429): normally retried within the attempt budget.
+        // With continueAtUsageLimit on we instead keep waiting it out — honoring
+        // Retry-After, capped per-wait and in total — so the turn continues once
+        // the limit clears rather than ending in an error at the attempt cap.
+        if (status === 429 && opts.continueAtUsageLimit && usageWaits < USAGE_WAIT_CAP) {
+          usageWaits++
+          const delay = Math.min((parseRetryAfter(res.headers.get('retry-after')) ?? 30) * 1000, 300_000)
+          yield { type: 'retry', attempt: attempt + 1, max: maxAttempts, delayMs: delay, reason: `usage limit (HTTP 429) — 等待后继续 ${usageWaits}/${USAGE_WAIT_CAP}` }
+          await sleep(delay, opts.signal); if (opts.signal?.aborted) return
+          attempt-- // a usage-limit wait doesn't consume the transient-retry budget
+          continue
+        }
         if (!shouldRetry(status) || attempt >= maxAttempts - 1) { yield { type: 'error', message: `API error ${status}: ${errText.slice(0, 400)}` }; return }
         const delay = backoffMs(attempt, parseRetryAfter(res.headers.get('retry-after')))
         yield { type: 'retry', attempt: attempt + 1, max: maxAttempts, delayMs: delay, reason: `HTTP ${status}` }
@@ -460,6 +482,19 @@ async function* agent(messages: Message[], opts: StreamOpts, cfg: AnthropicOpts,
     }
 
     if (opts.signal?.aborted) return
+
+    // switchModelOnFlag: a `refusal` stop reason means the message was flagged by
+    // the model. If enabled and a distinct fallback model is available, swap to
+    // it and redo this step ONCE (don't record the refused turn) rather than
+    // surfacing the refusal. Guarded so it happens at most once per turn.
+    if (stopReason === 'refusal' && opts.switchModelOnFlag && opts.fallbackModel && !switchedModel && opts.fallbackModel !== activeModel) {
+      switchedModel = true
+      activeModel = opts.fallbackModel
+      yield { type: 'text', text: `\n⚠ 消息被标记，改用备用模型 ${activeModel} 重试…\n\n` }
+      step--
+      continue
+    }
+
     convo.push({ role: 'assistant', content: blocks })
 
     const toolUses = blocks.filter((b): b is Extract<ApiBlock, { type: 'tool_use' }> => b.type === 'tool_use')

@@ -6,7 +6,7 @@ import { saveConfig } from '../config'
 import { loadMemory, goalPreamble } from '../lib/memory'
 import { changeSummary } from '../lib/transcript'
 import { t, getLang } from '../lib/i18n'
-import { effortDirective, getSetting, thinkingBudgetFor } from '../lib/settings'
+import { effortDirective, getSetting, resolveThinkingBudget, outputStyleDirective } from '../lib/settings'
 import { randomStatusWord, randomCompletedWord } from '../lib/spinner'
 import { summarizeToolCall } from '../tools'
 import { estimateTokens } from '../lib/tokens'
@@ -27,9 +27,12 @@ function fmtDur(ms: number): string {
   if (s < 60) return zh ? `${s}秒` : `${s}s`
   return zh ? `${m}分${s % 60}秒` : `${m}m ${s % 60}s`
 }
-function fmtClock(d: Date): string {
+function fmtClock(d: Date, fmt24: boolean): string {
+  const mm = String(d.getMinutes()).padStart(2, '0')
+  if (fmt24) return `${String(d.getHours()).padStart(2, '0')}:${mm}`
   const h = d.getHours() % 12 || 12
-  return `${h}:${String(d.getMinutes()).padStart(2, '0')}`
+  const ampm = d.getHours() < 12 ? 'am' : 'pm'
+  return `${h}:${mm}${ampm}`
 }
 
 const BANNER: Message = { id: 'banner', role: 'system', content: '__banner__' }
@@ -285,17 +288,26 @@ export function useChat(initialConfig: AppConfig, initialMessages?: Message[], i
     const preamble = goalPreamble(loadMemory())
     const effortLevel = String(getSetting(configRef.current.settings, 'effort'))
     const effort = effortDirective(effortLevel)
-    const system = [AGENT_SYSTEM, effort, preamble, configRef.current.system].filter(Boolean).join('\n\n')
-    // Extended thinking is opt-in via /effort (high+); providers that don't
-    // support it ignore thinkingBudget (see providers/anthropic, settings).
+    // Output style (concise/explanatory) injects a preamble line like effort does.
+    const outStyle = outputStyleDirective(String(getSetting(configRef.current.settings, 'outputStyle')))
+    const system = [AGENT_SYSTEM, effort, outStyle, preamble, configRef.current.system].filter(Boolean).join('\n\n')
+    // Extended thinking: effort sets the budget, `thinkingMode` (auto/off/on)
+    // overrides it — off forces 0, on forces it on. Providers that don't support
+    // thinking ignore thinkingBudget (see providers/anthropic, settings).
+    const thinkingMode = String(getSetting(configRef.current.settings, 'thinkingMode'))
     const opts = {
       model: configRef.current.model,
       system,
       signal: controller.signal,
-      thinkingBudget: thinkingBudgetFor(effortLevel),
+      thinkingBudget: resolveThinkingBudget(effortLevel, thinkingMode),
       // Configurable retry policy (see settings retryStatusCodes/retryMaxAttempts).
       retryStatusCodes: String(getSetting(configRef.current.settings, 'retryStatusCodes')),
       retryMaxAttempts: Number(getSetting(configRef.current.settings, 'retryMaxAttempts')) || undefined,
+      // Keep going through a usage/rate limit instead of erroring at the cap.
+      continueAtUsageLimit: getSetting(configRef.current.settings, 'continueAtUsageLimit') === true,
+      // Swap to fallbackModel once if a message comes back flagged (refusal).
+      switchModelOnFlag: getSetting(configRef.current.settings, 'switchModelOnFlag') === true,
+      fallbackModel: String(getSetting(configRef.current.settings, 'fallbackModel') || '') || undefined,
       // Live workflow progress → React state so the UI can render the tree(s).
       // Snapshots are keyed by id: replace the matching one, else append. The
       // list is cleared on turn end (a workflow's final snapshot has done=true).
@@ -428,13 +440,15 @@ export function useChat(initialConfig: AppConfig, initialMessages?: Message[], i
     }
     // Per-turn completion footer at the bottom of the turn (like Claude Code's
     // "✻ Sautéed for 10m 10s · done 2:09"). Only when the turn actually produced a
-    // reply and wasn't interrupted. role 'system' keeps it out of the API history.
-    if (!interrupted && acc.trim()) {
+    // reply and wasn't interrupted, and only if the `showTurnDuration` setting is
+    // on. `timeFormat` (24h/12h) picks the clock format. role 'system' keeps it
+    // out of the API history.
+    if (!interrupted && acc.trim() && getSetting(configRef.current.settings, 'showTurnDuration') !== false) {
       const now = new Date()
       const line = t('app.turnDone', {
         word: randomCompletedWord(),
         dur: fmtDur(now.getTime() - turnStart),
-        clock: fmtClock(now),
+        clock: fmtClock(now, getSetting(configRef.current.settings, 'timeFormat') !== '12h'),
       })
       commitMessages((prev) => [...prev, { id: nextId(), role: 'system', content: line, meta: { turnDone: true } }])
     }

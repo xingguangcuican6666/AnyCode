@@ -32,6 +32,7 @@ export const SETTINGS: SettingSpec[] = [
   { key: 'autoCompactWindow', label: 'Auto-compact window', group: 'Context & model', type: 'number', min: 0, max: 10_000_000, unit: ' tok', default: 0, description: 'Trigger auto-compact once the context reaches this many tokens (0 = auto, use the model’s window). Set with /autocompact' },
   { key: 'continueAtUsageLimit', label: 'Continue automatically at usage limit', group: 'Context & model', type: 'boolean', default: false, description: 'Keep going when a usage limit is hit instead of stopping' },
   { key: 'switchModelOnFlag', label: 'Switch models when a message is flagged', group: 'Context & model', type: 'boolean', default: false, description: 'Fall back to another model if a message is flagged' },
+  { key: 'fallbackModel', label: 'Fallback model', group: 'Context & model', type: 'string', default: '', description: 'Model id to switch to when a message is flagged (requires the setting above)' },
   { key: 'thinkingMode', label: 'Thinking mode', group: 'Context & model', type: 'enum', values: ['auto', 'off', 'on'], default: 'auto', description: 'Extended thinking before responding' },
   { key: 'effort', label: 'Reasoning effort', group: 'Context & model', type: 'enum', values: ['low', 'medium', 'high', 'xhigh', 'max'], default: 'medium', description: 'How much reasoning/verification the agent applies (set with /effort)' },
   { key: 'contextWindow', label: 'Context window override', group: 'Context & model', type: 'number', min: 0, max: 10_000_000, unit: ' tok', default: 0, description: 'Force the context-window size in tokens (0 = auto-detect from the model)' },
@@ -201,4 +202,29 @@ const THINKING_BUDGET: Record<EffortLevel, number> = {
 export function thinkingBudgetFor(level: string | undefined): number {
   if (!level || !isEffortLevel(level)) return 0
   return THINKING_BUDGET[level]
+}
+
+// Combine the `thinkingMode` setting (auto/off/on) with the effort-derived
+// budget. `off` disables extended thinking regardless of effort; `on` forces it
+// on even when the effort tier's budget is 0 (using a modest floor so a model
+// that supports thinking actually engages it); `auto` (the default) keeps the
+// effort-driven behavior. Providers that don't support thinking ignore this.
+const THINKING_ON_FLOOR = 4096
+export function resolveThinkingBudget(level: string | undefined, mode: string | undefined): number {
+  const base = thinkingBudgetFor(level)
+  if (mode === 'off') return 0
+  if (mode === 'on') return Math.max(base, THINKING_ON_FLOOR)
+  return base
+}
+
+// The system-preamble line for the `outputStyle` setting. `default` adds nothing
+// (returns undefined so the caller drops it cleanly); the others steer how much
+// explanation the model wraps around its answers — mirroring effortDirective.
+const OUTPUT_STYLE_DIRECTIVE: Record<string, string> = {
+  concise: 'Output style: concise. Keep prose to the minimum that answers well — lead with the result, skip preamble and restatement, and prefer short paragraphs or tight lists.',
+  explanatory: 'Output style: explanatory. Teach as you go — explain the reasoning behind non-obvious choices, note relevant trade-offs, and give enough context that the reader learns why, not just what.',
+}
+export function outputStyleDirective(style: string | undefined): string | undefined {
+  if (!style || style === 'default') return undefined
+  return OUTPUT_STYLE_DIRECTIVE[style]
 }

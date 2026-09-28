@@ -56,6 +56,17 @@ export interface StreamOpts {
   retryStatusCodes?: string
   // Total tries per request before giving up. Absent = the provider default.
   retryMaxAttempts?: number
+  // When true, a usage/rate limit (HTTP 429) no longer ends the turn at the
+  // normal attempt cap: the provider keeps waiting (honoring Retry-After, up to a
+  // bounded number of waits) and continues instead of surfacing the limit as an
+  // error. Maps to the `continueAtUsageLimit` setting.
+  continueAtUsageLimit?: boolean
+  // When true, a `refusal` stop reason (the message was flagged) makes the
+  // provider retry the turn once with `fallbackModel` instead of surfacing the
+  // refusal. Maps to the `switchModelOnFlag` setting; no-op without fallbackModel.
+  switchModelOnFlag?: boolean
+  // The model to fall back to for switchModelOnFlag. Absent = no switch possible.
+  fallbackModel?: string
   // Live progress callback for the `workflow` tool: called as its sub-agents move
   // queued→running→done so the UI can render a live tree. Threaded into the tool
   // context by the provider (see providers/anthropic). Optional; absent = no live

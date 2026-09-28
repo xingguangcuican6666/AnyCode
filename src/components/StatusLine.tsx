@@ -14,17 +14,22 @@ interface Props {
   dir?: 'up' | 'down'
   // Optional trailing note, e.g. "deep in thought with xhigh effort".
   suffix?: string
+  // When true, hold the spinner on a single frame instead of cycling (respects
+  // the `reduceMotion` setting).
+  reduceMotion?: boolean
 }
 
-export function StatusLine({ word, elapsed, tokens, dir = 'up', suffix }: Props): React.ReactElement {
+export function StatusLine({ word, elapsed, tokens, dir = 'up', suffix, reduceMotion = false }: Props): React.ReactElement {
   const colors = useTheme()
   const tr = useT()
   const [frame, setFrame] = useState(0)
   useEffect(() => {
+    if (reduceMotion) return
     const id = setInterval(() => setFrame((f) => f + 1), 120)
     return () => clearInterval(id)
-  }, [])
-  const star = starFrames[frame % starFrames.length]
+  }, [reduceMotion])
+  // A steady star (index 4 = '✻') when motion is reduced; the pulsing cycle otherwise.
+  const star = reduceMotion ? starFrames[4] : starFrames[frame % starFrames.length]
   const arrow = dir === 'down' ? symbols.arrowDown : symbols.arrowUp
   return (
     <Box paddingLeft={1}>
