@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { Box, Text, useApp, useInput, useStdin, useStdout } from 'ink'
-import type { AppConfig, LoopSpec, Message as Msg, PanelTab, SessionUsage } from './types'
+import type { AppConfig, Message as Msg, PanelTab, SessionUsage } from './types'
 import { useChat, type ChatActions } from './hooks/useChat'
 import { StatusLine } from './components/StatusLine'
 import { PromptInput } from './components/PromptInput'
@@ -28,37 +28,16 @@ import { type Selection, lineSpan, splitByCols, stripAnsi, isEmpty, selectedText
 import { displayWidth } from './lib/text'
 import { copyToClipboard } from './lib/clipboard'
 import { loadSession } from './lib/sessions'
-import { registry } from './commands'
+import { registry, isCommand } from './commands'
 import { ThemeProvider, getTheme } from './theme'
 import { LangProvider, resolveLang, setLang, translate } from './lib/i18n'
 import { setGoal } from './lib/memory'
 import { judgeGoal } from './lib/goalJudge'
+import { formatInterval, formatLoop, formatGoal, type ActiveLoop, type ActiveGoal } from './app-helpers'
 
-export type ActiveLoop = LoopSpec & { runs: number }
-
-function formatInterval(ms: number): string {
-  if (ms % 3600000 === 0) return `${ms / 3600000}h`
-  if (ms % 60000 === 0) return `${ms / 60000}m`
-  return `${Math.round(ms / 1000)}s`
-}
-
-function formatLoop(l: ActiveLoop): string {
-  const cadence = l.intervalMs !== null ? `every ${formatInterval(l.intervalMs)}` : 'self-paced'
-  return `Looping "${l.payload}" ${cadence} · ${l.runs} run${l.runs === 1 ? '' : 's'} done · /loop stop to cancel`
-}
-
-// A goal AnyCode autonomously works toward, like Claude Code's /goal. `startedAt`
-// drives the live "◎ /goal active (Ns)" timer; `runs` counts turns spent on it.
-// `paused` freezes the autonomous loop (esc, or a turn that got no model
-// response) WITHOUT clearing the goal — the driver skips a paused goal and waits
-// for the user; any submit (or /goal) resumes it.
-export type ActiveGoal = { text: string; startedAt: number; runs: number; paused?: boolean }
-
-function formatGoal(g: ActiveGoal, elapsed: number, judging = false): string {
-  if (g.paused) return `◎ /goal 已暂停 · ${g.text} · 输入任意内容或 /goal 继续`
-  const tail = judging ? ' · evaluating whether to continue…' : ''
-  return `◎ /goal active (${elapsed}s) · working toward: ${g.text}${tail} · /goal clear to stop`
-}
+// Re-exported so existing importers (cli.tsx, lib/sessions) keep resolving these
+// from './app'; the definitions now live in ./app-helpers.
+export type { ActiveLoop, ActiveGoal } from './app-helpers'
 
 // A snapshot of the live session, carried across a clean resize remount so the
 // transcript, active goal, and active loop survive the fresh Ink instance.
@@ -182,6 +161,9 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume,
   const exitTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   // Refs so the idle driver always reads the live chat/loop/goal without re-subscribing.
   const chatRef = useRef(chat); chatRef.current = chat
+  // Mirrors `queued` so the mid-turn interjection drain (takePending) and ↑-recall
+  // read the live queue from callbacks captured earlier (makeActions / PromptInput).
+  const queuedRef = useRef(queued); queuedRef.current = queued
   const loopRef = useRef(loop); loopRef.current = loop
   const goalRef = useRef(goal); goalRef.current = goal
   const panelRef = useRef(panel); panelRef.current = panel
@@ -752,6 +734,23 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume,
     }
   }, [chat.agents, viewingAgent, agentSel])
 
+  // Destroy a COMPLETED workflow / sub-agent once it loses focus, so it stops
+  // lingering at the bottom (instead of waiting for the turn boundary to clear).
+  // A finished workflow that isn't the expanded one is dropped; a finished
+  // switchable agent that isn't the one being viewed is dropped. The focused
+  // instance survives until the user navigates away — that changes wfExpanded /
+  // viewingAgent, re-runs these, and prunes it then.
+  useEffect(() => {
+    for (const w of chat.workflows) {
+      if (w.done && wfExpanded !== w.id) chat.dropWorkflow(w.id)
+    }
+  }, [chat.workflows, wfExpanded, chat.dropWorkflow])
+  useEffect(() => {
+    for (const a of chat.agents) {
+      if (a.state !== 'running' && viewingAgent !== a.id) chat.dropAgent(a.id)
+    }
+  }, [chat.agents, viewingAgent, chat.dropAgent])
+
   // Global keys: esc interrupts a streaming turn (never clears the goal — that's
   // /goal's job, so autonomous work isn't lost to a stray esc); ctrl+c twice exits.
   useInput((input, key) => {
@@ -856,6 +855,13 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume,
       chat.interrupt()
       return
     }
+    // Idle with background sub-agents still running: esc cancels them (interrupt
+    // routes to abortBackground when no turn is streaming). Comes after the
+    // selection/scroll steps so those keep priority.
+    if (key.escape && !streaming && chat.bgPending) {
+      chat.interrupt()
+      return
+    }
     if (key.ctrl && input === 'c') {
       // With an active text selection, ctrl+c COPIES it (like a terminal) rather
       // than interrupting the turn or arming exit — the highlight is the user's
@@ -892,6 +898,25 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume,
     // through the type-ahead queue so it starts on the next idle tick — never
     // re-entrantly inside the /command turn that requested it.
     send: (text: string) => setQueued((q) => [...q, text]),
+    // Mid-turn interjection drain (see StreamOpts.takePending): hand the provider
+    // the PLAIN-TEXT lines type-ahead-queued during this turn so they land right
+    // after the next tool call. Slash commands are left in the queue for the idle
+    // flush (they must run as their own turn, not be fed to the model as text).
+    // Removes exactly the drained lines by value, so anything queued between this
+    // render and now (including further interjections) is preserved.
+    takePending: (): string[] => {
+      const drained = queuedRef.current.filter((s) => !isCommand(s.trim()))
+      if (drained.length === 0) return []
+      setQueued((q) => {
+        const rest = [...q]
+        for (const d of drained) {
+          const i = rest.indexOf(d)
+          if (i >= 0) rest.splice(i, 1)
+        }
+        return rest
+      })
+      return drained
+    },
     compact: () => doCompact(true),
     openPanel: (tab) => setPanel(tab),
     openLogin: () => setLoginOpen(true),
@@ -1190,6 +1215,12 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume,
               />
             ) : null}
 
+            {!streaming && chat.bgPending ? (
+              <Box paddingLeft={1}>
+                <Text color={colors.accent} wrap="truncate">⚙ 后台运行中 —— 完成后自动继续，按 Esc 取消。</Text>
+              </Box>
+            ) : null}
+
             {chat.retry ? (
               <Box paddingLeft={1}>
                 <Text color={colors.warning} wrap="truncate">
@@ -1257,6 +1288,19 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume,
                 placeholder={t('app.placeholder')}
                 editorMode={String(getSetting(chat.config.settings, 'editorMode') || 'normal')}
                 onSubmit={handleSubmit}
+                recallPending={() => {
+                  // ↑ with the input empty pulls the most recent type-ahead line
+                  // back into the box to edit or retract it (removed by value so a
+                  // concurrent enqueue isn't clobbered). null = nothing queued.
+                  const cur = queuedRef.current
+                  if (cur.length === 0) return null
+                  const last = cur[cur.length - 1]
+                  setQueued((q) => {
+                    const i = q.lastIndexOf(last)
+                    return i >= 0 ? [...q.slice(0, i), ...q.slice(i + 1)] : q
+                  })
+                  return last
+                }}
                 onOverflowDown={() => {
                   // A single ↓ past the input drops into a selectable region below
                   // it. Prefer the agent switcher (switchable transcripts) when

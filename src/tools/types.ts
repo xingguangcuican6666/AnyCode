@@ -6,6 +6,11 @@ import type { AgentSnapshot, DiffLine, WorkflowSnapshot } from '../types'
 
 export interface ToolResult {
   content: string
+  // Optional SHORT text shown in the terminal transcript in place of `content`.
+  // `content` still goes to the model verbatim (so internal guidance/handles stay
+  // in context); `display` is only what the user sees, keeping the frontend clean.
+  // Absent → the UI falls back to `content`.
+  display?: string
   isError?: boolean
   // Code-change accounting for the Usage tab's "Total code changes". Set by the
   // file-mutating tools (write_file/edit_file); absent for read-only tools.
@@ -52,6 +57,10 @@ export interface SpawnOpts {
   // the orchestrating tool can accumulate the sub-agent's live transcript and
   // surface it through ctx.onAgent. Absent = the caller only wants the final result.
   onEvent?: (ev: import('../types').AgentEvent) => void
+  // Optional per-spawn abort signal. When set, it (not the turn's signal) governs
+  // this sub-agent, so a BACKGROUND run can be cancelled independently of the main
+  // turn (see lib/background + useChat.interrupt). Absent = use the turn's signal.
+  signal?: AbortSignal
 }
 
 export interface SpawnResult {

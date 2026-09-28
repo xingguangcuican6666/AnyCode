@@ -3,6 +3,8 @@ import { loadConfig } from '../config'
 import { runTool, toolSchemas, type SpawnOpts, type SpawnResult } from '../tools'
 import { estimateTokens } from '../lib/tokens'
 import { contextLimit, AUTO_COMPACT_RATIO } from '../lib/usage'
+import { parseRetryCodes, sleep, backoffMs, parseRetryAfter } from './retry'
+import { type ApiBlock, type ApiMsg, type StreamUsage, emptyStreamUsage, toApiMessages, parseStream } from './wire'
 
 const API_VERSION = '2023-06-01'
 // Last-resort guard against a runaway loop (e.g. a misbehaving provider that keeps
@@ -14,47 +16,6 @@ const MAX_ATTEMPTS = 10 // default total tries per request before giving up
 // Max times a single turn will wait out a usage limit when continueAtUsageLimit
 // is on, so a permanent cap eventually surfaces as an error instead of hanging.
 const USAGE_WAIT_CAP = 30
-// Default transient HTTP statuses worth retrying (rate limit, overload, gateway
-// churn). Overridable per-request via StreamOpts.retryStatusCodes.
-const DEFAULT_RETRY_CODES = '408,409,429,500-599'
-
-// Compile a retry-code spec ('408,409,429,500-599') into a fast predicate. Each
-// comma-separated part is a single code or an inclusive `lo-hi` range; malformed
-// parts are skipped. An empty/garbage spec yields a never-retry predicate.
-function parseRetryCodes(spec?: string): (s: number) => boolean {
-  const ranges: Array<[number, number]> = []
-  for (const part of (spec ?? DEFAULT_RETRY_CODES).split(',')) {
-    const m = /^\s*(\d+)(?:-(\d+))?\s*$/.exec(part)
-    if (!m) continue
-    const lo = Number(m[1]), hi = m[2] ? Number(m[2]) : lo
-    ranges.push([Math.min(lo, hi), Math.max(lo, hi)])
-  }
-  return ranges.length ? (s) => ranges.some(([a, b]) => s >= a && s <= b) : () => false
-}
-
-function sleep(ms: number, signal?: AbortSignal): Promise<void> {
-  return new Promise((resolve) => {
-    if (signal?.aborted) return resolve()
-    const t = setTimeout(resolve, ms)
-    signal?.addEventListener('abort', () => { clearTimeout(t); resolve() }, { once: true })
-  })
-}
-
-// Exponential backoff (0.5s, 1s, 2s, …) capped at 16s, plus a little jitter so
-// retries don't thundering-herd. A server-sent Retry-After wins when present.
-function backoffMs(attempt: number, retryAfter?: number): number {
-  if (retryAfter != null && retryAfter > 0) return Math.min(retryAfter * 1000, 60_000)
-  return Math.min(500 * 2 ** attempt, 16_000) + Math.floor(Math.random() * 250)
-}
-
-// Retry-After is either a number of seconds or an HTTP date.
-function parseRetryAfter(h: string | null): number | undefined {
-  if (!h) return undefined
-  const n = Number(h)
-  if (Number.isFinite(n)) return n
-  const t = Date.parse(h)
-  return Number.isFinite(t) ? Math.max(0, (t - Date.now()) / 1000) : undefined
-}
 
 // How a given Anthropic-protocol provider resolves its endpoint + key. The env
 // default (id 'anthropic') leaves baseUrl/apiKeyEnv unset; custom providers set
@@ -110,30 +71,6 @@ function keyHint(opts: AnthropicOpts): string {
   return `⚠️  No \`${envName}\` found. Set it, or run \`/provider mock\` for the offline demo.`
 }
 
-type ApiBlock =
-  | { type: 'text'; text: string }
-  | { type: 'thinking'; thinking: string; signature: string }
-  | { type: 'redacted_thinking'; data: string }
-  | { type: 'tool_use'; id: string; name: string; input: Record<string, unknown> }
-  | { type: 'tool_result'; tool_use_id: string; content: string; is_error?: boolean }
-type ApiMsg = { role: 'user' | 'assistant'; content: string | ApiBlock[] }
-
-// Real token usage reported by the API for one request (cache broken out).
-interface StreamUsage { input: number; output: number; cacheRead: number; cacheCreation: number }
-function emptyStreamUsage(): StreamUsage { return { input: 0, output: 0, cacheRead: 0, cacheCreation: 0 } }
-
-// Prior transcript → API messages (text turns only; tool history is rebuilt as
-// the loop runs so we never resend stale tool state). Compaction digests are the
-// one exception to "user/assistant only": they carry role 'system' for the UI,
-// but must reach the model, so they're relabeled as a user turn here.
-function toApiMessages(messages: Message[]): ApiMsg[] {
-  return messages
-    .filter((m) => (m.role === 'user' || m.role === 'assistant' || m.meta?.compacted) && m.content.trim())
-    .map((m) => m.meta?.compacted
-      ? { role: 'user' as const, content: `[Summary of the earlier conversation, which was compacted to save context]\n\n${m.content}` }
-      : { role: m.role as 'user' | 'assistant', content: m.content })
-}
-
 // A bearer-auth provider (new-api relay) sends `Authorization: Bearer <key>`;
 // the Anthropic default uses `x-api-key`. Both still send anthropic-version so
 // the relay routes to the Messages protocol.
@@ -150,76 +87,6 @@ async function post(url: string, body: unknown, apiKey: string, auth: 'x-api-key
     body: JSON.stringify(body),
     signal,
   })
-}
-
-// Parse a full SSE body, yielding text + thinking deltas live and collecting the
-// assistant content blocks + stop_reason + real token usage for the tool loop.
-async function* parseStream(res: Response, signal?: AbortSignal): AsyncGenerator<
-  | { type: 'text'; text: string }
-  | { type: 'thinking'; text: string }
-  | { type: 'done'; blocks: ApiBlock[]; stopReason: string; usage: StreamUsage },
-  void,
-  unknown
-> {
-  const reader = res.body!.getReader()
-  const decoder = new TextDecoder()
-  let buffer = ''
-  const blocks: ApiBlock[] = []
-  const jsonBuf: Record<number, string> = {}
-  let stopReason = 'end_turn'
-  const usage = emptyStreamUsage()
-
-  while (true) {
-    let done = false
-    let value: Uint8Array | undefined
-    try { const r = await reader.read(); done = r.done; value = r.value } catch (e) { if (signal?.aborted) return; throw e }
-    buffer += done ? decoder.decode() : decoder.decode(value, { stream: true })
-    const events = done ? [buffer] : buffer.split('\n\n')
-    if (!done) buffer = events.pop() ?? ''
-    for (const evt of events) {
-      for (const line of evt.split('\n')) {
-        const m = /^data:\s?(.*)$/.exec(line)
-        if (!m || m[1] === '[DONE]') continue
-        let json: any
-        try { json = JSON.parse(m[1]) } catch { continue }
-        if (json.type === 'message_start') {
-          const u = json.message?.usage
-          if (u) {
-            usage.input = u.input_tokens ?? 0
-            usage.cacheRead = u.cache_read_input_tokens ?? 0
-            usage.cacheCreation = u.cache_creation_input_tokens ?? 0
-            usage.output = u.output_tokens ?? usage.output
-          }
-        } else if (json.type === 'content_block_start') {
-          const cb = json.content_block
-          if (cb?.type === 'text') blocks[json.index] = { type: 'text', text: '' }
-          else if (cb?.type === 'thinking') blocks[json.index] = { type: 'thinking', thinking: cb.thinking ?? '', signature: cb.signature ?? '' }
-          else if (cb?.type === 'redacted_thinking') blocks[json.index] = { type: 'redacted_thinking', data: cb.data ?? '' }
-          else if (cb?.type === 'tool_use') { blocks[json.index] = { type: 'tool_use', id: cb.id, name: cb.name, input: {} }; jsonBuf[json.index] = '' }
-        } else if (json.type === 'content_block_delta') {
-          if (json.delta?.type === 'text_delta') {
-            const b = blocks[json.index]; if (b?.type === 'text') b.text += json.delta.text
-            yield { type: 'text', text: json.delta.text as string }
-          } else if (json.delta?.type === 'thinking_delta') {
-            const b = blocks[json.index]; if (b?.type === 'thinking') b.thinking += json.delta.thinking
-            yield { type: 'thinking', text: json.delta.thinking as string }
-          } else if (json.delta?.type === 'signature_delta') {
-            const b = blocks[json.index]; if (b?.type === 'thinking') b.signature += json.delta.signature ?? ''
-          } else if (json.delta?.type === 'input_json_delta') {
-            jsonBuf[json.index] = (jsonBuf[json.index] ?? '') + json.delta.partial_json
-          }
-        } else if (json.type === 'content_block_stop') {
-          const b = blocks[json.index]
-          if (b?.type === 'tool_use') { try { b.input = JSON.parse(jsonBuf[json.index] || '{}') } catch { b.input = {} } }
-        } else if (json.type === 'message_delta') {
-          if (json.delta?.stop_reason) stopReason = json.delta.stop_reason
-          if (json.usage?.output_tokens != null) usage.output = json.usage.output_tokens
-        }
-      }
-    }
-    if (done) break
-  }
-  yield { type: 'done', blocks: blocks.filter(Boolean), stopReason, usage }
 }
 
 // --- Mid-turn compaction --------------------------------------------------
@@ -315,6 +182,30 @@ async function compactConvo(convo: ApiMsg[], opts: StreamOpts, cfg: AnthropicOpt
   return { convo: [digest, ...convo.slice(cut)], folded: cut }
 }
 
+// Compact one-liner for a tool call the sub-agent made, used to reconstruct a
+// report from its trace when it ends without writing prose. Picks the most
+// telling string argument (path/command/pattern) so the line reads like an action.
+function summarizeToolCall(name: string, input: Record<string, unknown>): string {
+  let detail = ''
+  for (const k of ['path', 'command', 'pattern', 'file_path', 'query']) {
+    const v = input?.[k]
+    if (typeof v === 'string' && v.trim()) { detail = v.trim(); break }
+  }
+  if (!detail) { try { detail = JSON.stringify(input ?? {}) } catch { detail = '' } }
+  return `${name}${detail ? ` · ${detail.replace(/\s+/g, ' ').slice(0, 80)}` : ''}`
+}
+
+// Last-resort report synthesized from a sub-agent's tool trace when it finished
+// WITHOUT writing its own summary — so the orchestrator still learns what the
+// sub-agent did instead of getting an empty "no summary" error. Not a hard error:
+// the run completed, it was just terse.
+function traceReport(trace: string[], steps: number): string {
+  if (trace.length === 0) return `子代理已结束，但未产出书面总结，也没有可追溯的工具调用（共 ${steps} 步）。`
+  const lines = trace.slice(0, 30).map((t, i) => `${i + 1}. ${t}`)
+  const more = trace.length > 30 ? `\n… 另有 ${trace.length - 30} 次工具调用未列出` : ''
+  return `⚠️ 子代理未自行撰写总结；以下为其 ${steps} 次工具调用的操作轨迹（系统自动汇总）：\n${lines.join('\n')}${more}`
+}
+
 // `sub` marks a nested sub-agent run: it is offered no orchestration tools and
 // gets no spawnAgent in its tool context, so nesting is capped at one level.
 async function* agent(messages: Message[], opts: StreamOpts, cfg: AnthropicOpts, sub = false): AsyncGenerator<AgentEvent, void, unknown> {
@@ -336,23 +227,31 @@ async function* agent(messages: Message[], opts: StreamOpts, cfg: AnthropicOpts,
     ? undefined
     : async (sp) => {
         const subMessages: Message[] = [{ id: 'sub-user', role: 'user', content: sp.prompt }]
-        const subOpts: StreamOpts = { model: opts.model, system: sp.system, signal: opts.signal, retryStatusCodes: opts.retryStatusCodes, retryMaxAttempts: opts.retryMaxAttempts, continueAtUsageLimit: opts.continueAtUsageLimit, switchModelOnFlag: opts.switchModelOnFlag, fallbackModel: opts.fallbackModel }
+        const subOpts: StreamOpts = { model: opts.model, system: sp.system, signal: sp.signal ?? opts.signal, retryStatusCodes: opts.retryStatusCodes, retryMaxAttempts: opts.retryMaxAttempts, continueAtUsageLimit: opts.continueAtUsageLimit, switchModelOnFlag: opts.switchModelOnFlag, fallbackModel: opts.fallbackModel }
         let text = ''
         let lastText = ''
         let steps = 0
         let error: string | undefined
+        // Compact trace of the tools this sub-agent ran, so we can synthesize a
+        // usable report if it ends without writing its own prose (see below).
+        const trace: string[] = []
         for await (const ev of agent(subMessages, subOpts, cfg, true)) {
           sp.onEvent?.(ev) // forward the sub-agent's live events for the switchable view
           if (ev.type === 'text') { text += ev.text; lastText += ev.text }
-          else if (ev.type === 'tool_use') { steps++; lastText = '' } // reset so we keep only the FINAL text block
+          else if (ev.type === 'tool_use') { steps++; lastText = ''; trace.push(summarizeToolCall(ev.name, ev.input)) } // reset lastText so we keep only the FINAL prose block
           else if (ev.type === 'error') error = ev.message
         }
-        // Prefer the sub-agent's final prose block; fall back to all its prose,
-        // and finally to a synthesized note so a summary-less run reports what it
-        // did instead of a bare "(no output)".
-        const summary = lastText.trim() || text.trim() ||
-          (error ? '' : `Completed ${steps} tool call${steps === 1 ? '' : 's'} but returned no written summary.`)
-        return { text: summary, steps, error }
+        // Prefer the sub-agent's final prose block, else all its prose. A run that
+        // hit a transport error keeps whatever prose it managed (or a trace summary)
+        // and surfaces the error so it shows as ✗ with the real reason.
+        const prose = lastText.trim() || text.trim()
+        if (error) return { text: prose || traceReport(trace, steps), steps, error }
+        if (prose) return { text: prose, steps }
+        // No prose even after the forced-summary nudge: the model kept investigating
+        // and never wrote a report. Rather than surface an empty ✗ "no summary" — which
+        // discards the work — synthesize a report from the tool trace so the orchestrator
+        // still sees what was done. NOT flagged as an error: the sub-agent completed.
+        return { text: traceReport(trace, steps), steps }
       }
 
   // At most one forced token refresh per turn (on a 401), so an unrecoverable
@@ -368,6 +267,15 @@ async function* agent(messages: Message[], opts: StreamOpts, cfg: AnthropicOpts,
   // Convo length at the last mid-turn compaction — only re-compact once the
   // convo has grown again, so we never thrash on an already-folded transcript.
   let compactedLen = 0
+  // Sub-agent summary safety net: whether we've already nudged this run to write a
+  // report. A sub-agent that ends on a bare tool-call trace (no closing prose) would
+  // otherwise leave the orchestrator with "(no output)"; we prompt it ONCE to
+  // summarize (see the end-of-turn branch below).
+  let forcedSummary = false
+  // Set once we've nudged a sub-agent for its report: the FOLLOW-UP request drops
+  // tools entirely so the model physically can't keep poking around and MUST write
+  // prose — the earlier "please summarize" nudge alone didn't stop tool-only runs.
+  let summaryOnly = false
   for (let step = 0; step < MAX_STEPS; step++) {
     // Mid-turn auto-compaction (top level only — sub-agents stay lean): when the
     // request we're about to send nears the model's window, fold the older
@@ -388,7 +296,8 @@ async function* agent(messages: Message[], opts: StreamOpts, cfg: AnthropicOpts,
       model: activeModel,
       max_tokens: think ? think + 4096 : 4096,
       stream: true,
-      tools: toolSchemas(!sub),
+      // Drop tools on the forced-summary step so the model can only answer in prose.
+      ...(summaryOnly ? {} : { tools: toolSchemas(!sub) }),
       ...(think ? { thinking: { type: 'enabled', budget_tokens: think } } : {}),
       ...(opts.system ? { system: opts.system } : {}),
       messages: convo,
@@ -502,6 +411,26 @@ async function* agent(messages: Message[], opts: StreamOpts, cfg: AnthropicOpts,
       // Never end a turn with a blank transcript: if the model produced no answer
       // text and no tool call, say why (stop reason) instead of stopping silently.
       const hadText = blocks.some((b) => b.type === 'text' && b.text.trim().length > 0)
+      // A SUB-agent that stops WITHOUT closing prose gives the orchestrator only a
+      // tool-call trace ("(no output)"). Nudge it ONCE — dropping tools on the
+      // follow-up so it physically CANNOT keep poking around and MUST write its
+      // report — so task/plan/workflow results are always useful synthesis. Bounded
+      // by `forcedSummary` so it can't loop; only for sub-agents (the top-level
+      // agent's edits/output stand on their own). We fire regardless of whether a
+      // tool ran: any prose-less sub-agent turn gets the one summary prompt.
+      if (sub && !hadText && !forcedSummary) {
+        forcedSummary = true
+        summaryOnly = true // next request carries no tools, so the model must answer
+        // Ensure the assistant turn just pushed is a valid, non-empty message so the
+        // follow-up request is accepted (endpoints reject blank/empty content).
+        const last = convo[convo.length - 1]
+        if (last && last.role === 'assistant' && Array.isArray(last.content)) {
+          const kept = last.content.filter((b) => b.type !== 'text' || b.text.length > 0)
+          last.content = kept.length > 0 ? kept : [{ type: 'text', text: '(investigated with tools)' }]
+        }
+        convo.push({ role: 'user', content: 'Now write your final report: a short paragraph summarizing what you found or changed, with concrete specifics (file:line references, conclusions, and any remaining risks). This message is captured verbatim as your result and shown to the orchestrator — do NOT call any tools, just write the summary.' })
+        continue
+      }
       if (!hadText && !streamed) {
         const why = stopReason && stopReason !== 'end_turn' ? ` (stop reason: ${stopReason})` : ''
         yield { type: 'text', text: `(no reply — the model ended the turn without output${why})` }
@@ -515,10 +444,20 @@ async function* agent(messages: Message[], opts: StreamOpts, cfg: AnthropicOpts,
       yield { type: 'tool_use', id: tu.id, name: tu.name, input: tu.input }
       const r = await runTool(tu.name, tu.input, { cwd, signal: opts.signal, spawnAgent, onWorkflow: opts.onWorkflow, onAgent: opts.onAgent, allowBackground: !sub })
       if (opts.signal?.aborted) return
-      yield { type: 'tool_result', id: tu.id, name: tu.name, content: r.content, isError: r.isError, linesAdded: r.linesAdded, linesRemoved: r.linesRemoved, diff: r.diff }
+      yield { type: 'tool_result', id: tu.id, name: tu.name, content: r.content, display: r.display, isError: r.isError, linesAdded: r.linesAdded, linesRemoved: r.linesRemoved, diff: r.diff }
       results.push({ type: 'tool_result', tool_use_id: tu.id, content: r.content, is_error: r.isError })
     }
-    convo.push({ role: 'user', content: results })
+    // Mid-turn interjection: drain anything the user typed while this turn streamed
+    // (type-ahead) and merge it into THIS same user turn, as extra text blocks after
+    // the tool_results — the API needs a single user turn here, so it can't be a
+    // second consecutive message. This is what makes an interjection land right
+    // after the next tool call instead of waiting for the turn to end. Top level
+    // only: a sub-agent's opts carries no takePending (see subOpts).
+    const pending = !sub ? (opts.takePending?.() ?? []) : []
+    const content: ApiBlock[] = pending.length > 0
+      ? [...results, ...pending.map((text) => ({ type: 'text' as const, text }))]
+      : results
+    convo.push({ role: 'user', content })
   }
   yield { type: 'error', message: `stopped after ${MAX_STEPS} tool steps (safety cap)` }
 }

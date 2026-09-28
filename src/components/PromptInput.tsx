@@ -13,6 +13,11 @@ interface Props {
   /** Slash commands offered by the autocomplete menu when the line starts "/". */
   commands: readonly CommandSpec[]
   onSubmit: (value: string) => void
+  // Called on ↑ when the input is EMPTY: pulls the most recent type-ahead line the
+  // user queued while the model was streaming back into the box, so they can edit
+  // or retract the pending interjection. Returns the recalled text (removed from
+  // the queue), or null when nothing is queued — in which case ↑ browses history.
+  recallPending?: () => string | null
   // Called when ↓ overflows past the input while NOT browsing history, so the
   // host can repurpose it (here: enter workflow-selection mode). Returning true
   // means the host consumed the key; PromptInput then leaves the line untouched.
@@ -69,7 +74,7 @@ function filterCommands(commands: readonly CommandSpec[], query: string): Comman
   return [...starts, ...contains]
 }
 
-export function PromptInput({ active, placeholder, width, commands, onSubmit, onOverflowDown, onLeftAtStart, editorMode = 'normal' }: Props): React.ReactElement {
+export function PromptInput({ active, placeholder, width, commands, onSubmit, recallPending, onOverflowDown, onLeftAtStart, editorMode = 'normal' }: Props): React.ReactElement {
   const colors = useTheme()
   const [value, setValue] = useState('')
   // `cursor` is a grapheme-cluster index into `value`, never a UTF-16 offset,
@@ -119,6 +124,21 @@ export function PromptInput({ active, placeholder, width, commands, onSubmit, on
     setValue(v)
     setCursor(toGraphemes(v).length)
     setSelected(0)
+  }
+
+  // ↑ recall of a pending interjection: only when the input is empty (so we never
+  // clobber a line being typed) and the host has something queued. Pulls it into
+  // the box for editing; returns true when it consumed the key so ↑ skips history.
+  const tryRecallPending = (): boolean => {
+    if (value.length !== 0 || !recallPending) return false
+    const p = recallPending()
+    if (p === null) return false
+    setValue(p)
+    setCursor(toGraphemes(p).length)
+    histIdx.current = -1
+    setDismissed(false)
+    setSelected(0)
+    return true
   }
 
   useInput((input, key) => {
@@ -192,6 +212,8 @@ export function PromptInput({ active, placeholder, width, commands, onSubmit, on
     }
     if (key.rightArrow) { setCursor((c) => Math.min(g.length, c + 1)); return }
     if (key.upArrow) {
+      // A queued interjection takes precedence over history recall on an empty line.
+      if (tryRecallPending()) return
       const h = history.current ?? []
       if (h.length === 0) return
       histIdx.current = Math.min(h.length - 1, histIdx.current + 1)
@@ -239,6 +261,7 @@ export function PromptInput({ active, placeholder, width, commands, onSubmit, on
         setValue(g.slice(0, start).join('') + g.slice(cursor).join('')); setCursor(start); return
       }
       if (input === 'p') { // like ↑ (older history)
+        if (tryRecallPending()) return
         const h = history.current ?? []
         if (h.length === 0) return
         histIdx.current = Math.min(h.length - 1, histIdx.current + 1)

@@ -77,6 +77,13 @@ export interface StreamOpts {
   // swap the viewport to its transcript. Distinct from onWorkflow (a progress
   // tree). Threaded by the provider; absent = no switchable view.
   onAgent?: (snap: AgentSnapshot) => void
+  // Mid-turn interjection drain: called by the top-level agent loop right after a
+  // tool batch, it returns any user lines typed WHILE the turn was streaming
+  // (type-ahead) so they can be merged into the very next model request instead of
+  // waiting for the turn to end. Returns [] when nothing is queued. Only the
+  // top-level agent gets this (sub-agents never drain interjections). See app.tsx's
+  // `queued` state and useChat's opts wiring.
+  takePending?: () => string[]
 }
 
 // One sub-agent inside a live `workflow` run, with its current state and timing
@@ -149,7 +156,7 @@ export type AgentEvent =
   | { type: 'text'; text: string }
   | { type: 'thinking'; text: string }
   | { type: 'tool_use'; id: string; name: string; input: Record<string, unknown> }
-  | { type: 'tool_result'; id: string; name: string; content: string; isError?: boolean; linesAdded?: number; linesRemoved?: number; diff?: DiffLine[] }
+  | { type: 'tool_result'; id: string; name: string; content: string; display?: string; isError?: boolean; linesAdded?: number; linesRemoved?: number; diff?: DiffLine[] }
   | { type: 'usage'; inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreationTokens: number }
   | { type: 'retry'; attempt: number; max: number; delayMs: number; reason: string }
   | { type: 'error'; message: string }
