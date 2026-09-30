@@ -8,15 +8,35 @@ import path from 'node:path'
 import type { SpawnResult, ToolContext, ToolDef } from './types'
 import type { AgentEvent, AgentSnapshot, WorkflowAgent } from '../types'
 import { startBackground, listBackground, waitForBackground } from '../lib/background'
+import { loadAgents, findAgent } from '../lib/agents'
 import { clip } from './util'
 
 // Named sub-agent roles → a system-prompt hint. Kept small; the concrete
-// toolset a sub-agent gets is decided by the agent loop, not here.
+// toolset a sub-agent gets is decided by the agent loop, not here. Custom roles
+// defined under .anycode/agents/*.md (see lib/agents) extend this set at runtime.
 const SUBAGENT_ROLES: Record<string, string> = {
   general: 'You are a focused sub-agent. Complete the assigned task end-to-end using your tools, then report the result concisely.',
   explore: 'You are a read-only exploration sub-agent. Investigate the codebase with read_file/grep/glob/list_dir (do not modify files) and report precise findings with file:line references.',
   code: 'You are an implementation sub-agent. Make the requested code changes, then verify them with a build or tests before reporting what you did.',
   plan: 'You are a planning sub-agent. Investigate the codebase READ-ONLY (read_file/grep/glob/list_dir; do NOT modify files or run mutating commands) and produce a concrete, step-by-step implementation plan: the approach, the exact files to change, the key risks, and a short ordered checklist. Do not implement anything — only return the plan.',
+}
+
+// The built-in role names, plus any custom agents discoverable from `cwd`. Used
+// to build the `subagent_type` enum handed to the model and to surface available
+// agents in the system preamble.
+export function subagentTypeNames(cwd = process.cwd()): string[] {
+  const custom = loadAgents(cwd).map((a) => a.name)
+  const names = [...Object.keys(SUBAGENT_ROLES)]
+  for (const n of custom) if (!names.includes(n)) names.push(n)
+  return names
+}
+
+// A one-line catalog of the custom agents available in `cwd` (name — description),
+// for the system preamble. Empty string when there are none.
+export function customAgentCatalog(cwd = process.cwd()): string {
+  const custom = loadAgents(cwd)
+  if (!custom.length) return ''
+  return custom.map((a) => `- ${a.name}: ${a.description}`).join('\n')
 }
 
 // Cap how many sub-tasks a single `workflow` call fans out, and how many run at
@@ -69,9 +89,14 @@ export function renderWorkflowReport(title: string, agents: WorkflowAgent[], tex
 const REPORT_RULE =
   ' Your FINAL message is captured verbatim as your result and shown to the orchestrator, so it MUST be a self-contained written report — a short paragraph with the concrete findings or changes (file:line references, conclusions, remaining risks). NEVER stop after only tool calls: a run whose last message is a tool call, or is empty, produces no usable result. Once your tools have gathered what you need, write the summary instead of poking around further.'
 
-function spawnHint(kind: unknown): string | undefined {
+function spawnHint(kind: unknown, cwd?: string): string | undefined {
   const key = String(kind ?? 'general').toLowerCase()
-  return (SUBAGENT_ROLES[key] ?? SUBAGENT_ROLES.general) + REPORT_RULE
+  const builtin = SUBAGENT_ROLES[key]
+  if (builtin) return builtin + REPORT_RULE
+  // Not a built-in role — try a custom agent defined under .anycode/agents.
+  const custom = findAgent(key, cwd ?? process.cwd())
+  if (custom) return custom.prompt + REPORT_RULE
+  return SUBAGENT_ROLES.general + REPORT_RULE
 }
 
 interface BatchTask { prompt: string; label: string; type?: unknown }
@@ -125,7 +150,7 @@ async function runAgentBatch(
     agents[i].startedAt = Date.now()
     emit()
     try {
-      const r = await spawn({ prompt: t.prompt, system: spawnHint(t.type), label, signal: sig })
+      const r = await spawn({ prompt: t.prompt, system: spawnHint(t.type, ctx.cwd), label, signal: sig })
       texts[i] = r.text
       agents[i] = { ...agents[i], state: 'done', steps: r.steps, elapsedMs: Date.now() - (agents[i].startedAt ?? Date.now()), error: r.error }
       if (r.error) agents[i].state = 'error'
@@ -172,7 +197,7 @@ async function runSwitchableAgent(
   emit('running')
   const r = await spawn({
     prompt: task.prompt,
-    system: spawnHint(task.type),
+    system: spawnHint(task.type, ctx.cwd),
     label: task.label,
     signal: signal ?? ctx.signal,
     // Each sub-agent event feeds the live transcript + the switcher's activity word.

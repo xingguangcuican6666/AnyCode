@@ -1,4 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react'
+import { PICKER_MOTION_ON, PICKER_MOTION_OFF } from '../lib/termmodes'
 import { Box, Text, useInput, useStdin } from 'ink'
 import { themeList, getTheme, AUTO_THEME, useTheme, type ThemeColors } from '../theme'
 import { useT } from '../lib/i18n'
@@ -75,7 +76,7 @@ export function ThemePicker({ current, width, onSelect, onCancel }: Props): Reac
   // then falls back to ↑/↓ arrows (which PromptInput reads as history navigation).
   useEffect(() => {
     const out = process.stdout
-    try { out.write('\x1b[?1003h') } catch { /* best-effort */ }
+    try { out.write(PICKER_MOTION_ON) } catch { /* best-effort */ }
     const onData = (buf: Buffer): void => {
       const s = buf.toString('utf8')
       const re = /\x1b\[<(\d+);(\d+);(\d+)([Mm])/g
@@ -97,7 +98,7 @@ export function ThemePicker({ current, width, onSelect, onCancel }: Props): Reac
       }
     }
     stdin?.on('data', onData)
-    return () => { stdin?.off('data', onData); try { out.write('\x1b[?1003l\x1b[?1000h\x1b[?1002h\x1b[?1006h') } catch { /* best-effort */ } }
+    return () => { stdin?.off('data', onData); try { out.write(PICKER_MOTION_OFF) } catch { /* best-effort */ } }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [stdin])
 

@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
+import { PICKER_MOTION_ON, PICKER_MOTION_OFF } from '../lib/termmodes'
 import { Box, Text, useInput, useStdin } from 'ink'
 import type { AppConfig, Message, PanelTab, SessionUsage } from '../types'
 import { useTheme } from '../theme'
@@ -13,7 +14,7 @@ import {
 } from '../lib/settings'
 import { contextState, contextLevel, fmtTokens, fmtDuration, bar } from '../lib/usage'
 import { fmtUsd } from '../lib/pricing'
-import { loadMemory } from '../lib/memory'
+import { listMemories } from '../lib/memory'
 import { loadSkills } from '../lib/skills'
 import { loadUserCommands } from '../lib/userCommands'
 import { StatsView, type StatsSub } from './StatsView'
@@ -137,7 +138,7 @@ function editSeed(row: Row, config: AppConfig): string {
 function statusLines(config: AppConfig, usage: SessionUsage, messages: Message[], goal: string, loop: string, t: Tr): string[] {
   const ctx = contextState(messages, config.model)
   const pct = Math.round(ctx.ratio * 100)
-  const mem = loadMemory()
+  const memCount = listMemories().length
   const skills = loadSkills()
   const custom = loadUserCommands()
   // Pad the label column by display width (not string length) so zh labels align
@@ -155,7 +156,7 @@ function statusLines(config: AppConfig, usage: SessionUsage, messages: Message[]
     `${pad(t('status.session'))}${t('status.sessionValue', { turns: usage.turns, tokens: fmtTokens(usage.inputTokens + usage.outputTokens), tools: usage.toolCalls, compactions: usage.compactions })}`,
     `${pad(t('status.goal'))}${goal}`,
     `${pad(t('status.loop'))}${loop}`,
-    t('status.countsLine', { notes: mem.notes.length, skills: skills.length, custom: custom.length }),
+    t('status.countsLine', { notes: memCount, skills: skills.length, custom: custom.length }),
   ]
 }
 
@@ -445,7 +446,7 @@ export function SettingsPanel(props: Props): React.ReactElement {
   // (which PromptInput reads as history navigation).
   useEffect(() => {
     const out = process.stdout
-    try { out.write('\x1b[?1003h') } catch { /* best-effort */ }
+    try { out.write(PICKER_MOTION_ON) } catch { /* best-effort */ }
     const onData = (buf: Buffer): void => {
       const s = buf.toString('utf8')
       const re = /\x1b\[<(\d+);(\d+);(\d+)([Mm])/g
@@ -502,7 +503,7 @@ export function SettingsPanel(props: Props): React.ReactElement {
       }
     }
     stdin?.on('data', onData)
-    return () => { stdin?.off('data', onData); try { out.write('\x1b[?1003l\x1b[?1000h\x1b[?1002h\x1b[?1006h') } catch { /* best-effort */ } }
+    return () => { stdin?.off('data', onData); try { out.write(PICKER_MOTION_OFF) } catch { /* best-effort */ } }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [stdin])
 

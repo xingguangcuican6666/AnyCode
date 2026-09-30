@@ -2,10 +2,13 @@ import type { CommandContext, SlashCommand } from '../types'
 import { providerIds } from '../providers'
 import { VERSION, NAME } from '../version'
 import { themes, themeList, DEFAULT_THEME } from '../theme'
-import { loadMemory, setGoal, addNote, removeNote, formatMemory, saveMemory } from '../lib/memory'
+import { loadMemory, setGoal, listMemories, getMemory, saveMemoryEntry, deleteMemory, formatMemoryList, MEMORY_TYPES, type MemoryType } from '../lib/memory'
 import { contextState, contextLevel, contextLimit, fmtTokens, bar, emptyUsage } from '../lib/usage'
 import { refreshModelDb } from '../lib/modelDb'
 import { loadSkills, expandArgs } from '../lib/skills'
+import { collectProjectInstructions } from '../lib/projectInstructions'
+import { loadHooks, HOOK_EVENTS } from '../lib/hooks'
+import { listMcpServers } from '../lib/mcp'
 import { loadUserCommands } from '../lib/userCommands'
 import { loadCredentials, clearCredentials } from '../lib/credentials'
 import { logout as newapiLogout } from '../lib/newapi'
@@ -19,7 +22,13 @@ import { sendMessageFrame, subscribeTo, unsubscribeFrom, isSubscribed, isReachab
 import { detectIde } from '../lib/ide'
 import { detectChrome } from '../lib/chrome'
 import { t } from '../lib/i18n'
+import { loadAgents } from '../lib/agents'
+import { availableUpdate, type UpdateChannel } from '../lib/update'
+import { CONFIG_FILE } from '../config'
 import os from 'node:os'
+import path from 'node:path'
+import fs from 'node:fs'
+import { execFileSync } from 'node:child_process'
 import {
   SETTINGS, SETTINGS_BY_KEY, settingGroups, getSetting,
   formatSettingValue, coerceSetting, settingHint, EFFORT_LEVELS, isEffortLevel,
@@ -269,7 +278,7 @@ const status: SlashCommand = {
         t('cmd.statusSession', { turns: u.turns, tokens: fmtTokens(u.inputTokens + u.outputTokens), toolCalls: u.toolCalls, compactions: u.compactions }),
         t('cmd.statusGoal', { goal: goalLine }),
         t('cmd.statusLoop', { loop: loopLine }),
-        t('cmd.statusNotes', { notes: mem.notes.length, skills: skills.length, custom: custom.length }),
+        t('cmd.statusNotes', { notes: listMemories().length, skills: skills.length, custom: custom.length }),
       ].join('\n'),
       'system',
     )
@@ -400,11 +409,265 @@ const version: SlashCommand = {
   run(ctx) { ctx.print(`MeowCode v${VERSION}`, 'system') },
 }
 
+// --- /init: generate (or refresh) a project MEOWCODE.md, like Claude Code's
+// /init. It runs as a model turn: the agent explores the repo with its own tools
+// and writes MEOWCODE.md at the project root, which auto-loads into every future
+// session's system prompt (see lib/projectInstructions). If instruction files
+// already exist, it refreshes rather than starts from scratch.
+const INIT_PROMPT =
+  'Create a `MEOWCODE.md` file in the current project root that captures the essential, non-obvious knowledge a coding agent needs to work effectively in this repository. ' +
+  'First explore the codebase yourself — read the package/build manifests, the README, the directory layout, and a sample of the source — to ground everything you write in what is actually here; do not invent conventions. ' +
+  'Then write `MEOWCODE.md` with the write_file tool, covering: the build / test / lint / run commands (the exact invocations), the high-level architecture and where the main pieces live, the code conventions and libraries this project already uses, and any constraints or gotchas a newcomer would trip on. ' +
+  'Keep it concise and high-signal — omit anything obvious from a glance at the tree. If a MEOWCODE.md (or CLAUDE.md / AGENTS.md) already exists, read it first and improve it in place rather than discarding what is there. When done, briefly confirm what you wrote.'
+
+const init: SlashCommand = {
+  name: 'init',
+  get description() { return t('cmd.initDesc') },
+  run(ctx) {
+    if (!ctx.send) { ctx.print(t('cmd.initNonInteractive'), 'system', { error: true }); return }
+    const cwd = process.cwd()
+    const existing = collectProjectInstructions(cwd).filter((f) => path.dirname(f.path) === cwd)
+    ctx.send(INIT_PROMPT)
+    if (existing.length) {
+      ctx.print(t('cmd.initRefreshing', { files: existing.map((f) => f.rel).join(', ') }), 'system')
+    } else {
+      ctx.print(t('cmd.initRunning'), 'system')
+    }
+  },
+}
+
+// --- /hooks: show configured lifecycle hooks (read-only viewer) ---
+const hooks: SlashCommand = {
+  name: 'hooks',
+  get description() { return t('cmd.hooksDesc') },
+  run(ctx) {
+    const cfg = loadHooks(process.cwd())
+    const lines: string[] = []
+    for (const ev of HOOK_EVENTS) {
+      const matchers = cfg[ev] ?? []
+      if (!matchers.length) continue
+      lines.push(`• ${ev}`)
+      for (const m of matchers) {
+        const scope = m.matcher ? ` [${m.matcher}]` : ''
+        for (const h of m.hooks ?? []) lines.push(`    ${scope ? scope + ' ' : ''}$ ${h.command}`)
+      }
+    }
+    if (!lines.length) { ctx.print(t('cmd.hooksNone'), 'system'); return }
+    ctx.print(`${t('cmd.hooksHeader')}\n${lines.join('\n')}`, 'system')
+  },
+}
+
+// --- /mcp: show configured MCP servers, their status and discovered tools ---
+const mcp: SlashCommand = {
+  name: 'mcp',
+  get description() { return t('cmd.mcpDesc') },
+  run(ctx) {
+    const list = listMcpServers()
+    if (!list.length) { ctx.print(t('cmd.mcpNone'), 'system'); return }
+    const glyph: Record<string, string> = { ready: '✓', starting: '…', failed: '✗', stopped: '·' }
+    const label = {
+      ready: 'cmd.mcpReady', starting: 'cmd.mcpStarting',
+      failed: 'cmd.mcpFailed', stopped: 'cmd.mcpStopped',
+    } as const
+    const lines: string[] = []
+    for (const s of list) {
+      const g = glyph[s.status] ?? '?'
+      lines.push(`${g} ${s.name} — ${t(label[s.status])}${s.error ? ` (${s.error})` : ''}`)
+      lines.push(`    $ ${s.command}`)
+      if (s.tools.length) lines.push(`    ${t('cmd.mcpTools', { n: s.tools.length })}: ${s.tools.join(', ')}`)
+    }
+    ctx.print(`${t('cmd.mcpHeader')}\n${lines.join('\n')}`, 'system')
+  },
+}
+
+// --- /doctor: environment & configuration health check (read-only) ---
+const doctor: SlashCommand = {
+  name: 'doctor',
+  get description() { return t('cmd.doctorDesc') },
+  run(ctx) {
+    const c = ctx.config
+    const cwd = process.cwd()
+    const ok = (b: boolean) => (b ? '✓' : '✗')
+    const lines: string[] = []
+    lines.push(`${NAME} v${VERSION}`)
+    const runtime = (process as any).versions?.bun ? `bun ${(process as any).versions.bun}` : `node ${process.versions.node}`
+    lines.push(t('cmd.doctorRuntime', { runtime, platform: `${process.platform}-${process.arch}` }))
+    let branch = ''
+    try { branch = execFileSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd, stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim() } catch {}
+    lines.push(t('cmd.doctorCwd', { cwd, git: branch ? `git:${branch}` : t('cmd.doctorNoGit') }))
+    lines.push(t('cmd.doctorProvider', { provider: c.provider, model: c.model }))
+    const creds = loadCredentials()
+    const how = c.apiKey ? 'apiKey' : creds ? (creds.oauth ? 'oauth' : creds.key ? 'key' : 'session') : t('cmd.doctorNone')
+    lines.push(`${ok(!!(c.apiKey || creds))} ${t('cmd.doctorAuth', { how })}`)
+    lines.push(`${ok(fs.existsSync(CONFIG_FILE))} ${t('cmd.doctorConfig', { path: CONFIG_FILE })}`)
+    const channel = (String(getSetting(c.settings, 'autoUpdateChannel')) === 'latest' ? 'latest' : 'stable') as UpdateChannel
+    const upd = availableUpdate(channel)
+    lines.push(upd ? `⬆ ${t('cmd.doctorUpdate', { ver: upd })}` : `✓ ${t('cmd.doctorUpToDate')}`)
+    const mcpList = listMcpServers()
+    lines.push(t('cmd.doctorMcp', { total: mcpList.length, ready: mcpList.filter((s) => s.status === 'ready').length }))
+    const hk = loadHooks(cwd)
+    lines.push(t('cmd.doctorHooks', { n: HOOK_EVENTS.reduce((n, e) => n + (hk[e]?.length ?? 0), 0) }))
+    lines.push(t('cmd.doctorExt', { skills: loadSkills().length, commands: loadUserCommands().length, agents: loadAgents(cwd).length }))
+    const ide = detectIde()
+    lines.push(t('cmd.doctorIde', { ide: ide.ideName || (ide.integrated ? 'integrated' : t('cmd.doctorNone')) }))
+    ctx.print(`${t('cmd.doctorHeader')}\n${lines.join('\n')}`, 'system')
+  },
+}
+
+// --- /export: write the current conversation transcript to a Markdown file ---
+const ROLE_LABEL: Record<string, string> = { user: 'User', assistant: 'Assistant', system: 'System', tool: 'Tool' }
+const exportCmd: SlashCommand = {
+  name: 'export',
+  get description() { return t('cmd.exportDesc') },
+  run(ctx) {
+    const msgs = ctx.messages.filter((m) => m.content && m.content.trim() && !m.meta?.turnDone && !m.meta?.folded)
+    if (!msgs.length) { ctx.print(t('cmd.exportEmpty'), 'system'); return }
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
+    const arg = ctx.args.trim()
+    const dest = arg
+      ? (path.isAbsolute(arg) ? arg : path.join(process.cwd(), arg))
+      : path.join(process.cwd(), `meowcode-export-${stamp}.md`)
+    const body = msgs.map((m) => `## ${ROLE_LABEL[m.role] ?? m.role}\n\n${m.content.trim()}`).join('\n\n')
+    const md = `# ${NAME} — ${new Date().toLocaleString()}\n\n${body}\n`
+    try {
+      fs.writeFileSync(dest, md, 'utf8')
+      ctx.print(t('cmd.exportDone', { path: dest, n: msgs.length }), 'system')
+    } catch (e) {
+      ctx.print(t('cmd.exportFailed', { err: e instanceof Error ? e.message : String(e) }), 'system', { error: true })
+    }
+  },
+}
+
+// --- /review: kick off an AI code review of the current git changes (model turn) ---
+const REVIEW_PROMPT =
+  'Review the current uncommitted changes in this repository as a senior engineer would. ' +
+  'First run `git status` and `git diff` (both staged and unstaged) with the bash tool to see exactly what changed — if there are no uncommitted changes, review the most recent commit with `git show HEAD` instead. ' +
+  'Read enough of the surrounding code to judge each change in context. ' +
+  'Then give focused, actionable feedback grouped by severity, covering: correctness and edge-case bugs, security issues, error handling, missing tests, and any deviation from the conventions already used in this codebase. ' +
+  'Cite specific files and line ranges. Be concise; skip praise and trivia. If the changes look solid, say so briefly.'
+const review: SlashCommand = {
+  name: 'review',
+  get description() { return t('cmd.reviewDesc') },
+  run(ctx) {
+    if (!ctx.send) { ctx.print(t('cmd.reviewNonInteractive'), 'system', { error: true }); return }
+    const extra = ctx.args.trim()
+    ctx.send(extra ? `${REVIEW_PROMPT}\n\nAdditional focus from the user: ${extra}` : REVIEW_PROMPT)
+    ctx.print(t('cmd.reviewRunning'), 'system')
+  },
+}
+
+// --- /terminal-setup: detect the terminal and advise on multiline keybindings ---
+const terminalSetup: SlashCommand = {
+  name: 'terminal-setup',
+  get description() { return t('cmd.termSetupDesc') },
+  run(ctx) {
+    const prog = process.env.TERM_PROGRAM || process.env.TERM || 'unknown'
+    const p = prog.toLowerCase()
+    const tip = p.includes('iterm') ? 'cmd.termSetupIterm'
+      : p.includes('vscode') ? 'cmd.termSetupVscode'
+      : p.includes('apple') ? 'cmd.termSetupAppleTerminal'
+      : 'cmd.termSetupGeneric'
+    const lines = [t('cmd.termSetupDetected', { term: prog }), t(tip), t('cmd.termSetupSupported')]
+    ctx.print(`${t('cmd.termSetupHeader')}\n${lines.join('\n')}`, 'system')
+  },
+}
+
+// --- /statusline: set or clear the custom status-line shell command ---
+const statusline: SlashCommand = {
+  name: 'statusline',
+  get description() { return t('cmd.statuslineDesc') },
+  run(ctx) {
+    const arg = ctx.args.trim()
+    const s = ctx.config.settings ?? {}
+    const cur = String(getSetting(s, 'statusLine') || '')
+    if (!arg) {
+      ctx.print(cur ? t('cmd.statuslineCurrent', { cmd: cur }) : t('cmd.statuslineNone'), 'system')
+      return
+    }
+    if (['off', 'clear', 'none', 'disable'].includes(arg.toLowerCase())) {
+      ctx.setConfig({ settings: { ...s, statusLine: '' } })
+      ctx.print(t('cmd.statuslineCleared'), 'system')
+      return
+    }
+    ctx.setConfig({ settings: { ...s, statusLine: arg } })
+    ctx.print(t('cmd.statuslineSet', { cmd: arg }), 'system')
+  },
+}
+
 const exit: SlashCommand = {
   name: 'exit',
   aliases: ['quit', 'q'],
   get description() { return t('cmd.exitDesc') },
   run(ctx) { ctx.exit() },
+}
+
+// --- /permissions: view and edit the persistent allow/deny/ask rule lists ---
+// These layer on top of the permission MODE (see tools/permission): a matching
+// `deny` always blocks, an `allow` skips a prompt the mode would raise, and an
+// `ask` forces one the mode would auto-allow. Rules are `Tool` or `Tool(pattern)`
+// strings, e.g. `bash(git *)`, `Edit(src/**)`, `web_fetch(domain:example.com)`.
+const permissions: SlashCommand = {
+  name: 'permissions',
+  aliases: ['perms'],
+  get description() { return t('cmd.permsDesc') },
+  run(ctx) {
+    const raw = ctx.args.trim()
+    const cur = ctx.config.permissions ?? {}
+    const lists = { allow: [...(cur.allow ?? [])], deny: [...(cur.deny ?? [])], ask: [...(cur.ask ?? [])] }
+    const subRaw = raw.split(/\s+/)[0] ?? ''
+    const sub = subRaw.toLowerCase()
+    const rule = raw.slice(subRaw.length).trim()
+    const keys = ['allow', 'deny', 'ask'] as const
+
+    // Bare /permissions → list the current mode and every rule.
+    if (!raw) {
+      const mode = String(getSetting(ctx.config.settings, 'permissionMode') || 'default')
+      const section = (label: string, arr: string[]): string =>
+        arr.length ? `${label}\n${arr.map((r) => `    ${r}`).join('\n')}` : `${label} ${t('cmd.permsEmpty')}`
+      const body = [
+        t('cmd.permsMode', { mode }),
+        section(t('cmd.permsAllow'), lists.allow),
+        section(t('cmd.permsDeny'), lists.deny),
+        section(t('cmd.permsAsk'), lists.ask),
+        '',
+        t('cmd.permsHint'),
+      ].join('\n')
+      ctx.print(`${t('cmd.permsHeader')}\n${body}`, 'system')
+      return
+    }
+
+    if (sub === 'clear' || sub === 'reset') {
+      ctx.setConfig({ permissions: { allow: [], deny: [], ask: [] } })
+      ctx.print(t('cmd.permsCleared'), 'system')
+      return
+    }
+
+    if (sub === 'remove' || sub === 'rm' || sub === 'delete') {
+      if (!rule) { ctx.print(t('cmd.permsNeedRule'), 'system', { error: true }); return }
+      let removed = false
+      for (const k of keys) {
+        const before = lists[k].length
+        lists[k] = lists[k].filter((r) => r !== rule)
+        if (lists[k].length !== before) removed = true
+      }
+      if (!removed) { ctx.print(t('cmd.permsNotFound', { rule }), 'system', { error: true }); return }
+      ctx.setConfig({ permissions: lists })
+      ctx.print(t('cmd.permsRemoved', { rule }), 'system')
+      return
+    }
+
+    if (sub === 'allow' || sub === 'deny' || sub === 'ask') {
+      if (!rule) { ctx.print(t('cmd.permsNeedRule'), 'system', { error: true }); return }
+      // A rule lives in exactly one list: add here, drop from the others.
+      for (const k of keys) lists[k] = lists[k].filter((r) => r !== rule)
+      lists[sub].push(rule)
+      ctx.setConfig({ permissions: lists })
+      ctx.print(t('cmd.permsAdded', { list: sub, rule }), 'system')
+      return
+    }
+
+    ctx.print(t('cmd.permsUsage'), 'system', { error: true })
+  },
 }
 
 // --- /resume: reopen a previously saved session (its whole transcript) ---
@@ -417,6 +680,22 @@ const resume: SlashCommand = {
   run(ctx) {
     if (ctx.openResume) { ctx.openResume(); return }
     ctx.print(t('cmd.resumeNonInteractive'), 'system')
+  },
+}
+
+// --- /fork: branch the current conversation into a new session ---
+// Freezes the current session file as it stands and rotates continued autosaves
+// to a fresh id (see app.tsx forkCurrent → cli.tsx onFork). The original stays on
+// disk, reopenable via /resume, so the live conversation branches without losing
+// where it came from. `meowcode --fork-session [id]` does the same at launch.
+const fork: SlashCommand = {
+  name: 'fork',
+  get description() { return t('cmd.forkDesc') },
+  run(ctx) {
+    if (!ctx.forkCurrent) { ctx.print(t('cmd.forkNonInteractive'), 'system'); return }
+    const id = ctx.forkCurrent()
+    if (!id) { ctx.print(t('cmd.forkEmpty'), 'system', { error: true }); return }
+    ctx.print(t('cmd.forkDone', { id }), 'system')
   },
 }
 
@@ -527,7 +806,8 @@ const plan: SlashCommand = {
     // /plan <task>: switch to plan mode AND launch the planning turn.
     const prompt =
       `Use the \`plan\` tool to produce a concrete implementation plan for the following task, then present that plan to me. ` +
-      `Do NOT edit any files or run mutating commands yet — planning only.\n\nTask: ${arg}`
+      `Do NOT edit any files or run mutating commands yet — planning only. ` +
+      `When the plan is ready and you want to start implementing, call the \`exit_plan_mode\` tool with the plan to ask for my approval.\n\nTask: ${arg}`
     if (ctx.send) {
       ctx.send(prompt)
       ctx.print(t('cmd.planPlanning', { task: arg }), 'system')
@@ -582,34 +862,46 @@ const loop: SlashCommand = {
   },
 }
 
-// --- /memory: free-form notes remembered across sessions (goal lives in /goal) ---
+// --- /memory: the structured, cross-session memory store (goal lives in /goal) ---
 const memory: SlashCommand = {
   name: 'memory',
   get description() { return t('cmd.memoryDesc') },
   run(ctx) {
     const arg = ctx.args.trim()
-    if (!arg) { ctx.print(formatMemory(loadMemory()), 'system'); return }
+    if (!arg || arg === 'list' || arg === 'ls') { ctx.print(formatMemoryList(), 'system'); return }
     const [sub, ...rest] = arg.split(/\s+/)
     const body = rest.join(' ').trim()
     switch (sub) {
-      case 'add':
+      case 'save':
+      case 'add': {
+        // /memory save [type] <description> :: <body>  — or just <text> (reference).
         if (!body) { ctx.print(t('cmd.memoryAddUsage'), 'system', { error: true }); return }
-        addNote(body)
-        ctx.print(t('cmd.memoryAdded'), 'system')
-        return
-      case 'rm':
-      case 'remove': {
-        const n = Number(body)
-        if (!Number.isInteger(n) || n < 1) { ctx.print(t('cmd.memoryRmUsage'), 'system', { error: true }); return }
-        removeNote(n)
-        ctx.print(t('cmd.memoryRemoved', { n }), 'system')
+        let rest2 = body
+        let type: MemoryType = 'reference'
+        const maybeType = rest2.split(/\s+/)[0]
+        if ((MEMORY_TYPES as readonly string[]).includes(maybeType)) { type = maybeType as MemoryType; rest2 = rest2.slice(maybeType.length).trim() }
+        const [desc, fact] = rest2.includes('::') ? rest2.split('::', 2).map((s) => s.trim()) : [rest2, rest2]
+        if (!desc) { ctx.print(t('cmd.memoryAddUsage'), 'system', { error: true }); return }
+        const saved = saveMemoryEntry({ description: desc, type, body: fact })
+        if (!saved) { ctx.print(t('cmd.memorySaveFailed'), 'system', { error: true }); return }
+        ctx.print(t('cmd.memorySaved', { name: saved.name, type: saved.type }), 'system')
         return
       }
-      case 'clear': {
-        const m = loadMemory()
-        m.notes = []
-        saveMemory(m)
-        ctx.print(t('cmd.memoryCleared'), 'system')
+      case 'show':
+      case 'read':
+      case 'cat': {
+        if (!body) { ctx.print(t('cmd.memoryShowUsage'), 'system', { error: true }); return }
+        const e = getMemory(body)
+        if (!e) { ctx.print(t('cmd.memoryNotFound', { name: body }), 'system', { error: true }); return }
+        ctx.print(`**${e.name}** _(${e.type})_ — ${e.description}\n\n${e.body}`, 'system')
+        return
+      }
+      case 'rm':
+      case 'remove':
+      case 'delete': {
+        if (!body) { ctx.print(t('cmd.memoryRmUsage'), 'system', { error: true }); return }
+        const ok = deleteMemory(body)
+        ctx.print(ok ? t('cmd.memoryRemoved', { name: body }) : t('cmd.memoryNotFound', { name: body }), 'system', ok ? undefined : { error: true })
         return
       }
       case 'goal':
@@ -912,7 +1204,7 @@ const chrome: SlashCommand = {
   },
 }
 
-const builtins: SlashCommand[] = [help, clear, newSession, model, provider, login, logout, effort, theme, goal, plan, loop, memory, config, usage, status, stats, compact, autocompact, skill, copy, worktree, editor, feedback, rewind, dm, sessions, ide, chrome, resume, version, exit]
+const builtins: SlashCommand[] = [help, clear, newSession, model, provider, login, logout, effort, theme, goal, plan, loop, memory, config, usage, status, stats, compact, autocompact, skill, init, hooks, mcp, doctor, exportCmd, review, terminalSetup, statusline, permissions, copy, worktree, editor, feedback, rewind, dm, sessions, ide, chrome, resume, fork, version, exit]
 
 // Merge user-defined commands (from ~/.anycode/commands and ./.anycode/commands)
 // into the registry, but never let them shadow a built-in name or alias. Loaded

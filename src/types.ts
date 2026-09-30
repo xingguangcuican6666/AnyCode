@@ -11,6 +11,25 @@ export interface DiffLine {
   newNo?: number
 }
 
+// A structured content block a tool can return IN PLACE of plain text, so the
+// model receives it inside the tool_result — used by read_file to hand back
+// images and PDFs (multimodal read). `text` blocks caption the media; `image`
+// and `document` carry base64 data with an Anthropic media_type. When a
+// ToolResult sets `blocks`, the API request uses them; the transcript still
+// shows the ToolResult's plain `content`/`display`.
+export type ToolResultBlock =
+  | { type: 'text'; text: string }
+  | { type: 'image'; source: { type: 'base64'; media_type: string; data: string } }
+  | { type: 'document'; source: { type: 'base64'; media_type: string; data: string } }
+
+// A base64 image attached to a USER prompt (pasted from the clipboard or a
+// dropped/typed image-file path — see lib/images). Rides on the Message's meta;
+// wire.toApiMessages emits it as an Anthropic `image` content block.
+export interface ImageAttachment {
+  media_type: string
+  data: string
+}
+
 export interface MessageMeta {
   interrupted?: boolean
   error?: boolean
@@ -27,6 +46,14 @@ export interface MessageMeta {
   // carries it into the request as a user turn. Without this flag the summary
   // would be dropped and the model would "forget" everything that was folded.
   compacted?: boolean
+  // Set on messages FOLDED by an in-place compaction. They stay VISIBLE in the
+  // transcript (compaction no longer clears the screen — see app.tsx foldContext)
+  // but are dropped from the model context: toApiMessages and contextTokens both
+  // skip `folded` messages. The digest that stands in for them carries `compacted`
+  // (above) plus `foldedCount` — how many messages it replaces, shown on its
+  // collapsed one-line row (see lib/transcript).
+  folded?: boolean
+  foldedCount?: number
   // A write_file/edit_file result's unified diff, rendered as a line-numbered
   // green/red diff view (collapsible on click). Absent for non-mutating tools.
   diff?: DiffLine[]
@@ -34,6 +61,16 @@ export interface MessageMeta {
   // appended after the agent finishes a turn (see useChat). UI-only — role
   // 'system' keeps it out of the API history (toApiMessages drops it).
   turnDone?: boolean
+  // Images attached to a USER message (pasted from the clipboard or a
+  // dropped/typed image-file path — see lib/images, wire.toApiMessages). The
+  // visible `content` carries "[Image #N]" placeholders; these hold the actual
+  // base64 the model receives.
+  attachments?: ImageAttachment[]
+  // Contents injected for the `@path` mentions in a USER message (see
+  // lib/mentions, wire.toApiMessages). The visible `content` keeps the clean
+  // `@path` tokens; this block is appended to the text the model receives so it
+  // sees the referenced files without a read_file round-trip.
+  injectedContext?: string
 }
 
 export interface Message {
@@ -108,6 +145,23 @@ export interface StreamOpts {
   // (the denial is fed back as an error tool_result so the model can adapt).
   // Absent = no interactive gating (an 'ask' decision falls through to allow).
   requestPermission?: (req: PermissionRequest) => Promise<'allow' | 'deny'>
+  // Interactive structured-question prompt (the `ask_user` tool): called when the
+  // model needs a decision that is genuinely the user's to make and wants to offer
+  // a few concrete options. Resolves with the user's selections (see
+  // UserInputResponse). Absent (headless / sub-agent) = the tool reports that no
+  // interactive user is available and the model proceeds on its own judgment.
+  requestUserInput?: (req: UserInputRequest) => Promise<UserInputResponse>
+  // Plan-mode exit: called by the top-level agent loop when the `exit_plan_mode`
+  // tool is approved, so the host can flip the persistent `permissionMode` setting
+  // (plan → acceptEdits or default) and reflect it in the UI. The provider also
+  // updates its in-turn mode so edits are allowed immediately. Absent = the
+  // provider still relaxes the current turn but the change isn't persisted.
+  onPermissionModeChange?: (mode: string) => void
+  // Persistent permission rules (the `permissions` config), layered on top of the
+  // mode by the provider before each tool call. See AppConfig.permissions and
+  // tools/permission matchPermissionRule. Threaded to sub-agents too (a deny rule
+  // must bind them), but sub-agents can't prompt so an 'ask' collapses to allow.
+  permissionRules?: { allow?: string[]; deny?: string[]; ask?: string[] }
 }
 
 // One pending permission prompt handed to the UI: which tool wants to run, its
@@ -116,6 +170,30 @@ export interface PermissionRequest {
   tool: string
   input: Record<string, unknown>
   summary: string
+}
+
+// One structured question the `ask_user` tool poses, mirroring Claude Code's
+// AskUserQuestion. `header` is a short chip label; `options` are the selectable
+// answers. The UI ALWAYS also offers a free-form "Other" entry, so the model
+// never needs to add one. `multiSelect` lets the user pick more than one option.
+export interface UserQuestion {
+  question: string
+  header: string
+  multiSelect?: boolean
+  options: Array<{ label: string; description?: string }>
+}
+
+// A pending `ask_user` prompt handed to the UI (one or more questions), and the
+// answer that comes back — one entry per question, in the same order, holding the
+// chosen option labels (free-form "Other" text included verbatim). An empty inner
+// array = that question was skipped; `cancelled` = the whole prompt was dismissed
+// (esc), so the tool tells the model no answer was given.
+export interface UserInputRequest {
+  questions: UserQuestion[]
+}
+export interface UserInputResponse {
+  answers: string[][]
+  cancelled?: boolean
 }
 
 // One sub-agent inside a live `workflow` run, with its current state and timing
@@ -246,6 +324,22 @@ export interface AppConfig {
   settings?: Record<string, boolean | string | number>
   // User-defined Anthropic-protocol providers (persisted; keys live in env).
   customProviders?: CustomProvider[]
+  // Lifecycle shell hooks (PreToolUse/PostToolUse/UserPromptSubmit/SessionStart/…);
+  // see lib/hooks. Persisted as-is via saveConfig; shape is HooksConfig but kept
+  // loose here so types.ts stays dependency-free.
+  hooks?: Record<string, Array<{ matcher?: string; hooks: Array<{ type?: string; command: string; timeout?: number }> }>>
+  // Local MCP (Model Context Protocol) servers to spawn on startup; their tools
+  // become callable as mcp__<server>__<tool>. See lib/mcp. Kept loose here (shape
+  // is McpServers) so types.ts stays dependency-free.
+  mcpServers?: Record<string, { command: string; args?: string[]; env?: Record<string, string>; disabled?: boolean; cwd?: string }>
+  // Persistent permission rules layered on top of the permission MODE: lists of
+  // `Tool` or `Tool(pattern)` strings. A matching `deny` always blocks (wins over
+  // everything), an `allow` skips the prompt an 'ask' would raise, and an `ask`
+  // forces a prompt a mode would otherwise auto-allow. Evaluated by the provider
+  // before each tool call (see tools/permission matchPermissionRule) and managed
+  // by /permissions. Kept loose here (shape is PermissionRules) so types.ts stays
+  // dependency-free.
+  permissions?: { allow?: string[]; deny?: string[]; ask?: string[] }
 }
 
 /** Cumulative token/turn accounting for a session (see lib/usage). */
@@ -306,6 +400,8 @@ export interface CommandContext {
   openLogin?: () => void
   /** Open the interactive /resume session picker (interactive sessions only). */
   openResume?: () => void
+  /** Fork the current session into a fresh one and continue there, freezing the original on disk (/fork; interactive sessions only). Returns the new session id, or null if there's nothing saved yet. */
+  forkCurrent?: () => string | null
   /** Open the interactive /autocompact window picker (interactive sessions only). */
   openAutoCompact?: () => void
   /** Open the interactive /effort slider picker (interactive sessions only). */

@@ -13,13 +13,14 @@ import type { AppConfig, Message } from '../types'
 import { getProvider } from '../providers'
 
 const SUMMARY_SYSTEM =
-  'You are compressing a long coding-assistant conversation so it can continue seamlessly after the older messages are dropped from the context window. ' +
-  'Write a dense, factual summary — notes, not prose — that a fresh instance of the assistant could read to pick up exactly where things left off. ' +
-  'Cover, in this order: (1) what the user is trying to accomplish and any explicit requirements or constraints they stated; ' +
-  '(2) key files, paths, functions, commands, and decisions made; (3) what has been done so far and its outcome (what worked, what failed); ' +
-  '(4) the current state and the concrete next steps. ' +
-  'Preserve exact identifiers (file paths, symbol names, flags, error text) — do not paraphrase them away. Omit pleasantries and filler. ' +
-  'Output ONLY the summary text.'
+  'You are the compaction step of a coding-assistant CLI. A long session is about to exceed the context window, so the earlier messages will be dropped and REPLACED by your summary alone — anything you leave out is lost to the assistant permanently. ' +
+  'Write dense, factual notes (not prose, no pleasantries, no praise), grouped under these headings and each only as long as it needs to be:\n' +
+  '1. Task & intent — what the user is ultimately trying to accomplish and what they asked for most recently; quote wording that must be obeyed exactly.\n' +
+  '2. Standing instructions & constraints — every directive about HOW to work that stays in force for the whole session (language to reply in, formatting rules, security/credential rules, commit/push policy, things never to do). Reproduce them verbatim; never soften or drop them.\n' +
+  '3. Files, paths, symbols, commands & decisions — exact identifiers (file paths, function/variable names, flags, config keys, URLs, error text) and the design decisions already made. Never paraphrase an identifier.\n' +
+  '4. Work done & outcome — what was changed, what worked, what failed, fixes applied, and whether builds/tests were run and their result. Do not claim anything is complete or verified unless the transcript shows it.\n' +
+  '5. Current state & next steps — precisely where things stand and the concrete remaining actions, including any pending user request not yet fulfilled and anything awaiting the user’s confirmation.\n' +
+  'Do not invent facts or fill gaps with assumptions. Output ONLY the summary text.'
 
 // Render the messages being folded as a compact transcript for the summarizer.
 // Roles are labeled; each message is clipped so a huge transcript still fits the

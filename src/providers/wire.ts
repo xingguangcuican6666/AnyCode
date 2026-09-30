@@ -2,14 +2,15 @@
 // API-message conversion, and the SSE stream parser. Kept separate from the
 // agent loop (providers/anthropic) so the loop reads as orchestration, not
 // byte-plumbing.
-import type { Message } from '../types'
+import type { Message, ToolResultBlock } from '../types'
 
 export type ApiBlock =
   | { type: 'text'; text: string }
   | { type: 'thinking'; thinking: string; signature: string }
   | { type: 'redacted_thinking'; data: string }
+  | { type: 'image'; source: { type: 'base64'; media_type: string; data: string } }
   | { type: 'tool_use'; id: string; name: string; input: Record<string, unknown> }
-  | { type: 'tool_result'; tool_use_id: string; content: string; is_error?: boolean }
+  | { type: 'tool_result'; tool_use_id: string; content: string | ToolResultBlock[]; is_error?: boolean }
 export type ApiMsg = { role: 'user' | 'assistant'; content: string | ApiBlock[] }
 
 // Real token usage reported by the API for one request (cache broken out).
@@ -19,13 +20,33 @@ export function emptyStreamUsage(): StreamUsage { return { input: 0, output: 0, 
 // Prior transcript → API messages (text turns only; tool history is rebuilt as
 // the loop runs so we never resend stale tool state). Compaction digests are the
 // one exception to "user/assistant only": they carry role 'system' for the UI,
-// but must reach the model, so they're relabeled as a user turn here.
+// but must reach the model, so they're relabeled as a user turn here. Messages
+// folded by an in-place compaction (meta.folded) stay in the visible transcript
+// but are dropped here — the digest that replaced them carries their gist. A
+// user turn with image attachments (meta.attachments) becomes a block array
+// (its "[Image #N]" text plus one image block per attachment) so the pasted
+// images reach the model; such a turn is kept even when its text is empty.
 export function toApiMessages(messages: Message[]): ApiMsg[] {
   return messages
-    .filter((m) => (m.role === 'user' || m.role === 'assistant' || m.meta?.compacted) && m.content.trim())
-    .map((m) => m.meta?.compacted
-      ? { role: 'user' as const, content: `[Summary of the earlier conversation, which was compacted to save context]\n\n${m.content}` }
-      : { role: m.role as 'user' | 'assistant', content: m.content })
+    .filter((m) => !m.meta?.folded
+      && (m.role === 'user' || m.role === 'assistant' || m.meta?.compacted)
+      && (m.content.trim() || (m.role === 'user' && !!m.meta?.attachments?.length)))
+    .map((m) => {
+      if (m.meta?.compacted) {
+        return { role: 'user' as const, content: `[Summary of the earlier conversation, which was compacted to save context]\n\n${m.content}` }
+      }
+      const atts = m.role === 'user' ? m.meta?.attachments : undefined
+      const injected = m.role === 'user' ? m.meta?.injectedContext : undefined
+      // The API text = the visible content + any @-mention file contents.
+      const baseText = injected ? (m.content.trim() ? `${m.content}\n\n${injected}` : injected) : m.content
+      if (atts?.length) {
+        const blocks: ApiBlock[] = []
+        if (baseText.trim()) blocks.push({ type: 'text', text: baseText })
+        for (const a of atts) blocks.push({ type: 'image', source: { type: 'base64', media_type: a.media_type, data: a.data } })
+        return { role: 'user' as const, content: blocks }
+      }
+      return { role: m.role as 'user' | 'assistant', content: baseText }
+    })
 }
 
 // Parse a full SSE body, yielding text + thinking deltas live and collecting the

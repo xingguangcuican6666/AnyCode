@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { Box, Text, useApp, useInput, useStdin, useStdout } from 'ink'
-import type { AppConfig, Message as Msg, PanelTab, PermissionRequest, SessionUsage } from './types'
+import type { AppConfig, Message as Msg, PanelTab, PermissionRequest, SessionUsage, UserInputRequest, UserInputResponse } from './types'
 import { useChat, type ChatActions } from './hooks/useChat'
 import { StatusLine } from './components/StatusLine'
 import { PromptInput } from './components/PromptInput'
@@ -11,11 +11,12 @@ import { SessionPicker } from './components/SessionPicker'
 import { AutoCompactPicker, type AutoCompactChoice } from './components/AutoCompactPicker'
 import { EffortPicker, type EffortChoice } from './components/EffortPicker'
 import { PermissionDialog, type PermissionChoice } from './components/PermissionDialog'
+import { AskUserDialog } from './components/AskUserDialog'
 import { SettingsPanel } from './components/SettingsPanel'
 import { WorkflowView, WorkflowCollapsed } from './components/WorkflowView'
 import { AgentSwitcher } from './components/AgentSwitcher'
 import { getSetting, isEffortLevel, type EffortLevel } from './lib/settings'
-import { isPermissionMode, nextPermissionMode } from './tools/permission'
+import { isPermissionMode, nextPermissionMode, decidePermission } from './tools/permission'
 import { contextState, contextLevel, contextLimit, AUTO_COMPACT_RATIO, fmtTokens, bar } from './lib/usage'
 import { ensureModelDb } from './lib/modelDb'
 import { ensureUpdateCheck, availableUpdate, type UpdateChannel } from './lib/update'
@@ -23,14 +24,18 @@ import { setTermTitle, clearTermProgress } from './lib/termtitle'
 import { tipFor } from './lib/tips'
 import { notifyDesktop } from './lib/notify'
 import { openInEditor } from './lib/editor'
+import { ALT_ON, ALT_OFF, MOUSE_ON, MOUSE_OFF, CLEAR } from './lib/termmodes'
+import { KITTY_ON, KITTY_OFF } from './lib/kittykeys'
 import { workspaceFiles, filterWorkspaceFiles } from './lib/workspaceFiles'
 import { setIdentity, announce, farewell, pollMail } from './lib/mailbox'
 import { startHub, notifyIdle, setSelfTitle, type SockFrame } from './lib/sessionSocket'
 import { detectIde } from './lib/ide'
 import { detectChrome } from './lib/chrome'
 import { prStatus } from './lib/gitpr'
+import { runStatusLine } from './lib/statusline'
+import { VERSION } from './version'
 import { suggestFollowups } from './lib/suggest'
-import { planCompaction, buildCompacted, heuristicSummary } from './lib/compact'
+import { planCompaction, heuristicSummary } from './lib/compact'
 import { summarizeConversation } from './lib/summarize'
 import { flattenMessages, thinkingLines, messagesFromEvents, type LineKind, type FlatLine } from './lib/transcript'
 import { type Selection, lineSpan, splitByCols, stripAnsi, isEmpty, selectedText } from './lib/selection'
@@ -41,6 +46,10 @@ import { registry, isCommand } from './commands'
 import { ThemeProvider, getTheme } from './theme'
 import { LangProvider, resolveLang, setLang, translate } from './lib/i18n'
 import { setGoal } from './lib/memory'
+import { setScheduleSink, clearJobs } from './lib/scheduler'
+import { setMonitorSink, clearMonitors } from './lib/monitor'
+import { clearBgShells } from './lib/bgshell'
+import { startMcpServers, stopMcpServers } from './lib/mcp'
 import { judgeGoal } from './lib/goalJudge'
 import { formatInterval, formatLoop, formatGoal, type ActiveLoop, type ActiveGoal } from './app-helpers'
 
@@ -78,6 +87,11 @@ interface Props {
   // instance seeded with that snapshot and adopts its session id so continued
   // autosaves keep updating the same file.
   onResume?: (snapshot: SessionSnapshot, sessionId: string) => void
+  // Fork the current session: freeze the original session file as it stands and
+  // rotate autosaves to a fresh id so continued work branches off (/fork). Returns
+  // the new session id (or null if there's nothing saved yet to fork). No remount
+  // — the live transcript is unchanged, only its autosave target rotates.
+  onFork?: () => string | null
   // True only when this instance was seeded by /resume or --continue (not a
   // /compact or resize remount), so App can show a one-time session recap.
   resumed?: boolean
@@ -87,7 +101,7 @@ interface Props {
   sessionId?: string
 }
 
-export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume, resumed, sessionId }: Props): React.ReactElement {
+export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume, onFork, resumed, sessionId }: Props): React.ReactElement {
   const { exit } = useApp()
   const { stdout } = useStdout()
   const { stdin, setRawMode } = useStdin()
@@ -124,6 +138,10 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume,
   // no prompt. Rendered while streaming (a tool call is mid-turn), so it is NOT
   // part of `modalOpen`; it takes the input slot like the /effort picker.
   const [permReq, setPermReq] = useState<{ req: PermissionRequest; resolve: (v: 'allow' | 'deny') => void } | null>(null)
+  // A pending ask_user prompt (the `ask_user` tool). Like permReq it holds the
+  // request and the provider's resolver, and renders an inline AskUserDialog in
+  // the input slot; the resolver gets the user's structured answer. Null = none.
+  const [userReq, setUserReq] = useState<{ req: UserInputRequest; resolve: (v: UserInputResponse) => void } | null>(null)
   // Bumped on every keypress while a dialog/overlay is open, so the `dialogExpiry`
   // idle timer resets on activity (a truly idle dialog is what expires).
   const [dlgActivity, setDlgActivity] = useState(0)
@@ -194,6 +212,7 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume,
   // the keyboard to the dialog) plus the session allow-list of tools the user
   // chose to "always allow" — those auto-resolve without re-prompting.
   const permReqRef = useRef(permReq); permReqRef.current = permReq
+  const userReqRef = useRef(userReq); userReqRef.current = userReq
   const permAllowRef = useRef<Set<string>>(new Set())
   const scrollTopRef = useRef<number | null>(scrollTop); scrollTopRef.current = scrollTop
   // Terminal focus state, tracked from focus-reporting events (\x1b[I / \x1b[O,
@@ -206,6 +225,9 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume,
   // One-line PR/branch status for the footer (the `prStatusFooter` setting),
   // refreshed on a slow poll; null while unknown or when the line is off.
   const [prLine, setPrLine] = useState<string | null>(null)
+  // Custom status-line output (the `statusLine` setting): the first stdout line
+  // of the user's shell command, refreshed on a slow poll; null when unset/empty.
+  const [statusLineText, setStatusLineText] = useState<string | null>(null)
   // The newer version available on the `autoUpdateChannel` release channel (null
   // = up to date / unknown). Populated by a background registry check on startup.
   const [updateVer, setUpdateVer] = useState<string | null>(null)
@@ -216,6 +238,9 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume,
   const wfSelRef = useRef(wfSel); wfSelRef.current = wfSel
   const viewingAgentRef = useRef(viewingAgent); viewingAgentRef.current = viewingAgent
   const agentSelRef = useRef(agentSel); agentSelRef.current = agentSel
+  // Live session usage for the custom status-line command (read inside its slow
+  // poll so token/turn totals stay fresh without re-arming the effect per chunk).
+  const usageRef = useRef(chat.usage); usageRef.current = chat.usage
   // Timestamp of the last time the workflow tree was dismissed. The global esc
   // handler ignores esc for a short window afterwards so "esc to go back" from
   // the tree can never also interrupt the running turn — whether via a rapid
@@ -283,13 +308,13 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume,
     rows: stdout?.rows ?? 24,
   }))
 
-  // Compaction folds older messages into a digest, then applies the result by
-  // remounting a fresh Ink instance (via onRepaint) seeded with the shorter
-  // transcript. A remount is required because history lives in Ink's
-  // append-only <Static>, which can't drop or replace already-emitted lines —
-  // only a fresh instance re-emits the compacted transcript cleanly. Returns
-  // the number of messages folded (0 = nothing to do, no remount). Drives both
-  // /compact and auto-compaction.
+  // Compaction folds the older messages into a model-written digest and applies
+  // it IN PLACE (see useChat.foldContext): the folded messages stay VISIBLE in the
+  // transcript but drop out of the model context, and a collapsed one-line digest
+  // is spliced in. No remount, no screen clear — the earlier onRepaint path wiped
+  // the visible history every time ("不要每次压缩都把聊天记录clear了"). Returns the
+  // number of messages folded (0 = nothing to do). Drives both /compact and
+  // auto-compaction.
   //
   // The summary is model-driven: an independent provider.complete() call distills
   // the folded messages (see lib/summarize), with the offline heuristic as a
@@ -305,15 +330,7 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume,
     setCompacting({ pct: 1 })
     try {
       const summary = (await summarizeConversation(plan.older, chatRef.current.config)) ?? heuristicSummary(plan.older)
-      const { messages: folded, folded: n } = buildCompacted(plan, summary)
-      onRepaint({
-        config: chatRef.current.config,
-        messages: folded,
-        goal: goalRef.current,
-        loop: loopRef.current,
-        usage: { ...chatRef.current.usage, compactions: chatRef.current.usage.compactions + 1 },
-      })
-      return n
+      return chatRef.current.foldContext(summary, plan.older.length)
     } finally {
       compactingRef.current = false
       setCompacting(null)
@@ -474,7 +491,19 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume,
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [stdin])
 
-  const width = dims.cols
+  // Reserve the rightmost column: never draw to the terminal's last column.
+  // Ink 5's log-update erases the prior frame with eraseLines(N) where N is the
+  // count of *logical* lines (output.split('\n').length) — it does NOT account
+  // for physical rows produced by the terminal auto-wrapping a full-width line.
+  // Our bordered/stretched boxes are `width` wide, so at width === cols every
+  // row's right border sits on the last column. Terminals with deferred ("pending")
+  // wrap — kitty, iTerm2, modern VTE — hold the cursor there and the logical count
+  // stays correct; terminals that wrap eagerly at the last column push each such
+  // line onto a second physical row that Ink's erase never reaches, leaving the
+  // wrapped remainder ghosted on screen ("换行重复写同行"，仅 kitty 外可见). Rendering
+  // one column short removes the ambiguity on every terminal at the cost of an
+  // unnoticeable blank right margin.
+  const width = Math.max(1, dims.cols - 1)
   // Resolve the active palette from config and hand it to the whole tree.
   const colors = getTheme(chat.config.theme).colors
   // Active UI language, from the `language` setting (auto → shell locale). Handed
@@ -633,6 +662,7 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume,
     1 + // permission-mode indicator (always shown)
     (suggestLine ? 1 : 0) + // follow-up suggestions line
     (prLine && getSetting(chat.config.settings, 'prStatusFooter') !== false ? 1 : 0) + // PR status line
+    (statusLineText ? 1 : 0) + // custom status-line command output
     (updateVer ? 1 : 0) + // auto-update available banner
     (scrolled ? 1 : 0) + // bottom "jump to bottom" hint
     (scrolled ? 1 : 0) + // top "previous message" hint (rendered above the viewport)
@@ -649,6 +679,7 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume,
     chat.workflows.length +
     (suggestLine ? 1 : 0) +
     (prLine && getSetting(chat.config.settings, 'prStatusFooter') !== false ? 1 : 0) +
+    (statusLineText ? 1 : 0) +
     (updateVer ? 1 : 0) +
     1 + // footer
     1 // permission-mode indicator (always shown)
@@ -778,7 +809,7 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume,
   const autoCompactTrigger = autoCompactOn && !streaming && ctx.used >= autoCompactLimit * AUTO_COMPACT_RATIO
   useEffect(() => {
     if (!autoCompactTrigger) return
-    void doCompact() // remounts with the compacted transcript when it folds anything
+    void doCompact() // folds older messages in place when it triggers — no remount, no clear
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [autoCompactTrigger])
 
@@ -796,6 +827,15 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume,
   // stale/missing it refreshes from models.dev in the background, then re-renders
   // so the context bar picks up the accurate window. Never blocks a turn.
   useEffect(() => { ensureModelDb(() => setDbTick((n) => n + 1)) }, [])
+
+  // Start configured MCP servers once at mount (spawn + handshake + tools/list in
+  // the background) and tear them down on exit. Discovered tools surface in
+  // toolSchemas() on the next turn; a server that fails to start is marked failed
+  // and simply contributes no tools. See lib/mcp.
+  useEffect(() => {
+    startMcpServers(process.cwd())
+    return () => stopMcpServers()
+  }, [])
 
   // Auto-update check (the `autoUpdateChannel` setting): on startup — and when the
   // channel changes — query the release registry in the background and, when a
@@ -908,6 +948,31 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume,
     return () => { alive = false; clearInterval(id) }
   }, [chat.config.settings])
 
+  // Custom status-line footer (the `statusLine` setting): run the user's shell
+  // command with a JSON context on stdin and cache its first stdout line. Like
+  // the PR line, shelling out is slow, so we poll — mount + every 5s — rather
+  // than per render; an empty/failed command clears the line. Reads live usage
+  // from a ref so the poll cadence, not the stream, bounds how often it spawns.
+  useEffect(() => {
+    const cmd = String(getSetting(chat.config.settings, 'statusLine') || '').trim()
+    if (!cmd) { setStatusLineText(null); return }
+    let alive = true
+    const refresh = (): void => {
+      const u = usageRef.current
+      runStatusLine(cmd, {
+        model: chat.config.model,
+        provider: chat.config.provider,
+        cwd: process.cwd(),
+        version: VERSION,
+        tokens: u ? u.inputTokens + u.outputTokens : 0,
+        turns: u ? u.turns : 0,
+      }).then((line) => { if (alive) setStatusLineText(line ? stripAnsi(line) : null) })
+    }
+    refresh()
+    const id = setInterval(refresh, 5000)
+    return () => { alive = false; clearInterval(id) }
+  }, [chat.config.settings, chat.config.model, chat.config.provider])
+
   // `openAgentsView`: when sub-agents first appear (none→some), drop straight
   // into the switcher so the user lands on the agent list. Fires once per edge
   // and never while a modal picker owns the keyboard.
@@ -968,22 +1033,21 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume,
     }
   }, [chat.agents, viewingAgent, agentSel])
 
-  // Destroy a COMPLETED workflow / sub-agent once it loses focus, so it stops
-  // lingering at the bottom (instead of waiting for the turn boundary to clear).
-  // A finished workflow that isn't the expanded one is dropped; a finished
-  // switchable agent that isn't the one being viewed is dropped. The focused
-  // instance survives until the user navigates away — that changes wfExpanded /
-  // viewingAgent, re-runs these, and prunes it then.
+  // Destroy a COMPLETED workflow once it loses focus, so it stops lingering at
+  // the bottom (instead of waiting for the turn boundary to clear). A finished
+  // workflow that isn't the expanded one is dropped; the expanded instance
+  // survives until the user navigates away (that changes wfExpanded and re-runs
+  // this, pruning it then).
   useEffect(() => {
     for (const w of chat.workflows) {
       if (w.done && wfExpanded !== w.id) chat.dropWorkflow(w.id)
     }
   }, [chat.workflows, wfExpanded, chat.dropWorkflow])
-  useEffect(() => {
-    for (const a of chat.agents) {
-      if (a.state !== 'running' && viewingAgent !== a.id) chat.dropAgent(a.id)
-    }
-  }, [chat.agents, viewingAgent, chat.dropAgent])
+  // Finished sub-agents are deliberately NOT pruned here: they persist after the
+  // turn so ← ("← N 个代理") can still browse them at the idle prompt, matching
+  // Claude Code's "← N agents". If we dropped them the moment they finished, the
+  // footer hint would flash and vanish and ← would do nothing at idle — the bug
+  // the user hit. The next turn clears them wholesale (useChat setAgents([])).
 
   // Global keys: esc interrupts a streaming turn (never clears the goal — that's
   // /goal's job, so autonomous work isn't lost to a stray esc); ctrl+c twice exits.
@@ -993,6 +1057,9 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume,
     // interrupt the paused turn nor arm exit while the user is deciding — the only
     // way forward is to answer the dialog.
     if (permReqRef.current) return
+    // A pending ask_user prompt likewise owns the keyboard (its own useInput
+    // handles ↑↓/space/typing/↵/esc) — swallow global keys while it's open.
+    if (userReqRef.current) return
     // The expanded workflow tree owns the keyboard (its own useInput handles
     // ↑↓/x/esc) while open.
     if (wfExpandedRef.current) return
@@ -1159,7 +1226,14 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume,
   // Build the action bundle handed to every submit (exit/clear/theme/loop hooks).
   const makeActions = (): ChatActions => ({
     exit,
-    clear: () => onClear(chatRef.current.config),
+    // A brand-new session drops every session-scoped timer too: pending scheduled
+    // jobs and running monitors belong to the old conversation, not the new one.
+    clear: () => { clearJobs(); clearMonitors(); clearBgShells(); onClear(chatRef.current.config) },
+    // /fork: branch the live conversation — freeze the original on disk and keep
+    // going in a fresh session file (see cli.tsx onFork). No timers are cleared:
+    // the fork continues the same conversation, so its scheduled jobs/monitors
+    // stay valid (unlike /clear, which starts over).
+    forkCurrent: () => onFork?.() ?? null,
     openThemePicker: () => setPickerOpen(true),
     openModelPicker: () => setModelOpen(true),
     startLoop: (spec) => setLoop({ ...spec, runs: 0 }),
@@ -1199,13 +1273,22 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume,
     openAutoCompact: () => setAutoCompactOpen(true),
     openEffortPicker: () => setEffortOpen(true),
     // Open the last response in $EDITOR (the `lastResponseInEditor` setting). We
-    // drop Ink's raw mode + clear the screen so the editor owns the terminal, then
-    // restore and repaint; spawnSync inside openInEditor blocks Ink meanwhile.
+    // hand the terminal fully to the editor: drop Ink's raw mode AND leave our
+    // alternate screen + mouse/kitty modes on suspend, then re-enter and repaint
+    // on resume. Without leaving the alt screen the editor runs inside our owned
+    // viewport with mouse tracking + the kitty keyboard protocol still on, so
+    // vim/nano misbehave and on exit drop the whole TUI to the normal buffer.
+    // spawnSync inside openInEditor blocks Ink for the whole edit.
     openEditor: (text: string) => {
-      const wipe = (): void => { try { stdout.write('\x1b[2J\x1b[3J\x1b[H') } catch { /* ignore */ } }
       const edited = openInEditor(text, {
-        suspend: () => { try { setRawMode?.(false) } catch { /* ignore */ } wipe() },
-        resume: () => { try { setRawMode?.(true) } catch { /* ignore */ } wipe() },
+        suspend: () => {
+          try { setRawMode?.(false) } catch { /* ignore */ }
+          try { stdout.write(MOUSE_OFF + KITTY_OFF + ALT_OFF) } catch { /* ignore */ }
+        },
+        resume: () => {
+          try { setRawMode?.(true) } catch { /* ignore */ }
+          try { stdout.write(ALT_ON + MOUSE_ON + KITTY_ON + CLEAR) } catch { /* ignore */ }
+        },
       })
       chatRef.current.print(edited === null ? t('cmd.editorFailed') : t('cmd.editorClosed'), 'system', edited === null ? { error: true } : undefined)
     },
@@ -1214,8 +1297,26 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume,
     // the inline dialog and resolve once they choose (see PermissionDialog render).
     requestPermission: (req: PermissionRequest): Promise<'allow' | 'deny'> => {
       if (permAllowRef.current.has(req.tool)) return Promise.resolve('allow')
+      // Honor a permission-mode switch made AFTER this turn started. The provider
+      // captures permissionMode once at turn start (anthropic.ts), so a mid-turn
+      // shift+tab to bypassPermissions (or acceptEdits) wouldn't otherwise take
+      // effect until the next turn — the user switched to bypass but kept getting
+      // prompted ("我在运行时切了bypass，但依旧弹授权窗口"). Re-decide against the LIVE
+      // mode read from the current config; only fall through to the dialog when it
+      // still says "ask".
+      const bag = chatRef.current.config.settings
+      const liveMode = String(getSetting(bag, 'permissionMode') || 'default')
+      const live = decidePermission(isPermissionMode(liveMode) ? liveMode : 'default', req.tool, {
+        autoModeInPlan: getSetting(bag, 'autoModeInPlan') === true,
+      })
+      if (live.action === 'allow') return Promise.resolve('allow')
+      if (live.action === 'deny') return Promise.resolve('deny')
       return new Promise<'allow' | 'deny'>((resolve) => setPermReq({ req, resolve }))
     },
+    // Interactive structured-question prompt (the `ask_user` tool): raise the
+    // inline AskUserDialog and resolve once the user answers or dismisses it.
+    requestUserInput: (req: UserInputRequest): Promise<UserInputResponse> =>
+      new Promise<UserInputResponse>((resolve) => setUserReq({ req, resolve })),
   })
 
   // Submitting while a response streams queues the line (type-ahead) rather than
@@ -1307,6 +1408,24 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume,
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [streaming, queued, goal, loop])
+
+  // Wire the agent-facing timers (lib/scheduler, lib/monitor) to the same
+  // type-ahead queue the `send` action uses: when a scheduled job fires or a
+  // monitored command emits a line, we enqueue it, and the idle driver above
+  // flushes it as a fresh turn (priority #1) so the model resumes on its own.
+  // Registered once on mount; the singletons outlive an App remount, so we just
+  // re-attach the sink and leave any in-flight jobs/monitors running.
+  useEffect(() => {
+    setScheduleSink((payload, meta) => {
+      const tag = meta.kind === 'interval' ? `${meta.label} · fire ${meta.fires}` : meta.label
+      setQueued((q) => [...q, `⏰ [scheduled: ${tag}]\n${payload}`])
+    })
+    setMonitorSink((lines, meta) => {
+      const head = `👁 [monitor · ${meta.description}${meta.done ? ' · ended' : ''}]`
+      setQueued((q) => [...q, `${head}\n${lines.join('\n')}`])
+    })
+    return () => { setScheduleSink(null); setMonitorSink(null) }
+  }, [])
 
   return (
     // App-owned screen (alternate buffer): a windowed transcript viewport fills
@@ -1575,6 +1694,13 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume,
                   setPermReq(null)
                 }}
               />
+            ) : userReq ? (
+              <AskUserDialog
+                questions={userReq.req.questions}
+                width={width}
+                onSubmit={(answers) => { const cur = userReq; setUserReq(null); cur?.resolve({ answers }) }}
+                onCancel={() => { const cur = userReq; setUserReq(null); cur?.resolve({ answers: [], cancelled: true }) }}
+              />
             ) : effortOpen ? (
               <EffortPicker
                 width={width}
@@ -1677,6 +1803,12 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume,
             {prLine && getSetting(chat.config.settings, 'prStatusFooter') !== false ? (
               <Box paddingLeft={1}>
                 <Text color={colors.dim} wrap="truncate">{prLine}</Text>
+              </Box>
+            ) : null}
+
+            {statusLineText ? (
+              <Box paddingLeft={1}>
+                <Text color={colors.dim} wrap="truncate">{statusLineText}</Text>
               </Box>
             ) : null}
 

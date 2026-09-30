@@ -1,15 +1,20 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import type { AgentSnapshot, AppConfig, LoopSpec, Message, MessageMeta, PanelTab, PermissionRequest, Role, WorkflowSnapshot } from '../types'
+import type { AgentSnapshot, AppConfig, LoopSpec, Message, MessageMeta, PanelTab, PermissionRequest, Role, UserInputRequest, UserInputResponse, WorkflowSnapshot } from '../types'
 import { getProvider } from '../providers'
 import { isCommand, runCommand } from '../commands'
 import { saveConfig } from '../config'
-import { loadMemory, goalPreamble } from '../lib/memory'
+import { standingPreamble } from '../lib/memory'
+import { projectInstructionsPreamble } from '../lib/projectInstructions'
+import { customAgentCatalog } from '../tools/orchestration'
+import { runHooks, hasHooks } from '../lib/hooks'
 import { changeSummary } from '../lib/transcript'
 import { t } from '../lib/i18n'
 import { effortDirective, getSetting, resolveThinkingBudget, outputStyleDirective, workflowSizeDirective } from '../lib/settings'
 import { randomStatusWord, randomCompletedWord } from '../lib/spinner'
 import { summarizeToolCall } from '../tools'
 import { estimateTokens } from '../lib/tokens'
+import { processImagePrompt } from '../lib/images'
+import { expandMentions } from '../lib/mentions'
 import { emptyUsage, type SessionUsage } from '../lib/usage'
 import { computeCost } from '../lib/pricing'
 import { recordSession, recordTurn } from '../lib/stats'
@@ -65,6 +70,10 @@ export interface ChatActions {
   openPanel?: (tab: PanelTab) => void
   openLogin?: () => void
   openResume?: () => void
+  // Fork the current session: freeze the original on disk and rotate autosaves to
+  // a fresh id so continued work branches off (/fork). Returns the new id, or null
+  // when there's no transcript to fork yet. Owned by the App/CLI (id lives there).
+  forkCurrent?: () => string | null
   openAutoCompact?: () => void
   openEffortPicker?: () => void
   // Open the last assistant response in $EDITOR (the `lastResponseInEditor`
@@ -75,6 +84,11 @@ export interface ChatActions {
   // to run it or 'deny' to skip it (the denial is fed back to the model). Absent
   // = no interactive gating.
   requestPermission?: (req: PermissionRequest) => Promise<'allow' | 'deny'>
+  // Interactive structured-question prompt (the `ask_user` tool): the provider
+  // calls this when the model wants the user to choose between options or supply
+  // free-form input. Resolves with the user's selections. Absent = no interactive
+  // host (the tool then reports it can't ask and the model proceeds on its own).
+  requestUserInput?: (req: UserInputRequest) => Promise<UserInputResponse>
 }
 
 export interface Chat {
@@ -110,6 +124,12 @@ export interface Chat {
   usage: SessionUsage
   setConfig: (patch: Partial<AppConfig>, opts?: { persist?: boolean }) => void
   print: (content: string, role?: Role, meta?: MessageMeta) => void
+  // Fold the oldest `foldCount` transcript messages into a collapsed digest IN
+  // PLACE — they stay visible but are marked `meta.folded` (dropped from the
+  // model context) and a `meta.compacted` summary is spliced in before the recent
+  // tail. No remount, no screen clear (unlike the old onRepaint path). Returns the
+  // number actually folded (0 = nothing to do). Drives /compact + auto-compaction.
+  foldContext: (summary: string, foldCount: number) => number
   submit: (raw: string, actions: ChatActions) => Promise<void>
   interrupt: () => void
   // Destroy a finished workflow / switchable sub-agent snapshot once it loses UI
@@ -174,6 +194,10 @@ export function useChat(initialConfig: AppConfig, initialMessages?: Message[], i
   // Tracks whether a retry notice is currently shown, so we clear it (once) on
   // the next non-retry event without a setState on every event.
   const retryRef = useRef<boolean>(false)
+  // SessionStart hook context: run once per session (on the first real prompt)
+  // and injected into every turn's system prompt thereafter. undefined = not yet
+  // run; '' = ran with no context.
+  const sessionHookCtxRef = useRef<string | undefined>(undefined)
 
   // Keep refs in sync with the value we hand to React, avoiding stale closures.
   const commitMessages = useCallback((updater: (prev: Message[]) => Message[]) => {
@@ -199,6 +223,28 @@ export function useChat(initialConfig: AppConfig, initialMessages?: Message[], i
     commitMessages((prev) => [...prev, { id: nextId(), role, content, meta }])
   }, [commitMessages])
 
+  // Fold the oldest messages in place (see the Chat interface). We compute the
+  // cut off the live ref BEFORE the state update so the folded count is returned
+  // synchronously; the banner (a UI-only marker) never counts toward the fold and
+  // stays pinned at the top. Already-folded messages keep their flag; the freshly
+  // folded slice is re-tagged and the digest carrying the model-facing summary is
+  // inserted just before the recent (still-in-context) tail.
+  const foldContext = useCallback((summary: string, foldCount: number): number => {
+    if (foldCount <= 0 || !summary.trim()) return 0
+    const cur = messagesRef.current
+    const banner = cur.find((m) => m.content === '__banner__')
+    const body = cur.filter((m) => m.content !== '__banner__')
+    const cut = Math.min(foldCount, Math.max(0, body.length - 1)) // keep at least one recent message
+    if (cut <= 0) return 0
+    const older = body.slice(0, cut).map((m) => (m.meta?.folded ? m : { ...m, meta: { ...m.meta, folded: true } }))
+    const recent = body.slice(cut)
+    const digest: Message = { id: nextId(), role: 'system', content: summary.trim(), meta: { compacted: true, foldedCount: cut } }
+    const next = banner ? [banner, ...older, digest, ...recent] : [...older, digest, ...recent]
+    commitMessages(() => next)
+    bumpUsage({ compactions: usageRef.current.compactions + 1 })
+    return cut
+  }, [commitMessages, bumpUsage])
+
   const interrupt = useCallback(() => {
     // Streaming turn: abort the in-flight request (its controller). Background
     // work has its OWN controller, so a streaming interrupt leaves it running.
@@ -217,10 +263,21 @@ export function useChat(initialConfig: AppConfig, initialMessages?: Message[], i
     if (!text || status === 'streaming') return
 
     const prior = messagesRef.current
-    const userMsg: Message = { id: nextId(), role: 'user', content: text }
+    const cmd = isCommand(text)
+    // Non-command prompts: pull out any image references (dropped/typed image
+    // paths, or clipboard images stashed to a temp file by ctrl+v) into
+    // attachments, leaving "[Image #N]" placeholders in the visible text, and
+    // inject the contents of any @path mentions (kept visible as-is) so the
+    // model sees the referenced files without a read_file round-trip.
+    const { text: shownText, attachments } = cmd ? { text, attachments: [] } : processImagePrompt(text, process.cwd())
+    const injectedContext = cmd ? '' : expandMentions(shownText, process.cwd())
+    const meta: MessageMeta | undefined = attachments.length || injectedContext
+      ? { ...(attachments.length ? { attachments } : {}), ...(injectedContext ? { injectedContext } : {}) }
+      : undefined
+    const userMsg: Message = { id: nextId(), role: 'user', content: shownText, meta }
     commitMessages((prev) => [...prev, userMsg])
 
-    if (isCommand(text)) {
+    if (cmd) {
       await runCommand(text, {
         config: configRef.current,
         setConfig,
@@ -242,12 +299,33 @@ export function useChat(initialConfig: AppConfig, initialMessages?: Message[], i
         openPanel: actions.openPanel,
         openLogin: actions.openLogin,
         openResume: actions.openResume,
+        forkCurrent: actions.forkCurrent,
         openAutoCompact: actions.openAutoCompact,
         openEffortPicker: actions.openEffortPicker,
         openEditor: actions.openEditor,
       })
       return
     }
+
+    // Lifecycle hooks (see lib/hooks): fire SessionStart once (first real prompt),
+    // then UserPromptSubmit on this prompt. A UserPromptSubmit hook may BLOCK the
+    // prompt (show the reason, don't run the turn) or inject extra context.
+    let hookContext = ''
+    if (hasHooks(process.cwd())) {
+      if (sessionHookCtxRef.current === undefined) {
+        const ss = await runHooks('SessionStart', { source: 'startup' }, process.cwd())
+        sessionHookCtxRef.current = ss.context || ''
+        if (ss.systemMessage) print(ss.systemMessage, 'system')
+      }
+      const ups = await runHooks('UserPromptSubmit', { prompt: text }, process.cwd())
+      if (ups.systemMessage) print(ups.systemMessage, 'system')
+      if (ups.decision === 'deny' || ups.stop) {
+        print(t('hooks.promptBlocked', { reason: ups.reason ?? '' }), 'system', { error: true })
+        return
+      }
+      hookContext = ups.context
+    }
+    const sessionCtx = sessionHookCtxRef.current || ''
 
     const controller = new AbortController()
     abortRef.current = controller
@@ -276,10 +354,19 @@ export function useChat(initialConfig: AppConfig, initialMessages?: Message[], i
     }
 
     const provider = getProvider(configRef.current)
-    // Cross-session goal + notes steer every turn via the system preamble; the
-    // agent base prompt makes the model use tools and finish the work; the
+    // Cross-session goal + saved memories steer every turn via the system preamble;
+    // the agent base prompt makes the model use tools and finish the work; the
     // reasoning-effort level (set by /effort) tunes how much it explores/verifies.
-    const preamble = goalPreamble(loadMemory())
+    const preamble = standingPreamble()
+    // Project-root instruction files (MEOWCODE.md/CLAUDE.md/AGENTS.md) auto-loaded
+    // into the system prompt, like real Claude Code — folded in next to memory.
+    const projInstr = projectInstructionsPreamble(process.cwd())
+    // Custom sub-agent types (.anycode/agents/*.md): tell the model which named
+    // agents it can pass as `subagent_type` to task/workflow, and what each is for.
+    const agentCatalog = customAgentCatalog(process.cwd())
+    const agentsPreamble = agentCatalog
+      ? `## Custom sub-agents\nBesides the built-in roles (general, explore, code, plan), these project-defined sub-agents are available as \`subagent_type\` for the task/workflow tools:\n${agentCatalog}`
+      : undefined
     const effortLevel = String(getSetting(configRef.current.settings, 'effort'))
     const effort = effortDirective(effortLevel)
     // Output style (concise/explanatory) injects a preamble line like effort does.
@@ -290,7 +377,10 @@ export function useChat(initialConfig: AppConfig, initialMessages?: Message[], i
     const wfSize = allowWorkflows
       ? workflowSizeDirective(String(getSetting(configRef.current.settings, 'dynamicWorkflowSize')))
       : undefined
-    const system = [AGENT_SYSTEM, effort, outStyle, wfSize, preamble, configRef.current.system].filter(Boolean).join('\n\n')
+    // SessionStart + UserPromptSubmit hook context (see lib/hooks) folds into the
+    // system prompt as an extra section, like memory/project instructions.
+    const hookPreamble = [sessionCtx, hookContext].filter(Boolean).join('\n\n') || undefined
+    const system = [AGENT_SYSTEM, effort, outStyle, wfSize, preamble, projInstr, agentsPreamble, hookPreamble, configRef.current.system].filter(Boolean).join('\n\n')
     // Extended thinking: effort sets the budget, `thinkingMode` (auto/off/on)
     // overrides it — off forces 0, on forces it on. Providers that don't support
     // thinking ignore thinkingBudget (see providers/anthropic, settings).
@@ -318,6 +408,17 @@ export function useChat(initialConfig: AppConfig, initialMessages?: Message[], i
       permissionMode: String(getSetting(configRef.current.settings, 'permissionMode') || 'default'),
       autoModeInPlan: getSetting(configRef.current.settings, 'autoModeInPlan') === true,
       requestPermission: actions.requestPermission,
+      requestUserInput: actions.requestUserInput,
+      // Persistent permission rules (allow/deny/ask), managed by /permissions and
+      // layered on top of the mode by the provider before each tool call.
+      permissionRules: configRef.current.permissions,
+      // exit_plan_mode approval flips the permission mode mid-turn; persist it so
+      // the change survives into later turns and the UI reflects the new mode
+      // (mirrors how /plan writes the `permissionMode` setting via setConfig).
+      onPermissionModeChange: (mode: string) => {
+        const s = { ...(configRef.current.settings ?? {}), permissionMode: mode }
+        setConfig({ settings: s })
+      },
       // Live workflow progress → React state so the UI can render the tree(s).
       // Snapshots are keyed by id: replace the matching one, else append. The
       // list is cleared on turn end (a workflow's final snapshot has done=true).
@@ -365,7 +466,10 @@ export function useChat(initialConfig: AppConfig, initialMessages?: Message[], i
     // fallback for providers that don't report real usage (e.g. mock). Real
     // token counts, when the provider sends them, override this below.
     const inputEstimate =
-      estimateTokens(system) + [...prior, userMsg].reduce((n, m) => n + (m.content === '__banner__' ? 0 : estimateTokens(m.content)), 0)
+      estimateTokens(system) + [...prior, userMsg].reduce((n, m) =>
+        n + (m.content === '__banner__' || m.meta?.folded ? 0 : estimateTokens(m.content))
+          + estimateTokens(m.meta?.injectedContext ?? '')
+          + (m.meta?.attachments?.length ?? 0) * 1600, 0)
     // Show the ↑ input count immediately; it flips to ↓ output once the reply
     // (or a thinking block) starts streaming.
     setLive({ dir: 'up', tokens: inputEstimate, thinking: false })
@@ -553,5 +657,5 @@ export function useChat(initialConfig: AppConfig, initialMessages?: Message[], i
     }
   }, [status, commitMessages, setConfig, print, bumpUsage])
 
-  return { messages, streaming, thinking, live, retry, workflows, agents, bgPending, status, statusWord, config, usage, setConfig, print, submit, interrupt, dropWorkflow, dropAgent }
+  return { messages, streaming, thinking, live, retry, workflows, agents, bgPending, status, statusWord, config, usage, setConfig, print, foldContext, submit, interrupt, dropWorkflow, dropAgent }
 }

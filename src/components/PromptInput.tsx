@@ -6,6 +6,7 @@ import type { CommandSpec } from '../types'
 import { toGraphemes, truncateToWidth, displayWidth } from '../lib/text'
 import { loadHistory, appendHistory } from '../lib/history'
 import { copyToClipboard } from '../lib/clipboard'
+import { stashClipboardImage } from '../lib/images'
 
 interface Props {
   active: boolean
@@ -129,6 +130,7 @@ export function PromptInput({ active, placeholder, width, commands, atFiles, onS
   // rather than its mount-time closure.
   const mselRef = useRef(msel); mselRef.current = msel
   const valueRef = useRef(value); valueRef.current = value
+  const cursorRef = useRef(cursor); cursorRef.current = cursor
   const activeRef = useRef(active); activeRef.current = active
   const mouseSelectRef = useRef(mouseSelect); mouseSelectRef.current = mouseSelect
   const copyOnSelectRef = useRef(copyOnSelect); copyOnSelectRef.current = copyOnSelect
@@ -413,6 +415,26 @@ export function PromptInput({ active, placeholder, width, commands, atFiles, onS
     if (key.ctrl && input === 'e') { setCursor(g.length); return }
     if (key.ctrl && input === 'u') { setValue(''); setCursor(0); setDismissed(false); setSelected(0); return }
     if (key.ctrl && input === 'k') { setValue(g.slice(0, cursor).join('')); return }
+    // Ctrl+V: if the system clipboard holds an IMAGE, stash it to a temp file and
+    // insert its path at the cursor — submit-time processImagePrompt then turns it
+    // into an [Image #N] attachment. No clipboard image → no-op (ctrl+v is ignored
+    // otherwise), so ordinary text paste (which arrives via bracketed paste) is
+    // untouched. The read is async, so we fire-and-forget and setState on arrival.
+    if (key.ctrl && input === 'v') {
+      void (async () => {
+        let p: string | null = null
+        try { p = await stashClipboardImage() } catch { p = null }
+        if (!p) return
+        const gg = toGraphemes(valueRef.current)
+        const at = Math.min(cursorRef.current, gg.length)
+        const lead = at > 0 && !/\s/.test(gg[at - 1] ?? ' ') ? ' ' : ''
+        const ins = `${lead}${p} `
+        setValue(gg.slice(0, at).join('') + ins + gg.slice(at).join(''))
+        setCursor(at + toGraphemes(ins).length)
+        setDismissed(false); setSelected(0)
+      })()
+      return
+    }
     // Emacs mode adds the motions/edits the default scheme lacks. All additive
     // and gated on editorMode === 'emacs', so they never shadow normal editing.
     if (editorMode === 'emacs' && key.ctrl) {

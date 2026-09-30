@@ -25,11 +25,29 @@ function tryNative(text: string): void {
   }
 }
 
-// OSC 52: ESC ] 52 ; c ; <base64> BEL — the terminal copies it for us.
+// OSC 52: ESC ] 52 ; c ; <base64> BEL — the terminal copies it for us. Inside a
+// tmux or GNU screen session the sequence is consumed by the multiplexer and
+// never reaches the outer terminal unless we wrap it in that multiplexer's
+// device-control passthrough, so detect it and wrap accordingly (best-effort:
+// tmux still needs `set-clipboard on` + `allow-passthrough on`, screen a
+// compatible config). Very large payloads are left to the native tools — many
+// terminals cap the OSC 52 length and the DCS passthrough is size-limited.
+const OSC52_MAX_B64 = 100000
 function osc52(text: string, out: NodeJS.WriteStream): void {
   try {
     const b64 = Buffer.from(text, 'utf8').toString('base64')
-    out.write(`\x1b]52;c;${b64}\x07`)
+    if (b64.length > OSC52_MAX_B64) return // oversized → rely on the native path
+    const seq = `\x1b]52;c;${b64}\x07`
+    const term = process.env.TERM ?? ''
+    if (process.env.TMUX) {
+      // tmux passthrough: \x1bPtmux; … \x1b\\ with every inner ESC doubled.
+      out.write(`\x1bPtmux;${seq.replace(/\x1b/g, '\x1b\x1b')}\x1b\\`)
+    } else if (term.startsWith('screen') || term.startsWith('tmux')) {
+      // GNU screen DCS passthrough: \x1bP … \x1b\\ (no ESC-doubling).
+      out.write(`\x1bP${seq}\x1b\\`)
+    } else {
+      out.write(seq)
+    }
   } catch { /* ignore */ }
 }
 

@@ -125,6 +125,21 @@ export function loadSession(id: string): SessionSnapshot | null {
   return readFile(id)?.snapshot ?? null
 }
 
+// Fork a saved session: copy its transcript into a NEW session file under a fresh
+// id and return that id, leaving the source untouched so the conversation can
+// branch without altering the original. Used by `/fork` (branch and continue) and
+// `--fork-session` (open a copy at launch). Returns null when the source is
+// missing/corrupt or carries no content worth forking. The copy is stamped with
+// the current workspace, so a fork always lands in the project you're in.
+export function forkSession(sourceId: string): string | null {
+  const snap = loadSession(sourceId)
+  if (!snap) return null
+  const newId = newSessionId()
+  saveSession(newId, snap)
+  // saveSession no-ops on an empty transcript; confirm the copy actually landed.
+  return loadSession(newId) ? newId : null
+}
+
 // The most-recently-saved session's metadata in this workspace, or null (drives
 // `--continue`). Pass `null` for the globally newest across all workspaces.
 export function latestSession(cwd: string | null = process.cwd()): SessionMeta | null {
