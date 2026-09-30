@@ -153,6 +153,9 @@ jobs:
       - name: Create/refresh GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
+          # publish 作业不 checkout（令牌隔离），gh 无法从本地 git remote 推断仓库，
+          # 故显式指定 owner/repo，否则 gh release 会以 "not a git repository" 失败。
+          GH_REPO: ${{ github.repository }}
           TAG: ${{ steps.ver.outputs.tag }}
           PRE: ${{ steps.ver.outputs.prerelease }}
         run: |
