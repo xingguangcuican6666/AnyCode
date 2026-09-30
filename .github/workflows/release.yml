@@ -189,8 +189,10 @@ jobs:
             echo "meowcode@$VERSION 已在 npm -> 跳过发布（幂等）"
             exit 0
           fi
-          tarball="$(ls dist-bin/meowcode-*.tgz)"
+          tarball="$PWD/$(ls dist-bin/meowcode-*.tgz)"
           echo "发布 $tarball  (dist-tag=$DISTTAG, provenance=${PROVENANCE:-off})"
+          # 用绝对路径：npm publish 的路径参数若形如 a/b.tgz（含 / 又无 ./ 前缀），
+          # 会被 npm-package-arg 误判为 GitHub 简写 owner/repo 而去 git ls-remote，publickey 失败。
           npm publish "$tarball" --access public --tag "$DISTTAG" $PROVENANCE
 
       - name: npm publish skipped notice
