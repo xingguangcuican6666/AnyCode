@@ -292,17 +292,25 @@ export function writeIndex(scope: MemoryScope): void {
   }
 }
 
-/** Compact index text for the system preamble — workspace memories first, then
- *  global, each line tagged with its type so the model knows what it can recall. */
-export function memoryIndexText(): string {
+/** Compact index text — workspace memories first, then global, each line tagged
+ *  with its type. With `opts.limit`, only the N most-recently-modified entries per
+ *  scope are listed and the rest are folded into a "…and M more" line pointing at
+ *  the memory tool's "list" action; without a limit the full index is returned
+ *  (the `memory` tool's list action and /memory use the full form). This is what
+ *  bounds how much the system preamble injects when there are many memories. */
+export function memoryIndexText(opts?: { limit?: number }): string {
+  const limit = opts?.limit
   const sections: string[] = []
   for (const scope of MEMORY_SCOPES.slice().reverse()) { // project first, then global
-    const entries = listMemories(scope)
+    const entries = listMemories(scope) // newest-modified first
     if (entries.length === 0) continue
+    const shown = limit && limit > 0 ? entries.slice(0, limit) : entries
     const lines: string[] = [scope === 'project' ? '[workspace memory]' : '[global memory]']
     for (const type of MEMORY_TYPES) {
-      for (const e of entries.filter((x) => x.type === type)) lines.push(`- ${e.name} (${type}) — ${e.description}`)
+      for (const e of shown.filter((x) => x.type === type)) lines.push(`- ${e.name} (${type}) — ${e.description}`)
     }
+    const more = entries.length - shown.length
+    if (more > 0) lines.push(`- …and ${more} more — use the memory tool (action "list") to see the full index`)
     sections.push(lines.join('\n'))
   }
   return sections.join('\n')
@@ -332,6 +340,11 @@ export function formatMemoryList(): string {
   return lines.join('\n')
 }
 
+// Max index entries per scope injected into the system preamble each turn (the
+// most-recently-modified win). Bounds context cost when the store is large; the
+// full index stays reachable via the memory tool's "list" action and /memory.
+const PREAMBLE_INDEX_LIMIT = 25
+
 /**
  * The standing preamble injected into the system prompt every turn: the active
  * goal (kept verbatim so lib/goalJudge's bar is unchanged) plus the memory index
@@ -345,10 +358,14 @@ export function standingPreamble(): string | undefined {
       `Standing goal — keep working toward it until it is genuinely satisfied, and verify it (build/tests) before you consider yourself finished: ${goal}.`,
     )
   }
-  const index = memoryIndexText()
+  // Cap how much of the index the preamble injects: only the most-recent
+  // PREAMBLE_INDEX_LIMIT entries per scope, so a large memory store doesn't bloat
+  // every turn. The overflow line and the guidance below point the model at the
+  // memory tool's "list" action for the full index, and "read" for full bodies.
+  const index = memoryIndexText({ limit: PREAMBLE_INDEX_LIMIT })
   if (index) {
     parts.push(
-      'You have a persistent cross-session memory. Facts you have saved (read the full text of any with the `memory` tool, action "read"):\n' +
+      'You have a persistent cross-session memory. Below is the index of saved facts (this may be a recent subset when there are many — use the `memory` tool, action "list", to see the full index, and action "read" {name} for the full text of any one):\n' +
         index +
         '\n\nMemory has two scopes: [workspace memory] is specific to this project (the current directory); [global memory] applies across every project. Recall the relevant ones before acting. As you learn durable, non-obvious facts — the user\'s preferences and identity (user), corrections and confirmed working approaches (feedback), ongoing goals and constraints (project), useful pointers (reference) — save them with the `memory` tool (action "save"). Saves default to this workspace; pass scope:"global" only for facts that hold across all projects (e.g. the user\'s identity or universal preferences). Link related memories inline with [[their-name]]. Do not save what the repo or git history already records, or what only matters to this one turn.',
     )
