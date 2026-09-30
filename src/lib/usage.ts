@@ -64,6 +64,7 @@ export function contextTokens(messages: Message[]): number {
   for (const m of messages) {
     if (m.content === '__banner__') continue // UI-only, never sent to the model
     if (m.meta?.folded) continue // folded into a digest: still visible, but out of context
+    if (m.meta?.command) continue // local slash command I/O: visible, but out of context
     n += estimateTokens(m.content)
   }
   return n

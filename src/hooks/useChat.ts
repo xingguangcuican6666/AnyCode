@@ -291,19 +291,28 @@ export function useChat(initialConfig: AppConfig, initialMessages?: Message[], i
     const meta: MessageMeta = {
       ...(attachments.length ? { attachments } : {}),
       ...(injectedContext ? { injectedContext } : {}),
+      // A local slash command: tag it so it stays visible in the transcript but is
+      // excluded from the model context and token accounting (see toApiMessages /
+      // contextTokens), like meta.folded. Otherwise the model would later try to
+      // interpret e.g. a prior "/config" turn as a real request.
+      ...(cmd ? { command: text } : {}),
       ts: Date.now(),
     }
     const userMsg: Message = { id: nextId(), role: 'user', content: shownText, meta }
     commitMessages((prev) => [...prev, userMsg])
 
     if (cmd) {
+      // Tag the command's own printed output with meta.command too, so it shows in
+      // the transcript but never reaches the model or the context counter.
+      const cmdPrint = (content: string, role: Role = 'system', m?: MessageMeta): void =>
+        print(content, role, { ...m, command: text })
       await runCommand(text, {
         config: configRef.current,
         setConfig,
         messages: messagesRef.current,
         clear: actions.clear,
         exit: actions.exit,
-        print,
+        print: cmdPrint,
         openThemePicker: actions.openThemePicker,
         openModelPicker: actions.openModelPicker,
         startLoop: actions.startLoop,
@@ -364,7 +373,40 @@ export function useChat(initialConfig: AppConfig, initialMessages?: Message[], i
     let acc = ''
     setStreaming(base)
 
+    // --- Coalesce per-delta live updates onto a trailing tick ---
+    // Streaming emits dozens of SSE deltas/sec; a setThinking/setStreaming per delta
+    // caused the UI jank on large reasoning blocks. We accumulate on every delta but
+    // push to React state at most once per LIVE_MS (trailing). Block boundaries call
+    // cancelLive() so no stale frame fires after the block is committed/cleared, and
+    // the first delta of a block pushes immediately so there's no initial blank.
+    // Nothing is lost by throttling: the committed thinking/answer messages are built
+    // from thinkingAcc/acc, not from the live React state.
+    let liveTimer: ReturnType<typeof setTimeout> | null = null
+    let liveDirty = false
+    const LIVE_MS = 60
+    const pushLive = (): void => {
+      liveDirty = false
+      if (thinkingAcc) {
+        const secs = thinkingStart ? Math.max(1, Math.round((Date.now() - thinkingStart) / 1000)) : 0
+        setThinking({ id: thinkingId, role: 'assistant', content: thinkingAcc, meta: { thinking: true, thinkingSeconds: secs } })
+        setLive({ dir: 'down', tokens: Math.round(outChars / 4), thinking: true })
+      } else {
+        setStreaming({ ...base, content: acc })
+        setLive({ dir: 'down', tokens: Math.round(outChars / 4), thinking: false })
+      }
+    }
+    const scheduleLive = (): void => {
+      liveDirty = true
+      if (liveTimer) return
+      liveTimer = setTimeout(() => { liveTimer = null; if (liveDirty) pushLive() }, LIVE_MS)
+    }
+    const cancelLive = (): void => {
+      if (liveTimer) { clearTimeout(liveTimer); liveTimer = null }
+      liveDirty = false
+    }
+
     const flushText = (): void => {
+      cancelLive()
       if (acc.trim()) commitMessages((prev) => [...prev, { id: assistantId, role: 'assistant', content: acc }])
       acc = ''
       assistantId = nextId()
@@ -486,7 +528,7 @@ export function useChat(initialConfig: AppConfig, initialMessages?: Message[], i
     // token counts, when the provider sends them, override this below.
     const inputEstimate =
       estimateTokens(system) + [...prior, userMsg].reduce((n, m) =>
-        n + (m.content === '__banner__' || m.meta?.folded ? 0 : estimateTokens(m.content))
+        n + (m.content === '__banner__' || m.meta?.folded || m.meta?.command ? 0 : estimateTokens(m.content))
           + estimateTokens(m.meta?.injectedContext ?? '')
           + (m.meta?.attachments?.length ?? 0) * 1600, 0)
     // Show the ↑ input count immediately; it flips to ↓ output once the reply
@@ -507,6 +549,7 @@ export function useChat(initialConfig: AppConfig, initialMessages?: Message[], i
     let thinkingId = nextId()
     let thinkingStart = 0
     const flushThinking = (): void => {
+      cancelLive()
       if (thinkingAcc.trim()) {
         const secs = thinkingStart ? Math.max(1, Math.round((Date.now() - thinkingStart) / 1000)) : 0
         const tId = thinkingId
@@ -527,18 +570,18 @@ export function useChat(initialConfig: AppConfig, initialMessages?: Message[], i
           // transient retry notice so it doesn't linger above the prompt.
           if (ev.type !== 'retry' && retryRef.current) { retryRef.current = false; setRetry(null) }
           if (ev.type === 'thinking') {
-            if (!thinkingStart) thinkingStart = Date.now()
+            const first = !thinkingStart
+            if (first) thinkingStart = Date.now()
             thinkingAcc += ev.text
             outChars += ev.text.length
-            setThinking({ id: thinkingId, role: 'assistant', content: thinkingAcc, meta: { thinking: true } })
-            setLive({ dir: 'down', tokens: Math.round(outChars / 4), thinking: true })
+            if (first) pushLive(); else scheduleLive() // show the fold line at once, then coalesce
           }
           else if (ev.type === 'text') {
             flushThinking()
+            const first = !acc
             acc += ev.text
             outChars += ev.text.length
-            setStreaming({ ...base, content: acc })
-            setLive({ dir: 'down', tokens: Math.round(outChars / 4), thinking: false })
+            if (first) pushLive(); else scheduleLive()
           }
           else if (ev.type === 'tool_use') { flushThinking(); turnToolCalls++; flushText(); print(`● ${summarizeToolCall(ev.name, ev.input)}`, 'tool') }
           else if (ev.type === 'tool_result') {
@@ -571,10 +614,10 @@ export function useChat(initialConfig: AppConfig, initialMessages?: Message[], i
         }
       } else {
         for await (const chunk of provider.stream([...prior, userMsg], opts)) {
+          const first = !acc
           acc += chunk
           outChars += chunk.length
-          setStreaming({ ...base, content: acc })
-          setLive({ dir: 'down', tokens: Math.round(outChars / 4), thinking: false })
+          if (first) pushLive(); else scheduleLive()
         }
       }
     } catch (err) {

@@ -28,7 +28,7 @@ export function emptyStreamUsage(): StreamUsage { return { input: 0, output: 0, 
 // images reach the model; such a turn is kept even when its text is empty.
 export function toApiMessages(messages: Message[]): ApiMsg[] {
   return messages
-    .filter((m) => !m.meta?.folded
+    .filter((m) => !m.meta?.folded && !m.meta?.command
       && (m.role === 'user' || m.role === 'assistant' || m.meta?.compacted)
       && (m.content.trim() || (m.role === 'user' && !!m.meta?.attachments?.length)))
     .map((m) => {

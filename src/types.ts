@@ -33,6 +33,11 @@ export interface ImageAttachment {
 export interface MessageMeta {
   interrupted?: boolean
   error?: boolean
+  // A local slash command's input (the "/cmd" user turn) or its printed output.
+  // Holds the raw command text. Such messages stay VISIBLE in the transcript but
+  // are excluded from the model context and token accounting (toApiMessages /
+  // contextTokens skip them), like `folded` — so the model never tries to
+  // interpret a prior "/config" as a real request.
   command?: string
   // A reasoning ("thinking") block: rendered as a dim, collapsed summary
   // ("✻ Thought for Ns") above the answer. `thinkingSeconds` is how long the
