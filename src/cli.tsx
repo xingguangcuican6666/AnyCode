@@ -146,6 +146,13 @@ async function runInteractive(initial: AppConfig, resume?: { snapshot: SessionSn
     if (restored) return
     restored = true
     source.off('data', forward)
+    // Release the REAL stdin. Ink is handed `wrapped` (whose ref/unref are no-op
+    // proxies), so its unmount unref never reaches the real fd; and Node only
+    // auto-pauses a stream when its last 'readable' listener is removed, not on
+    // 'data' removal. Without this the raw TTY read handle stays ref'd and keeps
+    // the event loop alive — the process hangs after /exit until the user ^C's.
+    try { source.pause() } catch { /* ignore */ }
+    try { source.unref?.() } catch { /* ignore */ }
     process.stdout.write(KITTY_OFF + MOUSE_OFF + ALT_OFF)
   }
   // Always restore the terminal, even on a crash or signal — a stuck alternate
@@ -220,6 +227,12 @@ async function runInteractive(initial: AppConfig, resume?: { snapshot: SessionSn
       process.stdout.write(`\n${NAME} session ended · ${n} message${n === 1 ? '' : 's'}. Run \`meowcode\` to start again.\n`)
     }
   }
+  // Belt-and-suspenders: the finally above already flushed the final autosave and
+  // restored the terminal synchronously, so force the process to exit. This defends
+  // against any lingering handle (a still-running /monitor or background-shell child,
+  // a scheduled timer) that would otherwise keep the event loop alive and wedge the
+  // user's shell until they hit ctrl+c.
+  process.exit(0)
 }
 
 async function main(): Promise<void> {

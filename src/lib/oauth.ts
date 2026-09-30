@@ -87,8 +87,12 @@ export function resolveOAuthPort(): number {
 // so the user can open it manually if this silently fails).
 function openBrowser(url: string): void {
   const p = process.platform
-  const cmd = p === 'darwin' ? 'open' : p === 'win32' ? 'cmd' : 'xdg-open'
-  const args = p === 'win32' ? ['/c', 'start', '', url] : [url]
+  // win32: DO NOT use `cmd /c start` — cmd.exe re-parses its command line and treats
+  // '&' as a command separator, so an OAuth URL (…?a=1&b=2&…) gets truncated at the
+  // first '&' and every later query param is dropped. rundll32 is a plain executable
+  // (not a command interpreter), so the URL passes through verbatim as one argument.
+  const cmd = p === 'darwin' ? 'open' : p === 'win32' ? 'rundll32' : 'xdg-open'
+  const args = p === 'win32' ? ['url.dll,FileProtocolHandler', url] : [url]
   try {
     const child = spawn(cmd, args, { stdio: 'ignore', detached: true })
     // 唤起失败（如无 xdg-open）走的是异步 'error' 事件而非同步抛错；不挂监听器它会
@@ -210,6 +214,7 @@ export async function loginWithOAuth(params: {
   clientId: string
   port?: number
   onStatus?: (msg: string) => void
+  onAuthUrl?: (url: string) => void
   signal?: AbortSignal
 }): Promise<OAuthLoginResult> {
   const issuer = normalizeBase(params.baseUrl)
@@ -223,6 +228,10 @@ export async function loginWithOAuth(params: {
     response_type: 'code', client_id: params.clientId, redirect_uri: redirectUri,
     scope: OAUTH_SCOPE, state, nonce, code_challenge: challenge, code_challenge_method: 'S256',
   }).toString()
+
+  // Surface the raw URL so the overlay can offer a "copy link" key — mouse
+  // selection is unavailable while app-level mouse tracking is on.
+  params.onAuthUrl?.(authorizeUrl)
 
   let code: string
   try {

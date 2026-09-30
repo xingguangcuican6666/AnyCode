@@ -136,6 +136,10 @@ export interface Chat {
   // focus, so completed instances stop lingering at the bottom (see app.tsx).
   dropWorkflow: (id: string) => void
   dropAgent: (id: string) => void
+  // Rewind the conversation to just before the user turn `messageId`: drop that
+  // message and everything after it (the banner stays). Pairs with
+  // checkpoints.restoreToTimestamp for the code side — see the Rewind menu.
+  rewindTo: (messageId: string) => void
 }
 
 export function useChat(initialConfig: AppConfig, initialMessages?: Message[], initialUsage?: SessionUsage): Chat {
@@ -245,6 +249,17 @@ export function useChat(initialConfig: AppConfig, initialMessages?: Message[], i
     return cut
   }, [commitMessages, bumpUsage])
 
+  // Rewind the conversation to just before a user turn: drop that message and
+  // everything after it. The banner (index 0) is always preserved; a missing id
+  // or the banner itself is a no-op. The Rewind menu only opens while idle, so
+  // there is no in-flight stream to tear down here.
+  const rewindTo = useCallback((messageId: string): void => {
+    commitMessages((prev) => {
+      const i = prev.findIndex((m) => m.id === messageId)
+      return i <= 0 ? prev : prev.slice(0, i)
+    })
+  }, [commitMessages])
+
   const interrupt = useCallback(() => {
     // Streaming turn: abort the in-flight request (its controller). Background
     // work has its OWN controller, so a streaming interrupt leaves it running.
@@ -271,9 +286,13 @@ export function useChat(initialConfig: AppConfig, initialMessages?: Message[], i
     // model sees the referenced files without a read_file round-trip.
     const { text: shownText, attachments } = cmd ? { text, attachments: [] } : processImagePrompt(text, process.cwd())
     const injectedContext = cmd ? '' : expandMentions(shownText, process.cwd())
-    const meta: MessageMeta | undefined = attachments.length || injectedContext
-      ? { ...(attachments.length ? { attachments } : {}), ...(injectedContext ? { injectedContext } : {}) }
-      : undefined
+    // Stamp every user turn with its submit time so the Rewind menu can pair it
+    // with the file checkpoints captured during the turn.
+    const meta: MessageMeta = {
+      ...(attachments.length ? { attachments } : {}),
+      ...(injectedContext ? { injectedContext } : {}),
+      ts: Date.now(),
+    }
     const userMsg: Message = { id: nextId(), role: 'user', content: shownText, meta }
     commitMessages((prev) => [...prev, userMsg])
 
@@ -521,7 +540,7 @@ export function useChat(initialConfig: AppConfig, initialMessages?: Message[], i
             setStreaming({ ...base, content: acc })
             setLive({ dir: 'down', tokens: Math.round(outChars / 4), thinking: false })
           }
-          else if (ev.type === 'tool_use') { flushThinking(); turnToolCalls++; flushText(); print(`⏺ ${summarizeToolCall(ev.name, ev.input)}`, 'tool') }
+          else if (ev.type === 'tool_use') { flushThinking(); turnToolCalls++; flushText(); print(`● ${summarizeToolCall(ev.name, ev.input)}`, 'tool') }
           else if (ev.type === 'tool_result') {
             turnLinesAdded += ev.linesAdded ?? 0
             turnLinesRemoved += ev.linesRemoved ?? 0
@@ -571,7 +590,7 @@ export function useChat(initialConfig: AppConfig, initialMessages?: Message[], i
       commitMessages((prev) => [...prev, { id: assistantId, role: 'assistant', content: acc, meta }])
     }
     if (errorMsg && !interrupted) {
-      print(`⚠️ ${errorMsg}`, 'system', { error: true })
+      print(`⚠ ${errorMsg}`, 'system', { error: true })
     }
     // Per-turn completion footer at the bottom of the turn (like Claude Code's
     // "✻ Sautéed for 10m 10s · done 2:09"). Only when the turn actually produced a
@@ -657,5 +676,5 @@ export function useChat(initialConfig: AppConfig, initialMessages?: Message[], i
     }
   }, [status, commitMessages, setConfig, print, bumpUsage])
 
-  return { messages, streaming, thinking, live, retry, workflows, agents, bgPending, status, statusWord, config, usage, setConfig, print, foldContext, submit, interrupt, dropWorkflow, dropAgent }
+  return { messages, streaming, thinking, live, retry, workflows, agents, bgPending, status, statusWord, config, usage, setConfig, print, foldContext, submit, interrupt, dropWorkflow, dropAgent, rewindTo }
 }

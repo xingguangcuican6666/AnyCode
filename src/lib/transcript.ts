@@ -114,8 +114,10 @@ const baseName = (p: string): string => p.replace(/\/+$/, '').split('/').pop() |
 const firstWord = (s: string): string => s.trim().split(/\s+/)[0] || s.trim()
 const abbrevPath = (p: string): string => p.replace(os.homedir(), '~')
 const cap = (s: string): string => (s ? s.charAt(0).toUpperCase() + s.slice(1) : s)
-// A tool header is "⏺ <name> · <arg>"; pull the pieces back out.
-const toolNameFromHeader = (c: string): string => c.replace(/^⏺\s*/, '').split(' · ')[0].trim()
+// A tool header is "● <name> · <arg>"; pull the pieces back out. Accept the old
+// U+23FA "⏺" marker too so tool headers in transcripts saved before the switch
+// to the text-presentation U+25CF "●" still parse.
+const toolNameFromHeader = (c: string): string => c.replace(/^[●⏺]\s*/, '').split(' · ')[0].trim()
 const argFromHeader = (c: string): string => { const i = c.indexOf(' · '); return i < 0 ? '' : c.slice(i + 3).trim() }
 
 
@@ -150,7 +152,7 @@ export function flattenMessages(messages: Message[], width: number, opts?: Flatt
     if (m.role === 'system' && m.content === '__banner__') { items.push({ kind: 'banner' }); continue }
     if (m.role === 'system' && m.meta?.compacted) { items.push({ kind: 'compact', id: m.id, m }); continue }
     if (m.meta?.thinking) { items.push({ kind: 'think', id: m.id, m }); continue }
-    if (m.role === 'tool' && m.content.startsWith('⏺')) {
+    if (m.role === 'tool' && (m.content.startsWith('●') || m.content.startsWith('⏺'))) {
       const next = messages[k + 1]
       let result: Message | undefined
       if (next && next.role === 'tool' && next.content.startsWith('⎿')) { result = next; k++ }
@@ -403,7 +405,7 @@ export function messagesFromEvents(events: AgentEvent[]): Message[] {
     if (ev.type === 'text') acc += ev.text
     else if (ev.type === 'tool_use') {
       flush()
-      out.push({ id: `ev-t${n++}`, role: 'tool', content: `⏺ ${summarizeToolCall(ev.name, ev.input)}` })
+      out.push({ id: `ev-t${n++}`, role: 'tool', content: `● ${summarizeToolCall(ev.name, ev.input)}` })
     } else if (ev.type === 'tool_result') {
       if (ev.diff && ev.diff.length && !ev.isError) {
         out.push({ id: `ev-r${n++}`, role: 'tool', content: `⎿ ${changeSummary(ev.linesAdded ?? 0, ev.linesRemoved ?? 0)}`, meta: { diff: ev.diff } })
@@ -412,7 +414,7 @@ export function messagesFromEvents(events: AgentEvent[]): Message[] {
       }
     } else if (ev.type === 'error') {
       flush()
-      out.push({ id: `ev-e${n++}`, role: 'system', content: `⚠️ ${ev.message}`, meta: { error: true } })
+      out.push({ id: `ev-e${n++}`, role: 'system', content: `⚠ ${ev.message}`, meta: { error: true } })
     }
   }
   flush()
@@ -425,5 +427,5 @@ function toolResultBlock(content: string, isError?: boolean): string {
   const shown = lines.slice(0, 12)
   const more = lines.length - shown.length
   const body = shown.join('\n') + (more > 0 ? `\n… (+${more} more lines)` : '')
-  return (isError ? '⎿ ⚠️ ' : '⎿ ') + body.split('\n').join('\n   ')
+  return (isError ? '⎿ ⚠ ' : '⎿ ') + body.split('\n').join('\n   ')
 }

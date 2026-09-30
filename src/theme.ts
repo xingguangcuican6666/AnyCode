@@ -218,7 +218,7 @@ export const colors: ThemeColors = themes[DEFAULT_THEME].colors
 
 export const symbols = {
   userPrompt: '>',
-  assistant: '⏺',
+  assistant: '●',
   toolResult: '⎿',
   star: '✻',
   bullet: '•',

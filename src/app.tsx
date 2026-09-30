@@ -8,6 +8,7 @@ import { ThemePicker } from './components/ThemePicker'
 import { ModelPicker } from './components/ModelPicker'
 import { LoginPanel } from './components/LoginPanel'
 import { SessionPicker } from './components/SessionPicker'
+import { RewindMenu } from './components/RewindMenu'
 import { AutoCompactPicker, type AutoCompactChoice } from './components/AutoCompactPicker'
 import { EffortPicker, type EffortChoice } from './components/EffortPicker'
 import { PermissionDialog, type PermissionChoice } from './components/PermissionDialog'
@@ -49,6 +50,7 @@ import { setGoal } from './lib/memory'
 import { setScheduleSink, clearJobs } from './lib/scheduler'
 import { setMonitorSink, clearMonitors } from './lib/monitor'
 import { clearBgShells } from './lib/bgshell'
+import { restoreToTimestamp, clearCheckpoints } from './lib/checkpoints'
 import { startMcpServers, stopMcpServers } from './lib/mcp'
 import { judgeGoal } from './lib/goalJudge'
 import { formatInterval, formatLoop, formatGoal, type ActiveLoop, type ActiveGoal } from './app-helpers'
@@ -126,6 +128,10 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume,
   // The /resume session picker overlay (opened by /resume). Lists saved sessions;
   // selecting one remounts the app seeded with that transcript (see onResume).
   const [resumeOpen, setResumeOpen] = useState(false)
+  // The Rewind menu overlay (opened by double-Esc while idle). Lists earlier user
+  // turns; picking one restores the conversation to before it, plus the code when
+  // this session captured checkpoints (see RewindMenu + lib/checkpoints).
+  const [rewindOpen, setRewindOpen] = useState(false)
   // The /autocompact window picker overlay (opened by bare /autocompact). Chooses
   // when auto-compaction fires (off / auto / an explicit token window).
   const [autoCompactOpen, setAutoCompactOpen] = useState(false)
@@ -199,6 +205,8 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume,
   // Lines the user submitted while a response was streaming; flushed when idle.
   const [queued, setQueued] = useState<string[]>([])
   const exitTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  // Timestamp of the last idle Esc, so a second Esc within 500ms opens Rewind.
+  const lastEscRef = useRef(0)
   // Refs so the idle driver always reads the live chat/loop/goal without re-subscribing.
   const chatRef = useRef(chat); chatRef.current = chat
   // Mirrors `queued` so the mid-turn interjection drain (takePending) and ↑-recall
@@ -527,7 +535,7 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume,
 
   // A modal overlay (theme picker / settings / workflow tree) replaces the whole
   // content area — you operate it rather than read the transcript behind it.
-  const modalOpen = pickerOpen || modelOpen || loginOpen || resumeOpen || autoCompactOpen || !!panel || !!expandedWf
+  const modalOpen = pickerOpen || modelOpen || loginOpen || resumeOpen || rewindOpen || autoCompactOpen || !!panel || !!expandedWf
   modalOpenRef.current = modalOpen
   // Any open dialog/overlay that the `dialogExpiry` idle-timer governs (the
   // inline /effort picker included, but NOT the permission prompt — that has its
@@ -857,6 +865,7 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume,
     if (secs <= 0 || !anyDialogOpen) return
     const id = setTimeout(() => {
       setPickerOpen(false); setModelOpen(false); setLoginOpen(false); setResumeOpen(false)
+      setRewindOpen(false)
       setAutoCompactOpen(false); setEffortOpen(false); setPanel(null); setWfExpanded(null)
     }, secs * 1000)
     return () => clearTimeout(id)
@@ -1199,6 +1208,18 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume,
       chat.interrupt()
       return
     }
+    // Double-Esc while idle opens the Rewind menu. A single Esc that reaches here
+    // is otherwise a no-op — every earlier Esc consumer (goal/selection/scroll/
+    // interrupt/background) has already returned. Excluded in vim mode, where Esc
+    // means insert→normal in the input box.
+    if (key.escape && !streaming && !modalOpen && !goalRef.current
+        && scrollTopRef.current === null && !hasSelection && !chat.bgPending
+        && String(getSetting(chat.config.settings, 'editorMode') || '') !== 'vim') {
+      const now = Date.now()
+      if (now - lastEscRef.current < 500) { lastEscRef.current = 0; setRewindOpen(true); return }
+      lastEscRef.current = now
+      return
+    }
     if (key.ctrl && input === 'c') {
       // With an active text selection, ctrl+c COPIES it (like a terminal) rather
       // than interrupting the turn or arming exit — the highlight is the user's
@@ -1228,7 +1249,7 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume,
     exit,
     // A brand-new session drops every session-scoped timer too: pending scheduled
     // jobs and running monitors belong to the old conversation, not the new one.
-    clear: () => { clearJobs(); clearMonitors(); clearBgShells(); onClear(chatRef.current.config) },
+    clear: () => { clearJobs(); clearMonitors(); clearBgShells(); clearCheckpoints(); onClear(chatRef.current.config) },
     // /fork: branch the live conversation — freeze the original on disk and keep
     // going in a fresh session file (see cli.tsx onFork). No timers are cleared:
     // the fork continues the same conversation, so its scheduled jobs/monitors
@@ -1418,10 +1439,10 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume,
   useEffect(() => {
     setScheduleSink((payload, meta) => {
       const tag = meta.kind === 'interval' ? `${meta.label} · fire ${meta.fires}` : meta.label
-      setQueued((q) => [...q, `⏰ [scheduled: ${tag}]\n${payload}`])
+      setQueued((q) => [...q, `[scheduled: ${tag}]\n${payload}`])
     })
     setMonitorSink((lines, meta) => {
-      const head = `👁 [monitor · ${meta.description}${meta.done ? ' · ended' : ''}]`
+      const head = `[monitor · ${meta.description}${meta.done ? ' · ended' : ''}]`
       setQueued((q) => [...q, `${head}\n${lines.join('\n')}`])
     })
     return () => { setScheduleSink(null); setMonitorSink(null) }
@@ -1474,6 +1495,23 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume,
                   else chat.print('无法加载该会话（可能已被删除或损坏）。', 'system', { error: true })
                 }}
                 onCancel={() => setResumeOpen(false)}
+              />
+            ) : rewindOpen ? (
+              <RewindMenu
+                width={width}
+                rows={dims.rows}
+                messages={chat.messages}
+                onSelect={(id) => {
+                  // Restore code first (files touched since that turn), then truncate
+                  // the conversation to before it, then note what happened.
+                  const m = chat.messages.find((x) => x.id === id)
+                  const ts = m?.meta?.ts
+                  const restored = ts ? restoreToTimestamp(ts).filter((r) => r.ok).length : 0
+                  chat.rewindTo(id)
+                  setRewindOpen(false)
+                  chat.print(restored > 0 ? t('rewind.doneBoth', { n: restored }) : t('rewind.doneConv'), 'system')
+                }}
+                onCancel={() => setRewindOpen(false)}
               />
             ) : autoCompactOpen ? (
               <AutoCompactPicker
@@ -1611,7 +1649,7 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume,
               </Box>
             ) : loop ? (
               <Box paddingLeft={1}>
-                <Text color={colors.accentBright}>🔁 {formatLoop(loop)}</Text>
+                <Text color={colors.accentBright}>{formatLoop(loop)}</Text>
               </Box>
             ) : null}
 

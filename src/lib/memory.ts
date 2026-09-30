@@ -61,28 +61,62 @@ function migrateNotes(notes: unknown[]): void {
     if (typeof n !== 'string' || !n.trim()) continue
     const body = n.trim()
     const description = body.length > 72 ? body.slice(0, 69).replace(/\s+\S*$/, '') + '…' : body
-    saveMemoryEntry({ name: '', description, type: 'reference', body })
+    saveMemoryEntry({ name: '', description, type: 'reference', body, scope: 'global' })
   }
 }
 
 // --- The structured memory store: one Markdown file per fact + an index. ---
+// Two scopes, mirroring Claude Code: a GLOBAL store shared across every project
+// (the user's identity/preferences), and a per-PROJECT (workspace) store keyed by
+// the working directory, so a project's facts don't leak into unrelated sessions.
+// Both live under ~/.anycode (never in the repo): global at ~/.anycode/memory/,
+// project at ~/.anycode/projects/<cwd-slug>/memory/. Each scope has its own
+// MEMORY.md index. Saves default to the current workspace.
 export type MemoryType = 'user' | 'feedback' | 'project' | 'reference'
 export const MEMORY_TYPES: readonly MemoryType[] = ['user', 'feedback', 'project', 'reference']
+
+export type MemoryScope = 'global' | 'project'
+export const MEMORY_SCOPES: readonly MemoryScope[] = ['global', 'project']
 
 export interface MemoryEntry {
   name: string          // kebab-case slug; also the file stem
   description: string   // one line; used for recall relevance in the index
   type: MemoryType
+  scope: MemoryScope    // which store it lives in (derived from its directory)
   body: string          // the fact itself (Markdown)
   created: string
   modified: string
 }
 
-export const MEMORY_DIR = path.join(os.homedir(), '.anycode', 'memory')
+const ANYCODE_DIR = path.join(os.homedir(), '.anycode')
+
+// The global store, shared across every project.
+export const MEMORY_DIR = path.join(ANYCODE_DIR, 'memory')
+// Back-compat: the global index path (scope-aware callers use indexFile()).
 export const MEMORY_INDEX = path.join(MEMORY_DIR, 'MEMORY.md')
+
+// Key project memory by cwd the way Claude Code does: path separators (and ':' on
+// Windows) collapse to '-', so /home/u/app → -home-u-app. The workspace store thus
+// follows the directory you're working in.
+function projectSlug(): string {
+  return process.cwd().replace(/[/\\:]+/g, '-').replace(/^-+|-+$/g, '') || 'root'
+}
+
+// The directory backing a given scope.
+export function memoryDir(scope: MemoryScope): string {
+  return scope === 'global' ? MEMORY_DIR : path.join(ANYCODE_DIR, 'projects', projectSlug(), 'memory')
+}
+
+function indexFile(scope: MemoryScope): string {
+  return path.join(memoryDir(scope), 'MEMORY.md')
+}
 
 function isType(v: string): v is MemoryType {
   return (MEMORY_TYPES as readonly string[]).includes(v)
+}
+
+export function isScope(v: string): v is MemoryScope {
+  return (MEMORY_SCOPES as readonly string[]).includes(v)
 }
 
 export function slugify(s: string): string {
@@ -101,22 +135,39 @@ function hash(s: string): number {
   return h
 }
 
-function fileFor(name: string): string {
-  return path.join(MEMORY_DIR, `${name}.md`)
+function fileFor(name: string, scope: MemoryScope): string {
+  return path.join(memoryDir(scope), `${name}.md`)
 }
 
-// Serialize an entry to `---frontmatter---\n\nbody`. Front-matter values are kept
-// single-line (the flat parser in lib/frontmatter can't do multi-line YAML), so
-// description newlines collapse to spaces; the body keeps its Markdown intact.
+// Pull the `[[other-memory]]` link targets out of a body (normalized to slugs), so
+// a read can surface which related memories a fact points to. Mirrors Claude Code's
+// convention of linking related memories with [[their-name]].
+export function extractLinks(body: string): string[] {
+  const out = new Set<string>()
+  const re = /\[\[([^\]]+)\]\]/g
+  let m: RegExpExecArray | null
+  while ((m = re.exec(body)) !== null) {
+    const slug = slugify(m[1])
+    if (slug) out.add(slug)
+  }
+  return [...out]
+}
+
+// Serialize an entry to `---frontmatter---\n\nbody`, matching Claude Code's shape:
+// top-level `name`/`description`, then a nested `metadata:` block. Values are kept
+// single-line (lib/frontmatter reads keys leniently by trimming each line, so the
+// indented metadata leaves still parse); description newlines collapse to spaces.
+// The body keeps its Markdown, including any `[[other-memory]]` links, intact.
 function serialize(e: MemoryEntry): string {
   const oneLine = (s: string): string => s.replace(/\s*\n\s*/g, ' ').trim()
   const fm = [
     '---',
     `name: ${e.name}`,
     `description: ${oneLine(e.description)}`,
-    `type: ${e.type}`,
-    `created: ${e.created}`,
-    `modified: ${e.modified}`,
+    'metadata:',
+    `  type: ${e.type}`,
+    `  created: ${e.created}`,
+    `  modified: ${e.modified}`,
     '---',
     '',
     e.body.trim(),
@@ -125,7 +176,7 @@ function serialize(e: MemoryEntry): string {
   return fm.join('\n')
 }
 
-function readEntry(file: string): MemoryEntry | null {
+function readEntry(file: string, scope: MemoryScope): MemoryEntry | null {
   try {
     const { meta, body } = parseFrontmatter(fs.readFileSync(file, 'utf8'))
     const name = meta.name || path.basename(file, '.md')
@@ -134,6 +185,7 @@ function readEntry(file: string): MemoryEntry | null {
       name,
       description: meta.description || name,
       type,
+      scope,
       body,
       created: meta.created || '',
       modified: meta.modified || meta.created || '',
@@ -143,20 +195,30 @@ function readEntry(file: string): MemoryEntry | null {
   }
 }
 
-/** All stored memories, newest-modified first. */
-export function listMemories(): MemoryEntry[] {
+/** Memories in one scope, newest-modified first. Defaults to the workspace store. */
+export function listMemories(scope: MemoryScope = 'project'): MemoryEntry[] {
+  const dir = memoryDir(scope)
   let files: string[]
   try {
-    files = fs.readdirSync(MEMORY_DIR).filter((f) => f.endsWith('.md') && f !== 'MEMORY.md')
+    files = fs.readdirSync(dir).filter((f) => f.endsWith('.md') && f !== 'MEMORY.md')
   } catch {
     return [] // no memory dir yet
   }
-  const entries = files.map((f) => readEntry(path.join(MEMORY_DIR, f))).filter((e): e is MemoryEntry => e !== null)
+  const entries = files.map((f) => readEntry(path.join(dir, f), scope)).filter((e): e is MemoryEntry => e !== null)
   return entries.sort((a, b) => (b.modified || '').localeCompare(a.modified || ''))
 }
 
-export function getMemory(name: string): MemoryEntry | null {
-  return readEntry(fileFor(slugify(name)))
+/** Every memory across both scopes — project (workspace) first, then global. */
+export function listAllMemories(): MemoryEntry[] {
+  return [...listMemories('project'), ...listMemories('global')]
+}
+
+// Look up a memory by name. With an explicit scope, only that store is searched;
+// otherwise the workspace store shadows the global one (project first, then global).
+export function getMemory(name: string, scope?: MemoryScope): MemoryEntry | null {
+  const slug = slugify(name)
+  if (scope) return readEntry(fileFor(slug, scope), scope)
+  return readEntry(fileFor(slug, 'project'), 'project') || readEntry(fileFor(slug, 'global'), 'global')
 }
 
 /**
@@ -164,43 +226,53 @@ export function getMemory(name: string): MemoryEntry | null {
  * entry with the resolved name exists its `created` is preserved. Rewrites the
  * MEMORY.md index. Best-effort — a write failure never throws.
  */
-export function saveMemoryEntry(input: { name?: string; description: string; type?: MemoryType; body: string }): MemoryEntry | null {
+export function saveMemoryEntry(input: { name?: string; description: string; type?: MemoryType; body: string; scope?: MemoryScope }): MemoryEntry | null {
+  const scope: MemoryScope = input.scope && isScope(input.scope) ? input.scope : 'project'
   const now = new Date().toISOString()
   const name = slugify(input.name?.trim() || input.description)
-  const existing = readEntry(fileFor(name))
+  const existing = readEntry(fileFor(name, scope), scope)
   const entry: MemoryEntry = {
     name,
     description: input.description.trim() || name,
     type: input.type && isType(input.type) ? input.type : existing?.type ?? 'reference',
+    scope,
     body: input.body.trim(),
     created: existing?.created || now,
     modified: now,
   }
   try {
-    fs.mkdirSync(MEMORY_DIR, { recursive: true })
-    fs.writeFileSync(fileFor(name), serialize(entry))
-    writeIndex()
+    fs.mkdirSync(memoryDir(scope), { recursive: true })
+    fs.writeFileSync(fileFor(name, scope), serialize(entry))
+    writeIndex(scope)
     return entry
   } catch {
     return null
   }
 }
 
-export function deleteMemory(name: string): boolean {
+// Delete a memory. With an explicit scope, only that store is touched; otherwise
+// the workspace store is tried first, then global (first hit wins).
+export function deleteMemory(name: string, scope?: MemoryScope): boolean {
   const slug = slugify(name)
-  try {
-    fs.rmSync(fileFor(slug))
-    writeIndex()
-    return true
-  } catch {
-    return false
+  const scopes: MemoryScope[] = scope ? [scope] : ['project', 'global']
+  for (const s of scopes) {
+    try {
+      if (fs.existsSync(fileFor(slug, s))) {
+        fs.rmSync(fileFor(slug, s))
+        writeIndex(s)
+        return true
+      }
+    } catch {
+      // try the next scope
+    }
   }
+  return false
 }
 
-/** Regenerate MEMORY.md — one line per memory, grouped by type. */
-export function writeIndex(): void {
-  const entries = listMemories()
-  const lines: string[] = ['# MeowCode memory index', '']
+/** Regenerate one scope's MEMORY.md — one line per memory, grouped by type. */
+export function writeIndex(scope: MemoryScope): void {
+  const entries = listMemories(scope)
+  const lines: string[] = [`# MeowCode memory index (${scope})`, '']
   if (entries.length === 0) {
     lines.push('_(empty)_')
   } else {
@@ -213,43 +285,50 @@ export function writeIndex(): void {
     }
   }
   try {
-    fs.mkdirSync(MEMORY_DIR, { recursive: true })
-    fs.writeFileSync(MEMORY_INDEX, lines.join('\n') + '\n')
+    fs.mkdirSync(memoryDir(scope), { recursive: true })
+    fs.writeFileSync(indexFile(scope), lines.join('\n') + '\n')
   } catch {
     // best-effort
   }
 }
 
-/** Compact index text (grouped `name — description`) for the system preamble. */
+/** Compact index text for the system preamble — workspace memories first, then
+ *  global, each line tagged with its type so the model knows what it can recall. */
 export function memoryIndexText(): string {
-  const entries = listMemories()
-  if (entries.length === 0) return ''
-  const lines: string[] = []
-  for (const type of MEMORY_TYPES) {
-    const group = entries.filter((e) => e.type === type)
-    if (group.length === 0) continue
-    lines.push(`[${type}]`)
-    for (const e of group) lines.push(`- ${e.name} — ${e.description}`)
+  const sections: string[] = []
+  for (const scope of MEMORY_SCOPES.slice().reverse()) { // project first, then global
+    const entries = listMemories(scope)
+    if (entries.length === 0) continue
+    const lines: string[] = [scope === 'project' ? '[workspace memory]' : '[global memory]']
+    for (const type of MEMORY_TYPES) {
+      for (const e of entries.filter((x) => x.type === type)) lines.push(`- ${e.name} (${type}) — ${e.description}`)
+    }
+    sections.push(lines.join('\n'))
   }
-  return lines.join('\n')
+  return sections.join('\n')
 }
 
 /** Human-readable listing for the /memory command. */
 export function formatMemoryList(): string {
-  const entries = listMemories()
   const lines: string[] = ['**Memory** — cross-session facts', '']
-  if (entries.length === 0) {
+  const all = listAllMemories()
+  if (all.length === 0) {
     lines.push('_(no memories yet — the agent saves them as it learns, or add one with `/memory save`)_')
     return lines.join('\n')
   }
-  for (const type of MEMORY_TYPES) {
-    const group = entries.filter((e) => e.type === type)
-    if (group.length === 0) continue
-    lines.push(`**${type}**`)
-    for (const e of group) lines.push(`- \`${e.name}\` — ${e.description}`)
+  for (const scope of MEMORY_SCOPES.slice().reverse()) { // workspace first, then global
+    const entries = listMemories(scope)
+    if (entries.length === 0) continue
+    lines.push(`**${scope === 'project' ? 'workspace' : 'global'}** _(${memoryDir(scope)})_`)
+    for (const type of MEMORY_TYPES) {
+      const group = entries.filter((e) => e.type === type)
+      if (group.length === 0) continue
+      lines.push(`  _${type}_`)
+      for (const e of group) lines.push(`  - \`${e.name}\` — ${e.description}`)
+    }
     lines.push('')
   }
-  lines.push(`_${entries.length} mem${entries.length === 1 ? 'ory' : 'ories'} · ${MEMORY_DIR}_`)
+  lines.push(`_${all.length} mem${all.length === 1 ? 'ory' : 'ories'} across workspace + global_`)
   return lines.join('\n')
 }
 
@@ -271,11 +350,11 @@ export function standingPreamble(): string | undefined {
     parts.push(
       'You have a persistent cross-session memory. Facts you have saved (read the full text of any with the `memory` tool, action "read"):\n' +
         index +
-        '\n\nRecall the relevant ones before acting. As you learn durable, non-obvious facts — the user\'s preferences and identity (user), corrections and confirmed working approaches (feedback), ongoing goals and constraints (project), useful pointers (reference) — save them with the `memory` tool (action "save"). Do not save what the repo or git history already records, or what only matters to this one turn.',
+        '\n\nMemory has two scopes: [workspace memory] is specific to this project (the current directory); [global memory] applies across every project. Recall the relevant ones before acting. As you learn durable, non-obvious facts — the user\'s preferences and identity (user), corrections and confirmed working approaches (feedback), ongoing goals and constraints (project), useful pointers (reference) — save them with the `memory` tool (action "save"). Saves default to this workspace; pass scope:"global" only for facts that hold across all projects (e.g. the user\'s identity or universal preferences). Link related memories inline with [[their-name]]. Do not save what the repo or git history already records, or what only matters to this one turn.',
     )
   } else {
     parts.push(
-      'You have a persistent cross-session memory (currently empty). As you learn durable, non-obvious facts — user preferences/identity, corrections and confirmed approaches, ongoing constraints, useful pointers — save them with the `memory` tool (action "save") so future sessions keep them.',
+      'You have a persistent cross-session memory (currently empty), with two scopes: a per-project workspace store (the default) and a cross-project global store (pass scope:"global"). As you learn durable, non-obvious facts — user preferences/identity, corrections and confirmed approaches, ongoing constraints, useful pointers — save them with the `memory` tool (action "save") so future sessions keep them.',
     )
   }
   return parts.length ? parts.join('\n\n') : undefined

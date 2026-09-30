@@ -14,7 +14,7 @@ import {
 } from '../lib/settings'
 import { contextState, contextLevel, fmtTokens, fmtDuration, bar } from '../lib/usage'
 import { fmtUsd } from '../lib/pricing'
-import { listMemories } from '../lib/memory'
+import { listAllMemories } from '../lib/memory'
 import { loadSkills } from '../lib/skills'
 import { loadUserCommands } from '../lib/userCommands'
 import { StatsView, type StatsSub } from './StatsView'
@@ -138,7 +138,7 @@ function editSeed(row: Row, config: AppConfig): string {
 function statusLines(config: AppConfig, usage: SessionUsage, messages: Message[], goal: string, loop: string, t: Tr): string[] {
   const ctx = contextState(messages, config.model)
   const pct = Math.round(ctx.ratio * 100)
-  const memCount = listMemories().length
+  const memCount = listAllMemories().length
   const skills = loadSkills()
   const custom = loadUserCommands()
   // Pad the label column by display width (not string length) so zh labels align
@@ -544,7 +544,7 @@ export function SettingsPanel(props: Props): React.ReactElement {
       {editable ? (
         <Box flexDirection="column">
           <Text color={focus === 'search' ? colors.accentBright : colors.dim} wrap="truncate">
-            {'🔍 '}
+            {focus === 'search' ? '❯ ' : '  '}
             {search
               ? <Text color={colors.text}>{search}</Text>
               : <Text color={colors.dim}>{tab === 'config' ? t('panel.searchSettings') : t('panel.searchOptions')}</Text>}

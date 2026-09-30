@@ -2,7 +2,7 @@ import type { CommandContext, SlashCommand } from '../types'
 import { providerIds } from '../providers'
 import { VERSION, NAME } from '../version'
 import { themes, themeList, DEFAULT_THEME } from '../theme'
-import { loadMemory, setGoal, listMemories, getMemory, saveMemoryEntry, deleteMemory, formatMemoryList, MEMORY_TYPES, type MemoryType } from '../lib/memory'
+import { loadMemory, setGoal, listAllMemories, getMemory, saveMemoryEntry, deleteMemory, formatMemoryList, MEMORY_TYPES, type MemoryType, type MemoryScope } from '../lib/memory'
 import { contextState, contextLevel, contextLimit, fmtTokens, bar, emptyUsage } from '../lib/usage'
 import { refreshModelDb } from '../lib/modelDb'
 import { loadSkills, expandArgs } from '../lib/skills'
@@ -318,7 +318,7 @@ const status: SlashCommand = {
         t('cmd.statusSession', { turns: u.turns, tokens: fmtTokens(u.inputTokens + u.outputTokens), toolCalls: u.toolCalls, compactions: u.compactions }),
         t('cmd.statusGoal', { goal: goalLine }),
         t('cmd.statusLoop', { loop: loopLine }),
-        t('cmd.statusNotes', { notes: listMemories().length, skills: skills.length, custom: custom.length }),
+        t('cmd.statusNotes', { notes: listAllMemories().length, skills: skills.length, custom: custom.length }),
       ].join('\n'),
       'system',
     )
@@ -938,15 +938,22 @@ const memory: SlashCommand = {
     switch (sub) {
       case 'save':
       case 'add': {
-        // /memory save [type] <description> :: <body>  — or just <text> (reference).
+        // /memory save [global|workspace] [type] <description> :: <body>
+        //   — or just <text> (reference, saved to the workspace by default).
         if (!body) { ctx.print(t('cmd.memoryAddUsage'), 'system', { error: true }); return }
         let rest2 = body
+        let scope: MemoryScope | undefined
+        const maybeScope = rest2.split(/\s+/)[0].toLowerCase()
+        if (maybeScope === 'global' || maybeScope === 'workspace' || maybeScope === 'project') {
+          scope = maybeScope === 'global' ? 'global' : 'project'
+          rest2 = rest2.slice(rest2.split(/\s+/)[0].length).trim()
+        }
         let type: MemoryType = 'reference'
         const maybeType = rest2.split(/\s+/)[0]
         if ((MEMORY_TYPES as readonly string[]).includes(maybeType)) { type = maybeType as MemoryType; rest2 = rest2.slice(maybeType.length).trim() }
         const [desc, fact] = rest2.includes('::') ? rest2.split('::', 2).map((s) => s.trim()) : [rest2, rest2]
         if (!desc) { ctx.print(t('cmd.memoryAddUsage'), 'system', { error: true }); return }
-        const saved = saveMemoryEntry({ description: desc, type, body: fact })
+        const saved = saveMemoryEntry({ description: desc, type, body: fact, scope })
         if (!saved) { ctx.print(t('cmd.memorySaveFailed'), 'system', { error: true }); return }
         ctx.print(t('cmd.memorySaved', { name: saved.name, type: saved.type }), 'system')
         return

@@ -71,6 +71,10 @@ export interface MessageMeta {
   // `@path` tokens; this block is appended to the text the model receives so it
   // sees the referenced files without a read_file round-trip.
   injectedContext?: string
+  // Epoch ms when a USER turn was submitted. Pairs the turn with the file
+  // checkpoints captured during it (lib/checkpoints), so the Rewind menu can
+  // restore the code as it was just before this turn. UI-only; not sent to the API.
+  ts?: number
 }
 
 export interface Message {

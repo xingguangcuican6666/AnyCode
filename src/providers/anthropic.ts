@@ -75,7 +75,7 @@ function resolveKey(opts: AnthropicOpts): string | undefined {
 function keyHint(opts: AnthropicOpts): string {
   if (opts.noKeyHint) return opts.noKeyHint
   const envName = opts.apiKeyEnv || 'ANTHROPIC_API_KEY'
-  return `⚠️  No \`${envName}\` found. Set it, or run \`/provider mock\` for the offline demo.`
+  return `⚠ No \`${envName}\` found. Set it, or run \`/provider mock\` for the offline demo.`
 }
 
 // A bearer-auth provider (new-api relay) sends `Authorization: Bearer <key>`;
@@ -239,7 +239,7 @@ function traceReport(trace: string[], steps: number): string {
   if (trace.length === 0) return `子代理已结束，但未产出书面总结，也没有可追溯的工具调用（共 ${steps} 步）。`
   const lines = trace.slice(0, 30).map((t, i) => `${i + 1}. ${t}`)
   const more = trace.length > 30 ? `\n… 另有 ${trace.length - 30} 次工具调用未列出` : ''
-  return `⚠️ 子代理未自行撰写总结；以下为其 ${steps} 次工具调用的操作轨迹（系统自动汇总）：\n${lines.join('\n')}${more}`
+  return `⚠ 子代理未自行撰写总结；以下为其 ${steps} 次工具调用的操作轨迹（系统自动汇总）：\n${lines.join('\n')}${more}`
 }
 
 // exit_plan_mode approval. Called by the top-level tool loop (below) instead of
@@ -681,7 +681,7 @@ export function makeAnthropicProvider(cfg: AnthropicOpts): Provider {
     async *stream(messages: Message[], opts: StreamOpts) {
       for await (const ev of agent(messages, opts, cfg)) {
         if (ev.type === 'text') yield ev.text
-        else if (ev.type === 'error') yield `⚠️  ${ev.message}`
+        else if (ev.type === 'error') yield `⚠ ${ev.message}`
       }
     },
   }

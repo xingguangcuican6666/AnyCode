@@ -58,3 +58,24 @@ export function restoreCheckpoint(id: number): RestoreResult {
     return { ok: false, path: cp.path, error: (e as Error).message }
   }
 }
+
+// Distinct file paths touched at/after `ts` — drives the Rewind menu's per-turn
+// code-scope label ("No code changes" vs "N files").
+export function changedPathsSince(ts: number): string[] {
+  return [...new Set(store.filter((c) => c.ts >= ts).map((c) => c.path))]
+}
+
+// Restore every file to its state just BEFORE the turn at `ts`: for each path
+// touched at/after `ts`, take its EARLIEST such checkpoint (whose `before` is the
+// content before that turn's first edit) and write it back (or delete a file that
+// didn't exist yet). Returns one RestoreResult per path. Used by the Rewind menu.
+export function restoreToTimestamp(ts: number): RestoreResult[] {
+  const earliest = new Map<string, Checkpoint>()
+  for (const c of store) {
+    if (c.ts < ts) continue
+    if (!earliest.has(c.path)) earliest.set(c.path, c)
+  }
+  const out: RestoreResult[] = []
+  for (const cp of earliest.values()) out.push(restoreCheckpoint(cp.id))
+  return out
+}

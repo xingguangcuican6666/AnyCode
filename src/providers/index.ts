@@ -10,7 +10,7 @@ import { resolveRelayToken, refreshRelayToken } from '../lib/oauth'
 // just explains itself. Cost accounting elsewhere still uses official rates
 // (see lib/pricing), so the price source is likewise a stub until wired.
 const STUB_MSG =
-  '⚠️  The default MeowCode provider is a stub — not connected yet. Use `/provider anthropic` ' +
+  '⚠ The default MeowCode provider is a stub — not connected yet. Use `/provider anthropic` ' +
   'with an `ANTHROPIC_API_KEY`, add a custom Anthropic-protocol provider, or `/provider mock` for the offline demo.'
 
 const defaultProvider: Provider = {
@@ -33,7 +33,7 @@ const newapiProvider: Provider = makeAnthropicProvider({
   resolveKeyAsync: () => resolveRelayToken(),
   refreshKey: () => refreshRelayToken(),
   auth: 'bearer',
-  noKeyHint: '⚠️  Not logged in to MeowArch API. Run `/login` to sign in, or `/provider mock` for the offline demo.',
+  noKeyHint: '⚠ Not logged in to MeowArch API. Run `/login` to sign in, or `/provider mock` for the offline demo.',
 })
 
 // Built-in providers, always available regardless of config.

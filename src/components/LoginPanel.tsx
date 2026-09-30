@@ -4,6 +4,7 @@ import { Box, Text, useInput, useStdin } from 'ink'
 import { useTheme } from '../theme'
 import { login, submit2FA, fetchRelayKey, normalizeBase, resolveNewapiBase } from '../lib/newapi'
 import { loginWithOAuth, resolveOAuthClientId } from '../lib/oauth'
+import { copyToClipboard } from '../lib/clipboard'
 import { saveCredentials, loadCredentials, type PanelSession, type OAuthSession } from '../lib/credentials'
 import { useT } from '../lib/i18n'
 
@@ -51,6 +52,9 @@ export function LoginPanel({ width, onSuccess, onCancel }: Props): React.ReactEl
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const [status, setStatus] = useState('')
+  // The OAuth authorize URL, held so `c` can copy it — mouse selection doesn't
+  // work while app-level mouse tracking is on.
+  const [authUrl, setAuthUrl] = useState('')
   // In-flight OAuth run, so esc can abort the browser wait instead of hanging.
   const abortRef = useRef<AbortController | null>(null)
 
@@ -77,7 +81,7 @@ export function LoginPanel({ width, onSuccess, onCancel }: Props): React.ReactEl
   const startOAuth = async (cid: string): Promise<void> => {
     setStep('oauth'); setBusy(true); setError(''); setStatus(t('login.oauthStarting'))
     const ac = new AbortController(); abortRef.current = ac
-    const r = await loginWithOAuth({ baseUrl, clientId: cid, onStatus: setStatus, signal: ac.signal })
+    const r = await loginWithOAuth({ baseUrl, clientId: cid, onStatus: setStatus, onAuthUrl: setAuthUrl, signal: ac.signal })
     abortRef.current = null
     if (!r.ok || !r.oauth) { setBusy(false); setStatus(''); setError(r.error || t('login.oauthFailed')); return }
     finish(baseUrl, { oauth: r.oauth })
@@ -122,6 +126,13 @@ export function LoginPanel({ width, onSuccess, onCancel }: Props): React.ReactEl
       // Cancel an in-flight OAuth wait first; a second esc closes the overlay.
       if (abortRef.current) { abortRef.current.abort(); abortRef.current = null; return }
       onCancel(); return
+    }
+    // Copy the authorize URL. Sits above the `busy` guard because the 'oauth' step
+    // runs with busy=true; scoped to that step so 'c' still types in other fields.
+    if (step === 'oauth' && authUrl && (input === 'c' || input === 'C') && !uKey.ctrl && !uKey.meta) {
+      copyToClipboard(authUrl, process.stdout)
+      setStatus(t('login.oauthUrlCopied'))
+      return
     }
     if (busy) return
     // Drop mouse reports Ink may surface here as text (see the stdin listener),

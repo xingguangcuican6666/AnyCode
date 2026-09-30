@@ -47,7 +47,7 @@ export function formatToolResult(content: string, isError?: boolean): string {
   const shown = lines.slice(0, 12)
   const more = lines.length - shown.length
   const body = shown.join('\n') + (more > 0 ? `\n… (+${more} more lines)` : '')
-  const mark = isError ? '⎿ ⚠️ ' : '⎿ '
+  const mark = isError ? '⎿ ⚠ ' : '⎿ '
   return mark + body.split('\n').join('\n   ')
 }
 
