@@ -275,6 +275,18 @@ export const messages = {
   'cmd.effortUnknown': { zh: '未知的推理投入 `{effort}`。请从以下选择：{levels}。', en: 'Unknown effort `{effort}`. Choose one of: {levels}.' },
   'cmd.effortSet': { zh: '推理投入已设为 `{effort}`。', en: 'Reasoning effort set to `{effort}`.' },
   'cmd.effortSetSession': { zh: '推理投入已设为 `{effort}`（仅本次会话，未写入配置）。', en: 'Reasoning effort set to `{effort}` (this session only, not saved).' },
+  'cmd.outputStyleDesc': { zh: '查看或设置输出风格 —— 例如 /output-style concise（{styles}）', en: 'Show or set the output style — e.g. /output-style concise ({styles})' },
+  'cmd.outputStyleCurrent': { zh: '输出风格：`{cur}`。用 `/output-style <style>` 设置 —— {styles}。', en: 'Output style: `{cur}`. Set with `/output-style <style>` — {styles}.' },
+  'cmd.outputStyleUnknown': { zh: '未知的输出风格 `{style}`。请从以下选择：{styles}。', en: 'Unknown output style `{style}`. Choose one of: {styles}.' },
+  'cmd.outputStyleSet': { zh: '输出风格已设为 `{style}`。', en: 'Output style set to `{style}`.' },
+  'cmd.vimDesc': { zh: '切换输入框的 vim 键位（editorMode）—— 无参在 vim↔normal 间切换，或指定 normal|vim|emacs|off', en: 'Toggle vim key bindings for the prompt (editorMode) — bare toggles vim↔normal, or pass normal|vim|emacs|off' },
+  'cmd.vimUnknown': { zh: '未知的编辑模式 `{mode}`。可选：normal、vim、emacs、off。', en: 'Unknown editor mode `{mode}`. Choose: normal, vim, emacs, off.' },
+  'cmd.vimSet': { zh: '输入框编辑模式已设为 `{mode}`。', en: 'Prompt editor mode set to `{mode}`.' },
+  'cmd.agentsDesc': { zh: '列出可用的子代理类型 —— 内置角色与 .anycode/agents/*.md 自定义代理', en: 'List available sub-agent types — built-in roles and custom .anycode/agents/*.md agents' },
+  'cmd.agentsBuiltinHeader': { zh: '内置子代理角色：', en: 'Built-in sub-agent roles:' },
+  'cmd.agentsCustomHeader': { zh: '自定义子代理（.anycode/agents/*.md）：', en: 'Custom sub-agents (.anycode/agents/*.md):' },
+  'cmd.agentsCustomNone': { zh: '尚无自定义子代理。在 `.anycode/agents/` 下建一个带 front-matter（name/description）的 .md 文件即可定义。', en: 'No custom sub-agents yet. Define one by adding a .md file with front-matter (name/description) under `.anycode/agents/`.' },
+  'cmd.agentsHint': { zh: '在 task / plan / workflow 的 `subagent_type` 里按名字选用。', en: 'Reference one by name in a task / plan / workflow `subagent_type`.' },
   'cmd.effortSetUltra': { zh: '已切换到 `ultracode`（xhigh + 工作流编排）。', en: 'Switched to `ultracode` (xhigh + workflow orchestration).' },
   'cmd.effortSetUltraSession': { zh: '已切换到 `ultracode`（xhigh + 工作流编排；仅本次会话）。', en: 'Switched to `ultracode` (xhigh + workflows; this session only).' },
   // /effort slider picker (src/components/EffortPicker.tsx)
@@ -696,11 +708,13 @@ const settingZh: Record<string, { label: string; desc: string }> = {
   localNotifications: { label: '本地通知', desc: '终端失去焦点时发送桌面通知' },
   otherSessionMessages: { label: '来自你其他会话的消息', desc: '如何呈现来自你其他会话的消息' },
   dialogExpiry: { label: '对话框过期', desc: '空闲对话框过期前的秒数（0 = 永不）' },
+  cleanupPeriodDays: { label: '会话保留期', desc: '保存时删除早于该天数的历史会话（0 = 永久保留）' },
   autoUpdateChannel: { label: '自动更新渠道', desc: '从哪个发布渠道自动更新' },
   retryStatusCodes: { label: '重试状态码', desc: '触发重试的 HTTP 状态码 —— 支持单码与区间，例如 408,409,429,500-599' },
   retryMaxAttempts: { label: '重试最大次数', desc: '每次 API 请求放弃前的总尝试次数' },
   autoConnectIde: { label: '自动连接 IDE（外部终端）', desc: '从外部终端连接到运行中的 IDE' },
   chromeEnabled: { label: '默认启用 Claude in Chrome', desc: '为新会话启用 Chrome 集成' },
+  disableAllHooks: { label: '禁用所有钩子', desc: '一次性关闭所有已配置的钩子，且不从设置中移除' },
 }
 
 // Localized label/description for a setting. `en` is the English carried on the

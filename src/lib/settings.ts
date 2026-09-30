@@ -73,12 +73,14 @@ export const SETTINGS: SettingSpec[] = [
   { key: 'localNotifications', label: 'Local notifications', group: 'Notifications & sessions', type: 'boolean', default: true, description: 'Desktop notifications when the terminal is unfocused' },
   { key: 'otherSessionMessages', label: 'Messages from your other sessions', group: 'Notifications & sessions', type: 'enum', values: ['off', 'notify', 'deliver'], default: 'notify', description: 'How to surface messages from your other sessions' },
   { key: 'dialogExpiry', label: 'Dialog expiry', group: 'Notifications & sessions', type: 'number', min: 0, max: 86400, unit: 's', default: 300, description: 'Seconds before an idle dialog expires (0 = never)' },
+  { key: 'cleanupPeriodDays', label: 'Session retention period', group: 'Notifications & sessions', type: 'number', min: 0, max: 3650, unit: ' d', default: 0, description: 'Delete saved sessions older than this many days on save (0 = keep forever, the default)' },
   // Advanced
   { key: 'autoUpdateChannel', label: 'Auto-update channel', group: 'Advanced', type: 'enum', values: ['stable', 'latest'], default: 'stable', description: 'Which release channel to auto-update from' },
   { key: 'retryStatusCodes', label: 'Retry status codes', group: 'Advanced', type: 'string', default: '408,409,429,500-599', description: 'HTTP statuses to retry — codes and ranges, e.g. 408,409,429,500-599' },
   { key: 'retryMaxAttempts', label: 'Retry max attempts', group: 'Advanced', type: 'number', min: 1, max: 50, default: 10, description: 'Total tries per API request before giving up' },
   { key: 'autoConnectIde', label: 'Auto-connect to IDE (external terminal)', group: 'Advanced', type: 'boolean', default: false, description: 'Connect to a running IDE from an external terminal' },
   { key: 'chromeEnabled', label: 'Claude in Chrome enabled by default', group: 'Advanced', type: 'boolean', default: false, description: 'Enable the Chrome integration for new sessions' },
+  { key: 'disableAllHooks', label: 'Disable all hooks', group: 'Advanced', type: 'boolean', default: false, description: 'Turn every configured hook off at once without removing it from settings' },
 ]
 
 export const SETTINGS_BY_KEY: Record<string, SettingSpec> = Object.fromEntries(
