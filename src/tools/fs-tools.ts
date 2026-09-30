@@ -6,9 +6,10 @@ import fsp from 'node:fs/promises'
 import path from 'node:path'
 import { spawn } from 'node:child_process'
 import type { ToolContext, ToolDef, ToolResult } from './types'
-import type { DiffLine } from '../types'
+import type { DiffLine, ToolResultBlock } from '../types'
 import { clip } from './util'
 import { recordCheckpoint } from '../lib/checkpoints'
+import { startBgShell } from '../lib/bgshell'
 
 function resolve(cwd: string, p: string): string {
   return path.isAbsolute(p) ? p : path.resolve(cwd, p)
@@ -112,32 +113,83 @@ function runShell(command: string, ctx: ToolContext, timeoutMs: number): Promise
 }
 const bash: ToolDef = {
   name: 'bash',
-  description: 'Run a shell command in the working directory and return its combined stdout/stderr. Use for builds, tests, git, and any CLI task.',
+  description:
+    'Run a shell command in the working directory and return its combined stdout/stderr. Use for builds, tests, git, and any CLI task. ' +
+    'Set `run_in_background: true` for a long-running command (dev server, watcher, long build): it returns a shell id immediately instead of blocking, and you read its output with the `bash_output` tool and stop it with `bash_output` action "kill".',
   input_schema: {
     type: 'object',
     properties: {
       command: { type: 'string', description: 'The shell command to execute.' },
-      timeout_ms: { type: 'number', description: 'Optional timeout in milliseconds (default 120000).' },
+      timeout_ms: { type: 'number', description: 'Optional timeout in milliseconds (default 120000; foreground only).' },
+      run_in_background: { type: 'boolean', description: 'Run detached in the background and return a shell id (poll output via bash_output). Default false.' },
     },
     required: ['command'],
   },
-  run: (input, ctx) => runShell(String(input.command ?? ''), ctx, Number(input.timeout_ms) || 120000),
+  run: (input, ctx) => {
+    const command = String(input.command ?? '')
+    if (input.run_in_background === true) {
+      const ttl = typeof input.timeout_ms === 'number' && input.timeout_ms > 0 ? input.timeout_ms : undefined
+      const { shell, error } = startBgShell(command, ctx.cwd, ttl)
+      if (error || !shell) return Promise.resolve({ content: `bash (background): ${error ?? 'failed to start'}`, isError: true })
+      return Promise.resolve({
+        content: `Started background shell ${shell.id}: ${command.split('\n')[0].slice(0, 80)}\nRead its output with bash_output (bash_id: "${shell.id}") and stop it with bash_output action "kill".`,
+        display: `bash · background ${shell.id}`,
+      })
+    }
+    return runShell(command, ctx, Number(input.timeout_ms) || 120000)
+  },
 }
+
+// Extension → Anthropic media type for the multimodal read path. Images come
+// back as an `image` content block and PDFs as a `document` block, so the model
+// sees the file directly instead of a base64 blob dumped as text. Anything not
+// listed here is read as UTF-8 text (the default path in read_file).
+const IMAGE_TYPES: Record<string, string> = {
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif',
+  '.webp': 'image/webp',
+}
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024   // Anthropic per-image cap (~5MB)
+const MAX_PDF_BYTES = 20 * 1024 * 1024    // stay well under the ~32MB request cap
 
 const readFile: ToolDef = {
   name: 'read_file',
-  description: 'Read a UTF-8 text file and return its contents with line numbers.',
+  description: 'Read a file. Text files return with line numbers (offset/limit apply); image files (PNG/JPEG/GIF/WebP) and PDFs are returned as content the model can view directly.',
   input_schema: {
     type: 'object',
     properties: {
       path: { type: 'string', description: 'File path (absolute or relative to the working directory).' },
-      offset: { type: 'number', description: '1-based line to start from.' },
-      limit: { type: 'number', description: 'Max lines to read (default 2000).' },
+      offset: { type: 'number', description: '1-based line to start from (text files only).' },
+      limit: { type: 'number', description: 'Max lines to read (default 2000; text files only).' },
     },
     required: ['path'],
   },
   async run(input, ctx) {
     const file = resolve(ctx.cwd, String(input.path ?? ''))
+    const ext = path.extname(file).toLowerCase()
+    const imageType = IMAGE_TYPES[ext]
+    const isPdf = ext === '.pdf'
+    // Multimodal path: hand images/PDFs to the model as viewable blocks.
+    if (imageType || isPdf) {
+      try {
+        const cap = isPdf ? MAX_PDF_BYTES : MAX_IMAGE_BYTES
+        const stat = await fsp.stat(file)
+        if (stat.size > cap) {
+          return { content: `${file} is too large to read as ${isPdf ? 'a PDF' : 'an image'} (${(stat.size / 1048576).toFixed(1)}MB > ${(cap / 1048576).toFixed(0)}MB cap).`, isError: true }
+        }
+        const data = (await fsp.readFile(file)).toString('base64')
+        const kind = isPdf ? 'PDF' : 'image'
+        const caption = `Read ${kind} ${file} (${(stat.size / 1024).toFixed(1)} KB).`
+        const media: ToolResultBlock = isPdf
+          ? { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data } }
+          : { type: 'image', source: { type: 'base64', media_type: imageType, data } }
+        return { content: caption, display: `read_file · ${input.path} (${kind})`, blocks: [{ type: 'text', text: caption }, media] }
+      } catch (e) {
+        return { content: `cannot read ${file}: ${(e as Error).message}`, isError: true }
+      }
+    }
     try {
       const raw = await fsp.readFile(file, 'utf8')
       const lines = raw.split('\n')
@@ -185,36 +237,65 @@ const writeFile: ToolDef = {
 }
 const editFile: ToolDef = {
   name: 'edit_file',
-  description: 'Replace an exact string in a file. old_string must be unique unless replace_all is true.',
+  description:
+    'Replace exact text in a file. Single edit: pass old_string/new_string (old_string must be unique unless replace_all). ' +
+    'Multiple edits at once: pass `edits`, an array of {old_string, new_string, replace_all?} applied IN ORDER and ATOMICALLY — every edit must match or nothing is written, so later edits see the result of earlier ones. Use `edits` to make several related changes to one file in a single call.',
   input_schema: {
     type: 'object',
     properties: {
       path: { type: 'string', description: 'File path to edit.' },
-      old_string: { type: 'string', description: 'Exact text to replace.' },
-      new_string: { type: 'string', description: 'Replacement text.' },
+      old_string: { type: 'string', description: 'Exact text to replace (single-edit form).' },
+      new_string: { type: 'string', description: 'Replacement text (single-edit form).' },
       replace_all: { type: 'boolean', description: 'Replace every occurrence (default false).' },
+      edits: {
+        type: 'array',
+        description: 'A sequence of edits applied atomically in order (multi-edit form). Overrides old_string/new_string when present.',
+        items: {
+          type: 'object',
+          properties: {
+            old_string: { type: 'string', description: 'Exact text to replace.' },
+            new_string: { type: 'string', description: 'Replacement text.' },
+            replace_all: { type: 'boolean', description: 'Replace every occurrence (default false).' },
+          },
+          required: ['old_string', 'new_string'],
+        },
+      },
     },
-    required: ['path', 'old_string', 'new_string'],
+    required: ['path'],
   },
   async run(input, ctx) {
     const file = resolve(ctx.cwd, String(input.path ?? ''))
-    const oldStr = String(input.old_string ?? '')
-    const newStr = String(input.new_string ?? '')
+    // Normalize to a list of edits so single- and multi-edit share one code path.
+    const rawEdits = Array.isArray(input.edits) && input.edits.length
+      ? (input.edits as unknown[])
+      : [{ old_string: input.old_string, new_string: input.new_string, replace_all: input.replace_all }]
+    const edits = rawEdits.map((e) => {
+      const o = (e ?? {}) as Record<string, unknown>
+      return { oldStr: String(o.old_string ?? ''), newStr: String(o.new_string ?? ''), replaceAll: o.replace_all === true }
+    })
     try {
       const raw = await fsp.readFile(file, 'utf8')
-      const count = oldStr ? raw.split(oldStr).length - 1 : 0
-      if (count === 0) return { content: `old_string not found in ${file}`, isError: true }
-      if (count > 1 && !input.replace_all) return { content: `old_string is not unique in ${file} (${count} matches); pass replace_all or add context.`, isError: true }
-      const next = input.replace_all ? raw.split(oldStr).join(newStr) : raw.replace(oldStr, newStr)
+      let text = raw
+      let totalReps = 0
+      for (let k = 0; k < edits.length; k++) {
+        const { oldStr, newStr, replaceAll } = edits[k]
+        const label = edits.length > 1 ? ` (edit ${k + 1}/${edits.length})` : ''
+        if (!oldStr) return { content: `edit_file: old_string is empty${label}`, isError: true }
+        const count = text.split(oldStr).length - 1
+        if (count === 0) return { content: `old_string not found in ${file}${label}`, isError: true }
+        if (count > 1 && !replaceAll) return { content: `old_string is not unique in ${file}${label} (${count} matches); pass replace_all or add context.`, isError: true }
+        // Function replacer so `$`-sequences in new_string aren't treated as
+        // regex substitutions (they'd be, with a plain-string replacement).
+        text = replaceAll ? text.split(oldStr).join(newStr) : text.replace(oldStr, () => newStr)
+        totalReps += replaceAll ? count : 1
+      }
       if (ctx.rewind !== false) recordCheckpoint(file, raw, 'edit_file', Date.now())
-      await fsp.writeFile(file, next, 'utf8')
-      const reps = input.replace_all ? count : 1
-      // Whole-file diff gives accurate counts and a proper context view; the
-      // per-hunk multiply (below) was only a heuristic when we lacked the file.
-      const whole = lineDiff(raw, next)
-      const diff = diffLines(raw, next)
+      await fsp.writeFile(file, text, 'utf8')
+      const whole = lineDiff(raw, text)
+      const diff = diffLines(raw, text)
+      const editWord = edits.length > 1 ? `${edits.length} edits, ` : ''
       return {
-        content: `edited ${file} (${reps} replacement${reps === 1 ? '' : 's'})`,
+        content: `edited ${file} (${editWord}${totalReps} replacement${totalReps === 1 ? '' : 's'})`,
         linesAdded: whole.added,
         linesRemoved: whole.removed,
         diff: diff.length ? diff : undefined,

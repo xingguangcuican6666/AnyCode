@@ -19,11 +19,23 @@ export function setTermTitle(title: string): void {
   write(`${OSC}0;${title}${BEL}`)
 }
 
+// OSC 9;4 (taskbar progress) is a ConEmu extension honored by Windows Terminal,
+// ConEmu and WezTerm. Elsewhere it is at best ignored — but iTerm2 reads OSC 9 as
+// "post a desktop notification", so `9;4;0;0` pops a spurious notification reading
+// "4;0;0" on every call (and clearTermProgress runs every turn). So gate it to
+// terminals that actually implement the progress extension; a no-op everywhere
+// else, notably iTerm.app.
+const SUPPORTS_OSC94 =
+  !!process.env.WT_SESSION ||             // Windows Terminal
+  process.env.ConEmuANSI === 'ON' ||      // ConEmu
+  process.env.TERM_PROGRAM === 'WezTerm'  // WezTerm
+
 /**
  * Drive the taskbar progress indicator. state 1 = indeterminate/normal (we use
  * the "indeterminate" pulse, code 3, while working), state 0 = clear.
  */
 export function setTaskbarProgress(active: boolean): void {
+  if (!SUPPORTS_OSC94) return
   write(`${OSC}9;4;${active ? '3' : '0'};0${BEL}`)
 }
 

@@ -62,28 +62,59 @@ function legacyForCsiU(params: string): string {
   return ''
 }
 
+// Grace window (ms) for reassembling an escape sequence split across two stdin
+// data chunks. Only a chunk that ENDS mid-escape waits this long; complete
+// sequences pass through with no delay. Kept short enough to be imperceptible.
+const ESC_FLUSH_MS = 25
+
+// Translate one cooked run: strip bracketed-paste wrappers and rewrite complete
+// CSI-u events to their legacy bytes. Everything else passes through untouched.
+function cook(s: string): string {
+  // Strip bracketed-paste markers (?2004h, enabled in cli.tsx). The terminal
+  // wraps a paste in \x1b[200~ … \x1b[201~; we drop the wrapper and keep the
+  // content, which then inserts as normal text (PromptInput's CR/LF handling
+  // splits multi-line pastes). Without this the markers leak as literal
+  // "[200~"/"[201~" and the kitty protocol mangles the paste.
+  return s.replace(/\x1b\[20[01]~/g, '')
+    // Replace every complete CSI-u event with its legacy form.
+    .replace(/\x1b\[([0-9;:]+)u/g, (_full, params: string) => legacyForCsiU(params))
+}
+
 // Stateful translator over a raw stdin byte stream. Rewrites complete CSI-u key
 // events to legacy bytes and leaves everything else (plain text, unmodified
-// keys, mouse SGR reports, arrow/nav sequences) untouched. A sequence split
-// across two data chunks is held in `pending` until the rest arrives.
-export function createKittyTranslator(): (chunk: string) => string {
+// keys, mouse SGR reports, arrow/nav sequences) untouched. Cooked output is
+// handed to `emit` (usually a write into the stream Ink reads).
+//
+// A sequence split across two data chunks is briefly held in `pending` so the
+// rest can arrive. Crucially it is NOT held forever: after ESC_FLUSH_MS with no
+// continuation we flush it as-is. That is what makes a BARE Escape keypress work
+// on legacy terminals — kitty reports Escape as a complete CSI-u (\x1b[27u), but
+// every non-kitty terminal sends a lone \x1b, which would otherwise sit in
+// `pending` until the next keystroke and make ESC (cancel/vim/stop) feel dead.
+export function createKittyTranslator(emit: (out: string) => void): (chunk: string) => void {
   let pending = ''
-  return (chunk: string): string => {
+  let timer: ReturnType<typeof setTimeout> | null = null
+  const cancelTimer = (): void => { if (timer) { clearTimeout(timer); timer = null } }
+  return (chunk: string): void => {
+    cancelTimer()
     let s = pending + chunk
     pending = ''
-    // Hold a trailing, still-incomplete escape sequence (CSI-u or mouse SGR): a
-    // lone ESC, or ESC + '[' + parameter bytes with no final byte yet. A COMPLETE
-    // sequence ends in a final byte (a letter like 'u'/'M'/'m'/'A'), which is not
-    // in the parameter class below, so the anchor can't reach it → not buffered.
+    // Hold a trailing, still-incomplete escape sequence (a lone ESC, or ESC + '['
+    // + parameter bytes with no final byte yet). A COMPLETE sequence ends in a
+    // final byte (a letter like 'u'/'M'/'m'/'A'), outside the parameter class
+    // below, so the anchor can't reach it → not buffered.
     const tail = /\x1b(?:\[[0-9;:<>?]*)?$/.exec(s)
     if (tail) { pending = s.slice(tail.index); s = s.slice(0, tail.index) }
-    // Strip bracketed-paste markers (?2004h, enabled in cli.tsx). The terminal
-    // wraps a paste in \x1b[200~ … \x1b[201~; we drop the wrapper and keep the
-    // content, which then inserts as normal text (PromptInput's CR/LF handling
-    // splits multi-line pastes). Without this the markers leak as literal
-    // "[200~"/"[201~" and the kitty protocol mangles the paste.
-    s = s.replace(/\x1b\[20[01]~/g, '')
-    // Replace every complete CSI-u event with its legacy form.
-    return s.replace(/\x1b\[([0-9;:]+)u/g, (_full, params: string) => legacyForCsiU(params))
+    if (s) emit(cook(s))
+    if (pending) {
+      // Nothing more came in time → the held bytes are a real keypress (usually a
+      // bare ESC), not a split sequence. Flush them so Ink sees the key.
+      timer = setTimeout(() => {
+        timer = null
+        const held = pending; pending = ''
+        if (held) emit(cook(held))
+      }, ESC_FLUSH_MS)
+      timer.unref?.()
+    }
   }
 }

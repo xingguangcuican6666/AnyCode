@@ -6,32 +6,16 @@ import type { AppConfig } from './types'
 import { loadConfig } from './config'
 import { getProvider } from './providers'
 import { NAME, VERSION } from './version'
-import { newSessionId, saveSession, loadSession, latestSession } from './lib/sessions'
+import { newSessionId, saveSession, loadSession, latestSession, forkSession } from './lib/sessions'
 import { KITTY_ON, KITTY_OFF, createKittyTranslator } from './lib/kittykeys'
-
-// Fullscreen (alternate-screen) control sequences. AnyCode owns the whole
-// viewport the way Claude Code does — the transcript is a self-managed scroll
-// container, NOT native terminal scrollback. That means: no <Static>, so the
-// terminal never accumulates a scrollback buffer (hence no native scrollbar and
-// no mouse-wheel-scrolls-the-terminal), and modal overlays repaint cleanly with
-// nothing underneath to ghost.
-//   \x1b[?1049h  enter the alternate screen buffer (a fresh, scrollback-less
-//                screen; leaving it restores the pre-launch terminal intact).
-//   \x1b[?1000h  report mouse button events — crucially the wheel (buttons
-//   \x1b[?1006h  64/65) — in SGR form (\x1b[<b;x;y M/m), which App parses to
-//                scroll ITS viewport instead of the terminal. Text selection
-//                then needs Shift/Option-drag (the usual full-TUI trade-off).
-const ALT_ON = '\x1b[?1049h'
-const ALT_OFF = '\x1b[?1049l'
-// ?1000h button events + ?1002h button-event MOTION (so a left-drag streams as
-// button 32, which App turns into a text selection) + ?1006h SGR coordinates +
-// ?1004h focus reporting (CSI I/O in & out, so App can gate notifications) +
-// ?2004h bracketed paste (the terminal wraps pasted text in \x1b[200~…\x1b[201~;
-// the kitty translator strips the wrapper so the content pastes cleanly instead
-// of leaking "[200~" and mangling under the kitty keyboard protocol).
-const MOUSE_ON = '\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?1004h\x1b[?2004h'
-const MOUSE_OFF = '\x1b[?1000l\x1b[?1002l\x1b[?1006l\x1b[?1004l\x1b[?2004l'
-const CLEAR = '\x1b[2J\x1b[3J\x1b[H'
+import { StringDecoder } from 'node:string_decoder'
+// Fullscreen control sequences (alternate screen + mouse/paste enables). MeowCode
+// owns the whole viewport the way Claude Code does — the transcript is a
+// self-managed scroll container, NOT native terminal scrollback: no <Static>, so
+// the terminal never accumulates a scrollback buffer and overlays repaint cleanly.
+// The exact sequences (and the Terminal.app mouse gate) live in lib/termmodes so
+// the /editor bridge in app.tsx can leave and re-enter the same modes.
+import { ALT_ON, ALT_OFF, MOUSE_ON, MOUSE_OFF, CLEAR } from './lib/termmodes'
 
 const argv = process.argv.slice(2)
 
@@ -70,6 +54,7 @@ Options:
   -p, --print <prompt>   Run a single prompt and stream the response to stdout
   -c, --continue         Resume the most recent session
       --resume [id]      Resume a saved session (the latest, or the given id)
+      --fork-session [id]  Open a copy of a saved session, leaving the original intact
       --model <id>       Model to use for this run
       --provider <id>    Provider to use (mock | anthropic)
   -h, --help             Show this help
@@ -143,8 +128,17 @@ async function runInteractive(initial: AppConfig, resume?: { snapshot: SessionSn
   wrapped.setRawMode = (mode: boolean) => { source.setRawMode?.(mode); return wrapped }
   wrapped.ref = () => wrapped
   wrapped.unref = () => wrapped
-  const translate = createKittyTranslator()
-  const forward = (chunk: Buffer): void => { wrapped.write(translate(chunk.toString('utf8'))) }
+  const translate = createKittyTranslator((out) => { wrapped.write(out) })
+  // Decode raw stdin with a persistent StringDecoder, NOT chunk.toString('utf8').
+  // `source` (process.stdin, raw mode) emits Buffers with no encoding set — Ink's
+  // own stdin.setEncoding runs on the downstream `wrapped` PassThrough, i.e. AFTER
+  // this decode, so it can't help. A multibyte code point (3-byte CJK, 4-byte
+  // emoji) that straddles a chunk boundary — common on any paste larger than the
+  // pty buffer — would decode to U+FFFD (�) with per-chunk toString, silently
+  // corrupting pasted Chinese/emoji. StringDecoder holds the incomplete trailing
+  // bytes until the next chunk completes the sequence, so nothing is mangled.
+  const decoder = new StringDecoder('utf8')
+  const forward = (chunk: Buffer): void => { translate(decoder.write(chunk)) }
   source.on('data', forward)
 
   let restored = false
@@ -155,8 +149,16 @@ async function runInteractive(initial: AppConfig, resume?: { snapshot: SessionSn
     process.stdout.write(KITTY_OFF + MOUSE_OFF + ALT_OFF)
   }
   // Always restore the terminal, even on a crash or signal — a stuck alternate
-  // screen / mouse mode would otherwise leave the user's shell unusable.
+  // screen / mouse mode would otherwise leave the user's shell unusable. 'exit'
+  // covers normal completion and process.exit(); async termination signals do
+  // NOT fire 'exit' on their own, so bind them too and then re-exit. We skip
+  // SIGINT: in raw mode the terminal delivers ctrl+c to App as a 0x03 byte (its
+  // press-twice-to-exit handler) rather than raising SIGINT, so a SIGINT handler
+  // here would only shadow that without benefit.
   process.on('exit', restore)
+  for (const sig of ['SIGTERM', 'SIGHUP', 'SIGQUIT'] as const) {
+    process.once(sig, () => { restore(); process.exit(sig === 'SIGTERM' ? 143 : sig === 'SIGHUP' ? 129 : 131) })
+  }
 
   try {
     for (;;) {
@@ -182,11 +184,23 @@ async function runInteractive(initial: AppConfig, resume?: { snapshot: SessionSn
         resumed = true
         remount({ ...snap.config, apiKey: process.env.ANTHROPIC_API_KEY }, snap)
       }
+      // /fork: branch the current conversation. Freeze the original session file as
+      // it stands now, then rotate to a fresh id so continued work lands in a new
+      // session — the original stays on disk, reopenable via /resume. No remount:
+      // the live transcript carries on unchanged, only its autosave target moves.
+      // Returns the new id (or null when there's no transcript saved yet to fork).
+      const onFork = (): string | null => {
+        if (!last) return null
+        saveSession(sessionId, last) // freeze the original at the fork point
+        sessionId = newSessionId()   // future autosaves target the branch
+        saveSession(sessionId, last) // materialize the branch immediately
+        return sessionId
+      }
       const onSnapshot = (snap: SessionSnapshot): void => { last = snap; scheduleSave() }
       // App owns ctrl+c (interrupt / press-twice-to-exit), so keep Ink from
       // exiting on the first ctrl+c itself.
       instance = render(
-        <App config={config} initial={snapshot} resumed={resumed} sessionId={sessionId} onClear={onClear} onRepaint={onRepaint} onSnapshot={onSnapshot} onResume={onResume} />,
+        <App config={config} initial={snapshot} resumed={resumed} sessionId={sessionId} onClear={onClear} onRepaint={onRepaint} onSnapshot={onSnapshot} onResume={onResume} onFork={onFork} />,
         { exitOnCtrlC: false, stdin: wrapped as unknown as NodeJS.ReadStream },
       )
       await instance.waitUntilExit()
@@ -243,7 +257,23 @@ async function main(): Promise<void> {
   // config drives the reopened session (model/theme/settings), with the API key
   // re-injected from the environment since it's never written to disk.
   let resume: { snapshot: SessionSnapshot; id: string } | undefined
-  if (has('-c', '--continue', '--resume')) {
+  if (has('--fork-session')) {
+    // `--fork-session [id]` opens a COPY of a saved session (the latest when no id
+    // is given) under a fresh id, leaving the original untouched — a branch point
+    // straight from launch, symmetric with `--resume`.
+    const wanted = flagValue('--fork-session')
+    const srcId = wanted || latestSession()?.id
+    const forkedId = srcId ? forkSession(srcId) : null
+    const snap = forkedId ? loadSession(forkedId) : null
+    if (forkedId && snap) {
+      resume = { snapshot: snap, id: forkedId }
+      config = { ...snap.config, apiKey: process.env.ANTHROPIC_API_KEY }
+      if (model) config.model = model
+      if (provider) config.provider = provider
+    } else {
+      process.stderr.write('No saved session to fork.\n')
+    }
+  } else if (has('-c', '--continue', '--resume')) {
     const wanted = flagValue('--resume')
     const id = wanted || latestSession()?.id
     const snap = id ? loadSession(id) : null

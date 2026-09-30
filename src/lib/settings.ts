@@ -50,6 +50,7 @@ export const SETTINGS: SettingSpec[] = [
   { key: 'outputStyle', label: 'Output style', group: 'Interface', type: 'enum', values: ['default', 'concise', 'explanatory'], default: 'default', description: 'How much explanation responses include' },
   { key: 'language', label: 'Language', group: 'Interface', type: 'enum', values: ['auto', 'zh', 'en'], default: 'auto', description: 'UI language (auto = match your shell locale)' },
   { key: 'prStatusFooter', label: 'Show PR status footer', group: 'Interface', type: 'boolean', default: true, description: 'Footer line with the current PR status' },
+  { key: 'statusLine', label: 'Custom status line', group: 'Interface', type: 'string', default: '', description: 'Shell command whose first stdout line renders as a footer; receives a JSON context (model, provider, cwd, version, tokens, turns) on stdin. Set with /statusline' },
   { key: 'openAgentsView', label: 'Open agents view by default', group: 'Interface', type: 'boolean', default: false, description: 'Start with the agents panel open' },
   // Workflow
   { key: 'rewindCode', label: 'Rewind code (checkpoints)', group: 'Workflow', type: 'boolean', default: true, description: 'Keep checkpoints so edits can be rewound' },

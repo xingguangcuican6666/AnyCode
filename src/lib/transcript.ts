@@ -99,6 +99,10 @@ export interface FlattenOpts {
 // in full (write/edit additionally get a diff view).
 const MERGE_TOOLS = new Set(['read_file', 'bash', 'list_dir', 'grep', 'glob'])
 
+// Glyph fronting a collapsed compaction digest row (matches the ⎗ the digest
+// message itself used before it became collapsible).
+const COMPACT_GLYPH = '⎗'
+
 // One summary phrase for a run of collapsed activity: "Added N lines, removed M"
 // (or "No changes"). Exported so useChat/messagesFromEvents build the same line.
 export function changeSummary(added: number, removed: number): string {
@@ -116,12 +120,13 @@ const argFromHeader = (c: string): string => { const i = c.indexOf(' · '); retu
 
 
 // Pre-scanned transcript element: a banner marker, a prose/system message, a
-// thinking block, or a tool call (its "⏺" header paired with the following "⎿"
-// result, if any).
+// thinking block, a compaction digest, or a tool call (its "⏺" header paired
+// with the following "⎿" result, if any).
 type Item =
   | { kind: 'banner' }
   | { kind: 'msg'; m: Message }
   | { kind: 'think'; id: string; m: Message }
+  | { kind: 'compact'; id: string; m: Message }
   | { kind: 'tool'; id: string; tool: string; arg: string; header: Message; result?: Message }
 
 // Turn a list of messages into one flat, row-per-entry array. `width` is the
@@ -143,6 +148,7 @@ export function flattenMessages(messages: Message[], width: number, opts?: Flatt
   for (let k = 0; k < messages.length; k++) {
     const m = messages[k]
     if (m.role === 'system' && m.content === '__banner__') { items.push({ kind: 'banner' }); continue }
+    if (m.role === 'system' && m.meta?.compacted) { items.push({ kind: 'compact', id: m.id, m }); continue }
     if (m.meta?.thinking) { items.push({ kind: 'think', id: m.id, m }); continue }
     if (m.role === 'tool' && m.content.startsWith('⏺')) {
       const next = messages[k + 1]
@@ -163,6 +169,25 @@ export function flattenMessages(messages: Message[], width: number, opts?: Flatt
   for (let k = 0; k < items.length; k++) {
     const it = items[k]
     if (it.kind === 'banner') { if (opts?.banner) { for (const l of bannerLines(width)) out.push(l); spacer() } continue }
+    if (it.kind === 'compact') {
+      // A compaction digest: a single collapsed "⎗ Context compacted · N folded"
+      // row by default (click to expand → the full summary the model sees), reusing
+      // the same group/expanded toggle as merged activity runs. Never dumps the
+      // whole summary into the transcript (issue: "而不是全文展示给用户").
+      const gid = it.id
+      const open = expandAll || (expanded?.has(gid) ?? false)
+      const s = out.length
+      const head = `  ${COMPACT_GLYPH} ${t('compact.collapsed', { n: it.m.meta?.foldedCount ?? 0 })}`
+      if (open) {
+        out.push({ text: head, kind: 'collapsed', group: gid, tint: true })
+        mdLines(it.m.content, contentW).forEach((l) => out.push({ text: `  ${l}`, kind: 'system', group: gid, tint: true }))
+      } else {
+        out.push({ text: head, kind: 'collapsed', group: gid })
+      }
+      markStart(s)
+      spacer()
+      continue
+    }
     if (it.kind === 'msg') { const s = out.length; emitMsg(it.m, out, contentW); markStart(s); continue }
     if (mergeable(it)) {
       let j = k

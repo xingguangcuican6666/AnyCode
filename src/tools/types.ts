@@ -2,7 +2,7 @@
 // file, run a shell command, search by content or by name). A ToolDef couples
 // the model-facing schema (name/description/JSON schema, in Anthropic's tool
 // format) with a `run` that actually performs the action and returns text.
-import type { AgentSnapshot, DiffLine, WorkflowSnapshot } from '../types'
+import type { AgentSnapshot, DiffLine, ToolResultBlock, WorkflowSnapshot } from '../types'
 
 export interface ToolResult {
   content: string
@@ -12,6 +12,11 @@ export interface ToolResult {
   // Absent → the UI falls back to `content`.
   display?: string
   isError?: boolean
+  // Structured tool_result content (text + images/PDF) sent to the model IN PLACE
+  // of `content` — used by read_file for multimodal reads (see fs-tools). When set,
+  // the API request carries these blocks; the transcript still shows `content`/
+  // `display`. Absent → the string `content` is sent as before.
+  blocks?: ToolResultBlock[]
   // Code-change accounting for the Usage tab's "Total code changes". Set by the
   // file-mutating tools (write_file/edit_file); absent for read-only tools.
   linesAdded?: number
@@ -53,6 +58,11 @@ export interface ToolContext {
   // the pre-edit state, so `/rewind` has nothing to restore. Threaded from
   // StreamOpts.rewind by the agent loop; absent/true = checkpoints are kept.
   rewind?: boolean
+  // Interactive structured-question prompt for the `ask_user` tool. Threaded from
+  // StreamOpts.requestUserInput by the top-level agent loop; withheld from
+  // sub-agents (they never block on the user), so absent = ask_user reports that
+  // no interactive user is available and the model proceeds on its own.
+  requestUserInput?: (req: import('../types').UserInputRequest) => Promise<import('../types').UserInputResponse>
 }
 
 export interface SpawnOpts {

@@ -1,11 +1,13 @@
-import type { AgentEvent, Message, Provider, StreamOpts } from '../types'
+import type { AgentEvent, Message, Provider, StreamOpts, ToolResultBlock } from '../types'
 import { loadConfig } from '../config'
 import { runTool, toolSchemas, type SpawnOpts, type SpawnResult } from '../tools'
-import { decidePermission, isPermissionMode } from '../tools/permission'
+import { decidePermission, isPermissionMode, matchPermissionRule, DENY_RULE_REASON, type PermissionMode } from '../tools/permission'
+import { loadHooks, runHooks } from '../lib/hooks'
 import { estimateTokens } from '../lib/tokens'
 import { contextLimit, AUTO_COMPACT_RATIO } from '../lib/usage'
 import { parseRetryCodes, sleep, backoffMs, parseRetryAfter } from './retry'
 import { type ApiBlock, type ApiMsg, type StreamUsage, emptyStreamUsage, toApiMessages, parseStream } from './wire'
+import { t } from '../lib/i18n'
 
 const API_VERSION = '2023-06-01'
 // Last-resort guard against a runaway loop (e.g. a misbehaving provider that keeps
@@ -17,6 +19,10 @@ const MAX_ATTEMPTS = 10 // default total tries per request before giving up
 // Max times a single turn will wait out a usage limit when continueAtUsageLimit
 // is on, so a permanent cap eventually surfaces as an error instead of hanging.
 const USAGE_WAIT_CAP = 30
+// Max times a single turn will react to a "context too large" API rejection by
+// folding older messages and retrying, so a convo that can't shrink further (one
+// giant message) surfaces the error instead of looping.
+const MAX_OVERFLOW_COMPACTIONS = 3
 
 // How a given Anthropic-protocol provider resolves its endpoint + key. The env
 // default (id 'anthropic') leaves baseUrl/apiKeyEnv unset; custom providers set
@@ -100,13 +106,30 @@ async function post(url: string, body: unknown, apiKey: string, auth: 'x-api-key
 // Mirror of lib/summarize's SUMMARY_SYSTEM, kept local so the provider doesn't
 // import lib/summarize (which imports providers → a module init cycle).
 const SUMMARY_SYSTEM =
-  'You are compressing a long coding-assistant conversation so it can continue seamlessly after the older messages are dropped from the context window. ' +
-  'Write a dense, factual summary — notes, not prose — that a fresh instance of the assistant could read to pick up exactly where things left off. ' +
-  'Cover, in this order: (1) what the user is trying to accomplish and any explicit requirements or constraints they stated; ' +
-  '(2) key files, paths, functions, commands, and decisions made; (3) what has been done so far and its outcome (what worked, what failed); ' +
-  '(4) the current state and the concrete next steps. ' +
-  'Preserve exact identifiers (file paths, symbol names, flags, error text) — do not paraphrase them away. Omit pleasantries and filler. ' +
-  'Output ONLY the summary text.'
+  'You are the compaction step of a coding-assistant CLI. A long session is about to exceed the context window, so the earlier messages will be dropped and REPLACED by your summary alone — anything you leave out is lost to the assistant permanently. ' +
+  'Write dense, factual notes (not prose, no pleasantries, no praise), grouped under these headings and each only as long as it needs to be:\n' +
+  '1. Task & intent — what the user is ultimately trying to accomplish and what they asked for most recently; quote wording that must be obeyed exactly.\n' +
+  '2. Standing instructions & constraints — every directive about HOW to work that stays in force for the whole session (language to reply in, formatting rules, security/credential rules, commit/push policy, things never to do). Reproduce them verbatim; never soften or drop them.\n' +
+  '3. Files, paths, symbols, commands & decisions — exact identifiers (file paths, function/variable names, flags, config keys, URLs, error text) and the design decisions already made. Never paraphrase an identifier.\n' +
+  '4. Work done & outcome — what was changed, what worked, what failed, fixes applied, and whether builds/tests were run and their result. Do not claim anything is complete or verified unless the transcript shows it.\n' +
+  '5. Current state & next steps — precisely where things stand and the concrete remaining actions, including any pending user request not yet fulfilled and anything awaiting the user’s confirmation.\n' +
+  'Do not invent facts or fill gaps with assumptions. Output ONLY the summary text.'
+
+// A tool_result's content is either a plain string or structured blocks
+// (multimodal read). These flatten it for the two out-of-band consumers below —
+// the context estimate and the summarizer's transcript render — neither of which
+// can carry the actual image bytes. An image/document counts as a flat rough
+// token cost (the real cost depends on its dimensions, billed by the API).
+function estimateToolResult(content: string | ToolResultBlock[]): number {
+  if (typeof content === 'string') return estimateTokens(content)
+  let n = 0
+  for (const blk of content) n += blk.type === 'text' ? estimateTokens(blk.text) : 1500
+  return n
+}
+function toolResultText(content: string | ToolResultBlock[]): string {
+  if (typeof content === 'string') return content
+  return content.map((blk) => (blk.type === 'text' ? blk.text : `[${blk.type}]`)).join('\n')
+}
 
 // Rough token estimate of the API convo we'd send (the ~4-char/token heuristic
 // the rest of the app uses for its fill bar and thresholds — see lib/tokens).
@@ -118,7 +141,7 @@ function estimateApiConvo(convo: ApiMsg[]): number {
       if (b.type === 'text') n += estimateTokens(b.text)
       else if (b.type === 'thinking') n += estimateTokens(b.thinking)
       else if (b.type === 'tool_use') n += estimateTokens(JSON.stringify(b.input)) + 4
-      else if (b.type === 'tool_result') n += estimateTokens(b.content)
+      else if (b.type === 'tool_result') n += estimateToolResult(b.content)
     }
   }
   return n
@@ -138,7 +161,7 @@ function renderApiConvo(msgs: ApiMsg[], perMsg = 2000): string {
       for (const b of m.content) {
         if (b.type === 'text') segs.push(b.text)
         else if (b.type === 'tool_use') segs.push(`\u2192 ${b.name}(${JSON.stringify(b.input).slice(0, 300)})`)
-        else if (b.type === 'tool_result') segs.push(`\u2190 ${b.is_error ? 'error: ' : ''}${b.content.slice(0, 500)}`)
+        else if (b.type === 'tool_result') segs.push(`\u2190 ${b.is_error ? 'error: ' : ''}${toolResultText(b.content).slice(0, 500)}`)
       }
       body = segs.join('\n')
     }
@@ -183,6 +206,18 @@ async function compactConvo(convo: ApiMsg[], opts: StreamOpts, cfg: AnthropicOpt
   return { convo: [digest, ...convo.slice(cut)], folded: cut }
 }
 
+// Does a failed request look like a context-length overflow rather than a
+// transient fault? Our token estimate can undercount (a big tool result, an
+// image), so we sometimes only learn the request is too big from the API's own
+// rejection. Different relays word it differently: the user's relay returns a
+// bare `512 context too large`; Anthropic answers 400 "prompt is too long";
+// OpenAI-style relays say "maximum context length … tokens". Match the status
+// codes AND the common phrasings so we can fold + retry instead of erroring.
+function isContextOverflow(status: number, errText: string): boolean {
+  if (status === 413 || status === 512) return true
+  return /context (?:length|window|too)|too long|too large|maximum context|max(?:imum)? tokens|token limit|reduce the (?:length|number of tokens)|prompt is too long/i.test(errText)
+}
+
 // Compact one-liner for a tool call the sub-agent made, used to reconstruct a
 // report from its trace when it ends without writing prose. Picks the most
 // telling string argument (path/command/pattern) so the line reads like an action.
@@ -207,6 +242,46 @@ function traceReport(trace: string[], steps: number): string {
   return `⚠️ 子代理未自行撰写总结；以下为其 ${steps} 次工具调用的操作轨迹（系统自动汇总）：\n${lines.join('\n')}${more}`
 }
 
+// exit_plan_mode approval. Called by the top-level tool loop (below) instead of
+// running the tool through runTool, because approval must change THIS turn's
+// permission mode: the model that just proposed a plan should be able to start
+// editing right away. Presents the finalized plan and asks the user to approve
+// leaving plan mode, offering auto-accept (acceptEdits) vs. confirm-each (default).
+// Returns the text to feed back as the tool_result and, when approved, the new
+// mode the caller applies (and propagates to the host via onPermissionModeChange).
+// Never approves for a sub-agent or a headless run (no interactive approver).
+export async function handleExitPlanMode(
+  input: Record<string, unknown>,
+  opts: StreamOpts,
+  sub: boolean,
+  permMode: PermissionMode,
+): Promise<{ content: string; isError: boolean; newMode?: PermissionMode }> {
+  const plan = String((input as { plan?: unknown })?.plan ?? '').trim()
+  // Only meaningful while planning; outside plan mode it's a no-op the model
+  // shouldn't have reached for.
+  if (permMode !== 'plan') return { content: t('exitPlan.notPlanning'), isError: false }
+  // Sub-agents and headless runs can't raise a dialog, so there's no approver.
+  if (sub || !opts.requestUserInput) return { content: t('exitPlan.noApprover'), isError: false }
+  const autoLabel = t('exitPlan.optAuto')
+  const manualLabel = t('exitPlan.optManual')
+  const resp = await opts.requestUserInput({
+    questions: [{
+      question: t('exitPlan.approveQ'),
+      header: t('exitPlan.approveHeader'),
+      options: [
+        { label: autoLabel, description: t('exitPlan.optAutoDesc') },
+        { label: manualLabel, description: t('exitPlan.optManualDesc') },
+        { label: t('exitPlan.optReject'), description: t('exitPlan.optRejectDesc') },
+      ],
+    }],
+  })
+  const choice = resp.cancelled ? '' : (resp.answers?.[0]?.[0] ?? '')
+  if (choice === autoLabel) return { content: t('exitPlan.approvedAuto', { plan }), isError: false, newMode: 'acceptEdits' }
+  if (choice === manualLabel) return { content: t('exitPlan.approvedManual', { plan }), isError: false, newMode: 'default' }
+  // Reject, cancel, or a free-form "Other" answer → stay in plan mode.
+  return { content: t('exitPlan.rejected'), isError: false }
+}
+
 // `sub` marks a nested sub-agent run: it is offered no orchestration tools and
 // gets no spawnAgent in its tool context, so nesting is capped at one level.
 async function* agent(messages: Message[], opts: StreamOpts, cfg: AnthropicOpts, sub = false): AsyncGenerator<AgentEvent, void, unknown> {
@@ -215,10 +290,16 @@ async function* agent(messages: Message[], opts: StreamOpts, cfg: AnthropicOpts,
   const url = resolveUrl(cfg)
   let convo = toApiMessages(messages)
   const cwd = process.cwd()
+  // Lifecycle shell hooks (see lib/hooks), read once per turn. `null` when none
+  // are configured so the tool loop skips the machinery entirely.
+  const hooksCfg = loadHooks(cwd)
+  const hooksActive = (['PreToolUse', 'PostToolUse'] as const).some((e) => (hooksCfg[e]?.length ?? 0) > 0)
   // Permission mode governs whether each tool call runs freely, is denied, or
   // prompts the user (see tools/permission). Sub-agents inherit it but only ever
   // apply its deterministic part (plan mode denies mutations); they never prompt.
-  const permMode = isPermissionMode(opts.permissionMode) ? opts.permissionMode : 'default'
+  // `let`, not `const`: an approved exit_plan_mode flips it to acceptEdits/default
+  // mid-turn so the model can start editing immediately (see the tool loop below).
+  let permMode: PermissionMode = isPermissionMode(opts.permissionMode) ? opts.permissionMode : 'default'
 
   // Retry policy is configurable per request (see settings retryStatusCodes /
   // retryMaxAttempts, threaded through StreamOpts); fall back to the built-ins.
@@ -232,7 +313,7 @@ async function* agent(messages: Message[], opts: StreamOpts, cfg: AnthropicOpts,
     ? undefined
     : async (sp) => {
         const subMessages: Message[] = [{ id: 'sub-user', role: 'user', content: sp.prompt }]
-        const subOpts: StreamOpts = { model: opts.model, system: sp.system, signal: sp.signal ?? opts.signal, retryStatusCodes: opts.retryStatusCodes, retryMaxAttempts: opts.retryMaxAttempts, continueAtUsageLimit: opts.continueAtUsageLimit, switchModelOnFlag: opts.switchModelOnFlag, fallbackModel: opts.fallbackModel, permissionMode: opts.permissionMode, autoModeInPlan: opts.autoModeInPlan, rewind: opts.rewind }
+        const subOpts: StreamOpts = { model: opts.model, system: sp.system, signal: sp.signal ?? opts.signal, retryStatusCodes: opts.retryStatusCodes, retryMaxAttempts: opts.retryMaxAttempts, continueAtUsageLimit: opts.continueAtUsageLimit, switchModelOnFlag: opts.switchModelOnFlag, fallbackModel: opts.fallbackModel, permissionMode: opts.permissionMode, autoModeInPlan: opts.autoModeInPlan, rewind: opts.rewind, permissionRules: opts.permissionRules }
         let text = ''
         let lastText = ''
         let steps = 0
@@ -272,6 +353,9 @@ async function* agent(messages: Message[], opts: StreamOpts, cfg: AnthropicOpts,
   // Convo length at the last mid-turn compaction — only re-compact once the
   // convo has grown again, so we never thrash on an already-folded transcript.
   let compactedLen = 0
+  // How many times this turn has reacted to a "context too large" API rejection
+  // by folding + retrying (bounded by MAX_OVERFLOW_COMPACTIONS).
+  let overflowCompactions = 0
   // Sub-agent summary safety net: whether we've already nudged this run to write a
   // report. A sub-agent that ends on a bare tool-call trace (no closing prose) would
   // otherwise leave the orchestrator with "(no output)"; we prompt it ONCE to
@@ -302,7 +386,7 @@ async function* agent(messages: Message[], opts: StreamOpts, cfg: AnthropicOpts,
       max_tokens: think ? think + 4096 : 4096,
       stream: true,
       // Drop tools on the forced-summary step so the model can only answer in prose.
-      ...(summaryOnly ? {} : { tools: toolSchemas(!sub, opts.dynamicWorkflows !== false) }),
+      ...(summaryOnly ? {} : { tools: toolSchemas(!sub, opts.dynamicWorkflows !== false, cwd, permMode === 'plan' && !sub) }),
       ...(think ? { thinking: { type: 'enabled', budget_tokens: think } } : {}),
       ...(opts.system ? { system: opts.system } : {}),
       messages: convo,
@@ -355,6 +439,25 @@ async function* agent(messages: Message[], opts: StreamOpts, cfg: AnthropicOpts,
           await sleep(delay, opts.signal); if (opts.signal?.aborted) return
           attempt-- // a usage-limit wait doesn't consume the transient-retry budget
           continue
+        }
+        // A context-length overflow (e.g. the user's "512 context too large"):
+        // our estimate undercounted and the request came back rejected for size.
+        // Fold the older messages into a summary and retry this step instead of
+        // erroring — the auto-compaction the user expected but wasn't happening.
+        // Top level only (sub-agents stay lean); bounded so a convo that can't
+        // shrink further still surfaces the error.
+        if (!sub && isContextOverflow(status, errText) && overflowCompactions < MAX_OVERFLOW_COMPACTIONS) {
+          const folded = await compactConvo(convo, opts, cfg)
+          if (opts.signal?.aborted) return
+          if (folded) {
+            convo = folded.convo
+            compactedLen = convo.length
+            overflowCompactions++
+            body.messages = convo
+            yield { type: 'text', text: `\n⎗ Context compacted — the request exceeded the model's window; folded ${folded.folded} earlier messages and retrying.\n\n` }
+            attempt-- // the fold+retry doesn't consume the transient-retry budget
+            continue
+          }
         }
         if (!shouldRetry(status) || attempt >= maxAttempts - 1) { yield { type: 'error', message: `API error ${status}: ${errText.slice(0, 400)}` }; return }
         const delay = backoffMs(attempt, parseRetryAfter(res.headers.get('retry-after')))
@@ -447,11 +550,58 @@ async function* agent(messages: Message[], opts: StreamOpts, cfg: AnthropicOpts,
     const results: ApiBlock[] = []
     for (const tu of toolUses) {
       yield { type: 'tool_use', id: tu.id, name: tu.name, input: tu.input }
+      // PreToolUse hooks run first: a hook may DENY the call (short-circuits like a
+      // permission denial, feeding its reason back to the model) or explicitly
+      // ALLOW it (bypassing the normal permission prompt). Extra context a hook
+      // emits is appended to the eventual tool result.
+      let hookAllow = false
+      let preContext = ''
+      if (hooksActive) {
+        const pre = await runHooks('PreToolUse', { tool_name: tu.name, tool_input: tu.input }, cwd, hooksCfg, opts.signal)
+        if (opts.signal?.aborted) return
+        if (pre.decision === 'deny') {
+          const reason = `PreToolUse 钩子拒绝了本次调用：${pre.reason ?? '(no reason given)'}`
+          yield { type: 'tool_result', id: tu.id, name: tu.name, content: reason, isError: true }
+          results.push({ type: 'tool_result', tool_use_id: tu.id, content: reason, is_error: true })
+          continue
+        }
+        if (pre.decision === 'allow') hookAllow = true
+        if (pre.context) preContext = pre.context
+      }
+      // exit_plan_mode is a control tool, not a workspace action: it presents the
+      // finalized plan and asks the user to approve leaving plan mode. Handled here
+      // (not via runTool) because approval flips THIS turn's permission mode —
+      // `permMode` is reassigned so the model may edit immediately, and the change
+      // is propagated to the host (onPermissionModeChange) so it also persists.
+      if (tu.name === 'exit_plan_mode') {
+        const outcome = await handleExitPlanMode(tu.input, opts, sub, permMode)
+        if (opts.signal?.aborted) return
+        if (outcome.newMode) { permMode = outcome.newMode; opts.onPermissionModeChange?.(outcome.newMode) }
+        yield { type: 'tool_result', id: tu.id, name: tu.name, content: outcome.content, isError: outcome.isError }
+        results.push({ type: 'tool_result', tool_use_id: tu.id, content: outcome.content, is_error: outcome.isError })
+        continue
+      }
       // Permission gate: decide whether this tool may run under the current mode.
       // 'deny' (plan-mode mutation, or the user declined) short-circuits — the
       // reason is fed back as an error tool_result so the model adapts instead of
       // the tool actually running; 'ask' prompts the user via requestPermission.
-      const decision = decidePermission(permMode, tu.name, { autoModeInPlan: opts.autoModeInPlan, sub })
+      // A PreToolUse hook that returned "allow" skips this gate.
+      let decision: { action: 'allow' } | { action: 'ask' } | { action: 'deny'; reason: string } =
+        hookAllow ? { action: 'allow' } : decidePermission(permMode, tu.name, { autoModeInPlan: opts.autoModeInPlan, sub })
+      // Persistent permission rules modulate that decision: a matching `deny`
+      // always blocks (overriding a hook/mode allow — a user's explicit veto), an
+      // `allow` skips a prompt the mode would raise, and an `ask` forces a prompt
+      // a mode would auto-allow (top-level only; a sub-agent can't prompt, and
+      // never has a prompt in bypass mode either). Plan-mode mutation denials are
+      // left intact — an allow rule doesn't override read-only planning intent.
+      const rule = matchPermissionRule(tu.name, tu.input, opts.permissionRules)
+      if (rule === 'deny') {
+        decision = { action: 'deny', reason: DENY_RULE_REASON }
+      } else if (rule === 'allow' && decision.action === 'ask') {
+        decision = { action: 'allow' }
+      } else if (rule === 'ask' && decision.action === 'allow' && !sub && permMode !== 'bypassPermissions') {
+        decision = { action: 'ask' }
+      }
       let denyReason: string | undefined
       if (decision.action === 'deny') {
         denyReason = decision.reason
@@ -465,10 +615,26 @@ async function* agent(messages: Message[], opts: StreamOpts, cfg: AnthropicOpts,
         results.push({ type: 'tool_result', tool_use_id: tu.id, content: denyReason, is_error: true })
         continue
       }
-      const r = await runTool(tu.name, tu.input, { cwd, signal: opts.signal, spawnAgent, onWorkflow: opts.onWorkflow, onAgent: opts.onAgent, allowBackground: !sub, artifacts: opts.artifacts, rewind: opts.rewind })
+      const r = await runTool(tu.name, tu.input, { cwd, signal: opts.signal, spawnAgent, onWorkflow: opts.onWorkflow, onAgent: opts.onAgent, allowBackground: !sub, artifacts: opts.artifacts, rewind: opts.rewind, requestUserInput: opts.requestUserInput })
       if (opts.signal?.aborted) return
-      yield { type: 'tool_result', id: tu.id, name: tu.name, content: r.content, display: r.display, isError: r.isError, linesAdded: r.linesAdded, linesRemoved: r.linesRemoved, diff: r.diff }
-      results.push({ type: 'tool_result', tool_use_id: tu.id, content: r.content, is_error: r.isError })
+      // PostToolUse hooks run after execution: a hook may feed extra context back
+      // to the model, or "block" to flag the result (the reason is appended). The
+      // tool has already run, so this shapes the feedback, not whether it ran.
+      let extra = preContext
+      let postError = false
+      if (hooksActive) {
+        const post = await runHooks('PostToolUse', { tool_name: tu.name, tool_input: tu.input, tool_response: { content: r.content, isError: r.isError } }, cwd, hooksCfg, opts.signal)
+        if (opts.signal?.aborted) return
+        if (post.decision === 'deny') { postError = true; extra = [extra, `PostToolUse 钩子：${post.reason ?? 'blocked'}`].filter(Boolean).join('\n\n') }
+        if (post.context) extra = [extra, post.context].filter(Boolean).join('\n\n')
+      }
+      const content = extra ? `${r.content}\n\n[hook]\n${extra}` : r.content
+      const isError = r.isError || postError
+      yield { type: 'tool_result', id: tu.id, name: tu.name, content, display: r.display, isError, linesAdded: r.linesAdded, linesRemoved: r.linesRemoved, diff: r.diff }
+      // Structured blocks (images/PDF from a multimodal read_file) go to the model
+      // in place of the string; the UI event above still carries the text summary.
+      const blocks = r.blocks && !extra ? r.blocks : undefined
+      results.push({ type: 'tool_result', tool_use_id: tu.id, content: blocks ?? content, is_error: isError })
     }
     // Mid-turn interjection: drain anything the user typed while this turn streamed
     // (type-ahead) and merge it into THIS same user turn, as extra text blocks after
