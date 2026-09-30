@@ -1,6 +1,6 @@
 {
   "name": "meowcode",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "MeowCode — a Claude Code–style agentic coding CLI (framework skeleton).",
   "type": "module",
   "bin": {
@@ -15,9 +15,12 @@
   "scripts": {
     "dev": "tsx src/cli.tsx",
     "build": "tsup",
+    "build:bin": "bun run scripts/build-binaries.mjs",
     "start": "node dist/cli.js",
     "typecheck": "tsc --noEmit",
-    "clean": "rm -rf dist"
+    "clean": "rm -rf dist",
+    "version:check": "node scripts/sync-version.mjs check",
+    "version:write": "node scripts/sync-version.mjs write"
   },
   "keywords": [
     "cli",
@@ -26,7 +29,15 @@
     "ink",
     "coding-assistant"
   ],
-  "license": "MIT",
+  "license": "AGPL-3.0-or-later",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xingguangcuican6666/MeowCode.git"
+  },
+  "bugs": {
+    "url": "https://github.com/xingguangcuican6666/MeowCode/issues"
+  },
+  "homepage": "https://github.com/xingguangcuican6666/MeowCode#readme",
   "dependencies": {
     "ink": "~5.1.0",
     "marked": "^12.0.2",

@@ -1,0 +1,195 @@
+name: Release
+
+# 触发：推送形如 v1.2.3 / v1.2.3-rc.1 的版本 tag；也支持手动对已存在的 tag 运行。
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '已存在的 tag（例如 v0.1.0）'
+        required: true
+        type: string
+
+# 顶层默认最小权限；各 job 按需向上申请。
+permissions:
+  contents: read
+
+# 同一 tag 的发布串行执行，且不取消进行中的发布（避免半途中断留下残缺 release）。
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  # ===========================================================================
+  # 1) build —— 无密钥、只读权限。跑构建（会执行大量 devDependencies）、交叉编译
+  #    各平台二进制 + 打 npm tarball + 生成校验和，产物上传为 artifact。
+  #    把"执行任意项目代码"的重活与"持令牌/写权限"的发布环节隔离开，令牌零暴露。
+  # ===========================================================================
+  build:
+    name: Build binaries + npm tarball
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout tag
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Resolve version
+        id: ver
+        # 不可信输入（tag 名 / dispatch 输入）经 env 传入，脚本内用带引号的变量引用，
+        # 绝不把 ${{ }} 直插进 run: 脚本文本（否则形成命令注入）。
+        env:
+          RAW_REF: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          TAG="$RAW_REF"
+          # 白名单校验：仅接受 vX.Y.Z[-prerelease]，杜绝 tag 名里的 shell 元字符
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]] || { echo "非法 tag: $TAG"; exit 1; }
+          VERSION="${TAG#v}"
+          echo "tag=$TAG"         >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "解析版本: tag=$TAG version=$VERSION"
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2   # 固定工具链：二进制内嵌该 Bun 运行时，仅本机验证过 1.4.2；升级需重验交叉编译
+
+      - name: Install
+        run: bun install --frozen-lockfile
+
+      - name: Sync version (tag <-> package.json <-> src/version.ts)
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: node scripts/sync-version.mjs write "$VERSION"
+
+      - name: Typecheck
+        run: bun run typecheck
+
+      - name: Build JS bundle (tsup -> dist/cli.js)
+        run: bun run build
+
+      - name: Cross-compile standalone binaries
+        run: bun run scripts/build-binaries.mjs
+
+      - name: Smoke test (native linux-x64 binary)
+        env:
+          EXPECT_VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          chmod +x dist-bin/meowcode-linux-x64
+          out="$(./dist-bin/meowcode-linux-x64 --version)"
+          echo "binary --version -> $out"
+          test "$out" = "$EXPECT_VERSION"
+          ./dist-bin/meowcode-linux-x64 --help >/dev/null
+      - name: Pack npm tarball
+        run: npm pack --pack-destination dist-bin
+
+      - name: Generate SHA256SUMS
+        working-directory: dist-bin
+        # 只哈希 meowcode-*（二进制 + tarball），排除即将写入的 SHA256SUMS.txt 自身
+        run: sha256sum meowcode-* > SHA256SUMS.txt
+
+      - name: Upload release assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: dist-bin/
+          if-no-files-found: error
+
+  # ===========================================================================
+  # 2) publish —— 持 contents:write 与 id-token:write（provenance/OIDC）。
+  #    只下载已构建产物：创建/刷新 GitHub Release，并把 tarball 发到 npm。
+  #    不重新构建、不执行项目脚本，令牌暴露面最小。
+  # ===========================================================================
+  publish:
+    name: Publish release + npm
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write       # 创建 GitHub Release
+      id-token: write        # npm provenance（OIDC）
+    env:
+      # provenance 默认开启；若遇私有仓库/未配置 Trusted Publisher 等报错，
+      # 把仓库变量 NPM_PROVENANCE 设为 false 即可关闭，无需改工作流。
+      # 注意 GHA 三元短路 `cond && A || B`：A 必须为真值，否则 A 为 '' 时 `|| B` 恒回退。
+      # 故真值分支放 '--provenance'（真值），假值分支放 ''，方向才正确。
+      PROVENANCE: ${{ vars.NPM_PROVENANCE != 'false' && '--provenance' || '' }}
+    steps:
+      - name: Resolve version
+        id: ver
+        # 同 build 作业：不可信 tag/dispatch 输入经 env 传入，脚本内用带引号变量引用。
+        env:
+          RAW_REF: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          TAG="$RAW_REF"
+          # 白名单校验：仅接受 vX.Y.Z[-prerelease]，杜绝 tag 名里的 shell 元字符
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]] || { echo "非法 tag: $TAG"; exit 1; }
+          VERSION="${TAG#v}"
+          # 预发布判定：语义化版本带 '-' 后缀（v1.2.3-rc.1）视为 prerelease，发到 next dist-tag
+          if [[ "$TAG" == *-* ]]; then PRE=true; DISTTAG=next; else PRE=false; DISTTAG=latest; fi
+          echo "tag=$TAG"         >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$PRE"  >> "$GITHUB_OUTPUT"
+          echo "disttag=$DISTTAG" >> "$GITHUB_OUTPUT"
+
+      - name: Detect npm token
+        id: npm
+        # 仅把"令牌是否存在"布尔化为 step 输出，供后续步骤门控；绝不外泄令牌值本身。
+        env:
+          HAS_NPM: ${{ secrets.NPM_TOKEN != '' }}
+        run: echo "has=$HAS_NPM" >> "$GITHUB_OUTPUT"
+      - name: Download release assets
+        uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: dist-bin
+
+      - name: Create/refresh GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.ver.outputs.tag }}
+          PRE: ${{ steps.ver.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          # meowcode-* = 各平台二进制 + npm tarball；再附上校验和
+          assets=(dist-bin/meowcode-* dist-bin/SHA256SUMS.txt)
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG 已存在 -> 覆盖上传资产（幂等）"
+            gh release upload "$TAG" "${assets[@]}" --clobber
+          else
+            pre=""; [ "$PRE" = "true" ] && pre="--prerelease"
+            gh release create "$TAG" "${assets[@]}" --title "$TAG" --generate-notes $pre
+          fi
+
+      - name: Setup Node (npm registry + provenance)
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24                 # npm 11.x：支持 provenance / OIDC
+          registry-url: 'https://registry.npmjs.org'
+
+      # NPM_TOKEN 存在才发布；缺失则只发二进制到 GitHub Release，不硬失败。
+      - name: Publish to npm
+        if: ${{ steps.npm.outputs.has == 'true' }}
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          VERSION: ${{ steps.ver.outputs.version }}
+          DISTTAG: ${{ steps.ver.outputs.disttag }}
+        run: |
+          set -euo pipefail
+          if npm view "meowcode@$VERSION" version >/dev/null 2>&1; then
+            echo "meowcode@$VERSION 已在 npm -> 跳过发布（幂等）"
+            exit 0
+          fi
+          tarball="$(ls dist-bin/meowcode-*.tgz)"
+          echo "发布 $tarball  (dist-tag=$DISTTAG, provenance=${PROVENANCE:-off})"
+          npm publish "$tarball" --access public --tag "$DISTTAG" $PROVENANCE
+
+      - name: npm publish skipped notice
+        if: ${{ steps.npm.outputs.has != 'true' }}
+        run: echo "未配置 NPM_TOKEN secret -> 跳过 npm 发布（仅发布二进制到 GitHub Release）。"
