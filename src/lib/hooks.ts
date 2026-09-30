@@ -22,6 +22,7 @@ import path from 'node:path'
 import fs from 'node:fs'
 import os from 'node:os'
 import { loadConfig } from '../config'
+import { getSetting } from './settings'
 
 export type HookEvent = 'PreToolUse' | 'PostToolUse' | 'UserPromptSubmit' | 'SessionStart' | 'Stop' | 'Notification'
 
@@ -42,6 +43,11 @@ export type HooksConfig = Partial<Record<HookEvent, HookMatcher[]>>
 // concatenating matcher lists per event so both fire (project after user).
 export function loadHooks(cwd = process.cwd()): HooksConfig {
   const merged: HooksConfig = {}
+  // Master off-switch: `disableAllHooks` makes every event resolve to "no hooks"
+  // without touching the user's configured commands, so they can silence hooks
+  // for one session and turn them back on later (mirrors Claude Code's setting).
+  const cfg = loadConfig()
+  if (getSetting(cfg.settings, 'disableAllHooks') === true) return merged
   const add = (h: HooksConfig | undefined): void => {
     if (!h || typeof h !== 'object') return
     for (const ev of HOOK_EVENTS) {
@@ -49,7 +55,7 @@ export function loadHooks(cwd = process.cwd()): HooksConfig {
       if (Array.isArray(list) && list.length) merged[ev] = [...(merged[ev] ?? []), ...list]
     }
   }
-  add(loadConfig().hooks)
+  add(cfg.hooks)
   // Project-local settings.json (only its `hooks` key is consulted here).
   try {
     const p = path.join(cwd, '.anycode', 'settings.json')

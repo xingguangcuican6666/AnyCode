@@ -23,6 +23,7 @@ import { detectIde } from '../lib/ide'
 import { detectChrome } from '../lib/chrome'
 import { t } from '../lib/i18n'
 import { loadAgents } from '../lib/agents'
+import { subagentTypeNames } from '../tools/orchestration'
 import { availableUpdate, type UpdateChannel } from '../lib/update'
 import { CONFIG_FILE } from '../config'
 import os from 'node:os'
@@ -110,6 +111,45 @@ const effort: SlashCommand = {
     }
     ctx.setConfig({ settings: { ...ctx.config.settings, effort: next } })
     ctx.print(t('cmd.effortSet', { effort: next }), 'system')
+  },
+}
+
+// --- /output-style: how much explanation responses carry (the `outputStyle`
+// setting, applied via outputStyleDirective in useChat). Mirrors /effort. ---
+const OUTPUT_STYLES = ['default', 'concise', 'explanatory'] as const
+const outputStyle: SlashCommand = {
+  name: 'output-style',
+  aliases: ['outputstyle'],
+  get description() { return t('cmd.outputStyleDesc', { styles: OUTPUT_STYLES.join(' | ') }) },
+  run(ctx) {
+    const cur = String(getSetting(ctx.config.settings, 'outputStyle'))
+    const next = ctx.args.trim().toLowerCase()
+    if (!next) { ctx.print(t('cmd.outputStyleCurrent', { cur, styles: OUTPUT_STYLES.join(', ') }), 'system'); return }
+    if (!(OUTPUT_STYLES as readonly string[]).includes(next)) {
+      ctx.print(t('cmd.outputStyleUnknown', { style: next, styles: OUTPUT_STYLES.join(', ') }), 'system', { error: true })
+      return
+    }
+    ctx.setConfig({ settings: { ...ctx.config.settings, outputStyle: next } })
+    ctx.print(t('cmd.outputStyleSet', { style: next }), 'system')
+  },
+}
+
+// --- /vim: toggle the prompt's vim key bindings (the `editorMode` setting; the
+// modal logic lives in PromptInput). Bare toggles vim↔normal; an explicit
+// normal|vim|emacs|off argument sets that mode directly. ---
+const vim: SlashCommand = {
+  name: 'vim',
+  get description() { return t('cmd.vimDesc') },
+  run(ctx) {
+    const cur = String(getSetting(ctx.config.settings, 'editorMode') || 'normal')
+    const arg = ctx.args.trim().toLowerCase()
+    let next: string
+    if (!arg) next = cur === 'vim' ? 'normal' : 'vim'
+    else if (arg === 'off' || arg === 'normal') next = 'normal'
+    else if (arg === 'vim' || arg === 'emacs') next = arg
+    else { ctx.print(t('cmd.vimUnknown', { mode: arg }), 'system', { error: true }); return }
+    ctx.setConfig({ settings: { ...ctx.config.settings, editorMode: next } })
+    ctx.print(t('cmd.vimSet', { mode: next }), 'system')
   },
 }
 
@@ -228,7 +268,7 @@ const config: SlashCommand = {
 // --- /usage: session token accounting + context-window fill ---
 const usage: SlashCommand = {
   name: 'usage',
-  aliases: ['tokens'],
+  aliases: ['tokens', 'cost'],
   get description() { return t('cmd.usageDesc') },
   run(ctx) {
     if (ctx.openPanel) { ctx.openPanel('usage'); return }
@@ -696,6 +736,30 @@ const fork: SlashCommand = {
     const id = ctx.forkCurrent()
     if (!id) { ctx.print(t('cmd.forkEmpty'), 'system', { error: true }); return }
     ctx.print(t('cmd.forkDone', { id }), 'system')
+  },
+}
+
+// --- /agents: list the sub-agent types available to task/plan/workflow —
+// built-in roles plus custom ones from .anycode/agents/*.md (read-only, mirrors
+// /mcp and /hooks). Defining a new agent is a Markdown file, not a command. ---
+const agents: SlashCommand = {
+  name: 'agents',
+  get description() { return t('cmd.agentsDesc') },
+  run(ctx) {
+    const cwd = process.cwd()
+    const custom = loadAgents(cwd)
+    const customNames = new Set(custom.map((a) => a.name))
+    const builtins = subagentTypeNames(cwd).filter((n) => !customNames.has(n))
+    const lines: string[] = [t('cmd.agentsBuiltinHeader'), builtins.map((n) => `\`${n}\``).join(', ')]
+    lines.push('', custom.length ? t('cmd.agentsCustomHeader') : t('cmd.agentsCustomNone'))
+    for (const a of custom) {
+      lines.push(`- \`${a.name}\` — ${a.description}`)
+      const extra = [a.model ? `model: ${a.model}` : '', a.tools?.length ? `tools: ${a.tools.join(', ')}` : ''].filter(Boolean).join(' · ')
+      if (extra) lines.push(`    ${extra}`)
+      lines.push(`    ${a.source}`)
+    }
+    lines.push('', t('cmd.agentsHint'))
+    ctx.print(lines.join('\n'), 'system')
   },
 }
 
@@ -1204,7 +1268,7 @@ const chrome: SlashCommand = {
   },
 }
 
-const builtins: SlashCommand[] = [help, clear, newSession, model, provider, login, logout, effort, theme, goal, plan, loop, memory, config, usage, status, stats, compact, autocompact, skill, init, hooks, mcp, doctor, exportCmd, review, terminalSetup, statusline, permissions, copy, worktree, editor, feedback, rewind, dm, sessions, ide, chrome, resume, fork, version, exit]
+const builtins: SlashCommand[] = [help, clear, newSession, model, provider, login, logout, effort, outputStyle, vim, theme, goal, plan, loop, memory, config, usage, status, stats, compact, autocompact, skill, init, hooks, mcp, agents, doctor, exportCmd, review, terminalSetup, statusline, permissions, copy, worktree, editor, feedback, rewind, dm, sessions, ide, chrome, resume, fork, version, exit]
 
 // Merge user-defined commands (from ~/.anycode/commands and ./.anycode/commands)
 // into the registry, but never let them shadow a built-in name or alias. Loaded

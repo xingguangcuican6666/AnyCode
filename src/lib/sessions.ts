@@ -10,7 +10,8 @@
 // autosave. The stored config never carries the API key (same rule as saveConfig).
 import path from 'node:path'
 import fs from 'node:fs'
-import { CONFIG_DIR } from '../config'
+import { CONFIG_DIR, loadConfig } from '../config'
+import { getSetting } from './settings'
 import type { SessionSnapshot } from '../app'
 
 export const SESSIONS_DIR = path.join(CONFIG_DIR, 'sessions')
@@ -147,11 +148,30 @@ export function latestSession(cwd: string | null = process.cwd()): SessionMeta |
 }
 
 // Trim each workspace to MAX_PER_WORKSPACE, deleting its oldest files. Grouped
-// by cwd so a busy project never evicts another project's saved sessions.
+// by cwd so a busy project never evicts another project's saved sessions. Also
+// applies the `cleanupPeriodDays` retention policy across ALL workspaces: any
+// session last saved longer ago than that window is deleted (0 = keep forever).
 function prune(): void {
   try {
+    const metas = allMetas() // already newest-first
+    // Age-based retention (global): mirrors Claude Code's cleanupPeriodDays. Read
+    // from the persisted config so it applies even to background autosaves.
+    let cutoff = 0
+    try {
+      const days = Number(getSetting(loadConfig().settings, 'cleanupPeriodDays'))
+      if (Number.isFinite(days) && days > 0) cutoff = Date.now() - days * 86_400_000
+    } catch { /* config unreadable — skip age pruning */ }
+    const survivors: SessionMeta[] = []
+    for (const m of metas) {
+      if (cutoff && m.savedAt < cutoff) {
+        try { fs.unlinkSync(fileFor(m.id)) } catch { /* ignore one bad unlink */ }
+      } else {
+        survivors.push(m)
+      }
+    }
+    // Count-based cap, per workspace, on whatever's left after age pruning.
     const byCwd = new Map<string, SessionMeta[]>()
-    for (const m of allMetas()) { // already newest-first
+    for (const m of survivors) {
       const k = normCwd(m.cwd)
       const arr = byCwd.get(k) ?? []
       arr.push(m)
