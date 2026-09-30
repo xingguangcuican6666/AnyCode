@@ -25,6 +25,11 @@ export interface ThemeColors {
   warning: string
   dim: string
   text: string
+  // Reasoning ("thinking") text — a shade between `dim` and `text`, so the folded
+  // reasoning reads clearly against the (dark) background instead of nearly
+  // vanishing into it, while still sitting a notch below full text brightness.
+  // Optional: falls back to `dim` for palettes that don't set it (the ANSI themes).
+  thinking?: string
   // Full-row background tints for added / removed diff lines (GitHub/Claude Code
   // style). Empty string = no background (the ANSI-only themes, where a subtle
   // tint isn't possible, keep the plain coloured foreground instead).
@@ -67,6 +72,7 @@ export const themes: Record<string, Theme> = {
       warning: '#E5C07B',
       dim: '#6B6B6B',
       text: '#E6E6E6',
+      thinking: '#909090',
       diffAddBg: '#16351f',
       diffDelBg: '#3b1719',
       blockBg: '#1e1e22',
@@ -89,6 +95,7 @@ export const themes: Record<string, Theme> = {
       warning: '#A16207',
       dim: '#78716C',
       text: '#1C1917',
+      thinking: '#5C5753',
       diffAddBg: '#CBEBD1',
       diffDelBg: '#F7CFD1',
       blockBg: '#F0EEEC',
@@ -111,6 +118,7 @@ export const themes: Record<string, Theme> = {
       warning: '#F0E442',
       dim: '#6B6B6B',
       text: '#E6E6E6',
+      thinking: '#909090',
       diffAddBg: '#123246',
       diffDelBg: '#3a2410',
       blockBg: '#1e1e22',
@@ -133,6 +141,7 @@ export const themes: Record<string, Theme> = {
       warning: '#8A6D00',
       dim: '#78716C',
       text: '#1C1917',
+      thinking: '#5C5753',
       diffAddBg: '#CCE1F2',
       diffDelBg: '#F3DEC9',
       blockBg: '#ECEEF0',

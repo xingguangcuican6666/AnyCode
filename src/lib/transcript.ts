@@ -379,17 +379,22 @@ export function bannerLines(width: number): FlatLine[] {
 // reflowed reasoning text. The committed form collapses to one "Thought" line
 // (see flattenMessages); this keeps the in-progress reasoning visible while it
 // streams, so the owned viewport can window it like any other content.
-export function thinkingLines(msg: Message, _width: number): FlatLine[] {
-  // Render the LIVE (streaming) reasoning as a single collapsed line — like the
-  // committed "✻ Thought for Ns" run — instead of dumping the whole in-flight body
-  // above the prompt. This keeps thinking folded while it streams (it never leaks
-  // its full text into the transcript), and it also removes the per-delta re-wrap
-  // of the entire growing reasoning string that made large thinking blocks lag.
-  // The StatusLine shows the live spinner/elapsed cue; the full text is still kept
-  // in the committed block (expand with `verbose`).
+export function thinkingLines(msg: Message, width: number, expanded = false): FlatLine[] {
+  // Render the LIVE (streaming) reasoning as a single collapsed line by default —
+  // like the committed "✻ Thought for Ns" run — instead of dumping the whole
+  // in-flight body above the prompt. This keeps thinking folded while it streams
+  // (it never leaks its full text) and avoids the per-delta re-wrap of the entire
+  // growing reasoning string that made large thinking blocks lag. When `expanded`
+  // (ctrl+o, or the `verbose` setting), show the full in-flight body so the user
+  // can read the reasoning as it streams, then collapse again.
   const secs = msg.meta?.thinkingSeconds
   const label = secs ? `${t('message.thinking')} ${secs}s` : t('message.thinking')
-  return [{ text: `  ${symbols.star} ${label}`, kind: 'thinking' }]
+  const head: FlatLine = { text: `  ${symbols.star} ${label}`, kind: 'thinking' }
+  if (!expanded) return [head]
+  const contentW = Math.max(20, width - 4)
+  const out: FlatLine[] = [head]
+  for (const l of plainLines(msg.content, contentW)) out.push({ text: `  ${l}`, kind: 'thinking' })
+  return out
 }
 
 // Rebuild a sub-agent's transcript (Message[]) from its raw event stream, so the

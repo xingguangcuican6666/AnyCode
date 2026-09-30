@@ -178,6 +178,9 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume,
   // default state (see lib/transcript FlattenOpts.expanded). A no-drag click on a
   // grouped row flips its membership; the transcript re-flattens accordingly.
   const [expanded, setExpanded] = useState<Set<string>>(new Set())
+  // Whether the LIVE (streaming) reasoning fold is expanded to its full in-flight
+  // body. Toggled with ctrl+o while a thinking block streams; resets when it ends.
+  const [liveThinkingExpanded, setLiveThinkingExpanded] = useState(false)
   // Workflow overlay state. `wfExpanded` is the id of the workflow whose full
   // tree is open (null = none); it renders in the live region and owns the
   // keyboard while open. `wfSel` is the index of the collapsed line under the
@@ -720,14 +723,17 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume,
   const expandAll = getSetting(chat.config.settings, 'verbose') === true
   const committed = useMemo(() => flattenMessages(chat.messages, width, { banner: true, expanded, expandAll }), [chat.messages, width, expanded, expandAll])
   const liveThink = useMemo(
-    () => (chat.thinking && chat.thinking.content.trim() ? thinkingLines(chat.thinking, width) : []),
-    [chat.thinking, width],
+    () => (chat.thinking && chat.thinking.content.trim() ? thinkingLines(chat.thinking, width, liveThinkingExpanded || expandAll) : []),
+    [chat.thinking, width, liveThinkingExpanded, expandAll],
   )
   const liveStream = useMemo(
     () => (chat.streaming && chat.streaming.content.trim() ? flattenMessages([chat.streaming], width) : []),
     [chat.streaming, width],
   )
   const mainLines = useMemo(() => committed.concat(liveThink, liveStream), [committed, liveThink, liveStream])
+  // Start each thinking block collapsed: clear the live-expand toggle when the
+  // streaming reasoning ends (chat.thinking → null).
+  useEffect(() => { if (!chat.thinking) setLiveThinkingExpanded(false) }, [chat.thinking])
   // When a sub-agent is selected in the switcher, the viewport shows ITS OWN
   // transcript (flattened from its event stream) instead of the main one, headed
   // by a divider naming the agent and its state. This is the "switch to another
@@ -785,7 +791,7 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume,
       // Shade hierarchy done with the FONT, not a background: thinking (inner
       // monologue) is the faintest, tool output reads at full text brightness (real
       // data you scan), so the two are clearly different depths at a glance.
-      case 'thinking': return colors.dim
+      case 'thinking': return colors.thinking || colors.dim
       case 'collapsed': return colors.dim
       case 'tool': return colors.text
       case 'system': return colors.system
@@ -1163,6 +1169,13 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume,
       const cur = String(getSetting(bag, 'permissionMode') || 'default')
       const next = nextPermissionMode(isPermissionMode(cur) ? cur : 'default')
       chatRef.current.setConfig({ settings: { ...bag, permissionMode: next } })
+      return
+    }
+    // ctrl+o expands / collapses the LIVE reasoning fold, so the in-flight thinking
+    // can be read as it streams and then re-collapsed. Only meaningful while a
+    // thinking block is streaming (chat.thinking is non-null).
+    if (key.ctrl && input === 'o') {
+      if (chat.thinking) setLiveThinkingExpanded((v) => !v)
       return
     }
     // Transcript scrolling. The owned viewport windows the flattened transcript
