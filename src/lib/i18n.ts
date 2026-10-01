@@ -587,6 +587,13 @@ export const messages = {
   'app.sessionRecap': { zh: '↩ 已恢复会话 · {n} 条消息 · 上次：{last}', en: '↩ Resumed session · {n} messages · last: {last}' },
   'footer.suggest': { zh: '试试：{items}', en: 'Try: {items}' },
   'footer.update': { zh: '↑ 有新版本 {version}（{channel} 通道）· 运行 `bun add -g meowcode` 更新', en: '↑ update available: {version} ({channel} channel) · run `bun add -g meowcode`' },
+  // monitor / schedule sink wakeups — shown as `role: 'system'` notices so they
+  // stay out of the model context (they're an interjection signal, not a user turn).
+  'monitor.wakeup': { zh: '▸ 监视器「{description}」产出了新输出 —— 等待空闲时唤醒。', en: '▸ Monitor “{description}” produced output — will wake up idle.' },
+  'monitor.line': { zh: '[监视 {id}] {line}', en: '[monitor {id}] {line}' },
+  'monitor.ended': { zh: '[监视 {id} 已结束] {note}', en: '[monitor {id} ended] {note}' },
+  'schedule.wakeup': { zh: '▸ 定时任务「{label}」触发 —— 等待空闲时唤醒。', en: '▸ Schedule “{label}” fired — will wake up idle.' },
+  'schedule.line': { zh: '[定时 {id}] {line}', en: '[scheduled {id}] {line}' },
   // PermissionDialog (permissionMode / autoModeInPlan)
   'perm.title': { zh: '允许运行此工具？', en: 'Allow this tool to run?' },
   'perm.optOnce': { zh: '允许一次', en: 'Allow once' },

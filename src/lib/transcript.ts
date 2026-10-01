@@ -238,6 +238,12 @@ function emitMsg(m: Message, out: FlatLine[], contentW: number): void {
   } else if (m.role === 'system') {
     const kind: LineKind = m.meta?.error ? 'error' : m.meta?.retry ? 'retry' : 'system'
     mdLines(m.content, contentW).forEach((l) => push(`  ${l}`, kind))
+  } else if (m.role === 'tool') {
+    // A monitor/schedule wakeup already carries a `[scheduled: …]`/`[monitor · …]`
+    // head line; render the buffered content dimly as a tool line so the user sees
+    // it as "the watcher said X", never as if they had typed it.
+    m.content.split('\n').forEach((l) => push(`  ${l}`, 'tool'))
+    spacer()
   } else {
     mdLines(m.content, contentW).forEach((l, i) =>
       push(i === 0 ? `${symbols.assistant} ${l}` : `  ${l}`, 'assistant'))

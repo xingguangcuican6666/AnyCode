@@ -80,6 +80,15 @@ export interface MessageMeta {
   // checkpoints captured during it (lib/checkpoints), so the Rewind menu can
   // restore the code as it was just before this turn. UI-only; not sent to the API.
   ts?: number
+  // Identifies a `monitor` tool result (the monitor's id) so the transcript can
+  // group/limit lines from the same watcher. UI-only; filtered from the API by role.
+  monitorId?: string
+  // True on the final monitor flush for a watcher (its command exited / timed out).
+  // Lets the UI render a closing line and lets cleanup drop the monitor. UI-only.
+  monitorDone?: boolean
+  // Identifies a `schedule` tool result (the job's id) so the transcript can track
+  // which scheduled job produced the wakeup. UI-only; filtered from the API by role.
+  scheduledId?: string
 }
 
 export interface Message {

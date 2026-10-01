@@ -207,6 +207,10 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume,
   const judgingRef = useRef(false)
   // Lines the user submitted while a response was streaming; flushed when idle.
   const [queued, setQueued] = useState<string[]>([])
+  // Buffered scheduled-job payloads / monitor output accumulated while streaming,
+  // flushed as `role: 'tool'` results at idle (see the sink wiring below).
+  const schedulePendingRef = useRef<Map<string, string[]>>(new Map())
+  const monitorPendingRef = useRef<Map<string, string[]>>(new Map())
   const exitTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   // Timestamp of the last idle Esc, so a second Esc within 500ms opens Rewind.
   const lastEscRef = useRef(0)
@@ -922,16 +926,38 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume,
   // (the `localNotifications` setting). We fire on the streaming true→false edge
   // and only when focus reporting says the user has switched away, so an active
   // watcher isn't pinged. Best-effort escapes (see lib/notify); no-op off-TTY.
+  // Also flushes any monitor/schedule output buffered while the turn streamed:
+  // the SAME streaming→idle edge is the safe moment to print those buffered
+  // `role: 'tool'` results + wakeup line (the sink itself buffers rather than
+  // enqueue, so nothing splices into a running reply). Firing here (rather than
+  // in the sink, which only knows its own event) also coalesces all of them into
+  // one idle flush.
   useEffect(() => {
     if (streaming) { wasStreamingRef.current = true; return }
-    if (!wasStreamingRef.current) return
+    const wasStreaming = wasStreamingRef.current
     wasStreamingRef.current = false
-    // Tell any session subscribed to us (via the socket hub) that we just went
-    // idle — the inter-session equivalent of "finished a turn".
-    notifyIdle(Date.now())
-    if (getSetting(chat.config.settings, 'localNotifications') === false) return
-    if (focusedRef.current) return
-    notifyDesktop('MeowCode', translate(lang, 'notify.turnDone'))
+    if (wasStreaming) {
+      // Buffered monitor/schedule output (sink ran while streaming): flush as
+      // `role: 'tool'` results now that the turn is idle, then wake the driver.
+      for (const [id, buf] of schedulePendingRef.current) {
+        if (buf.length === 0) continue
+        schedulePendingRef.current.delete(id)
+        chatRef.current.print(`[scheduled wakeup ${id}]`, 'tool', { scheduledId: id })
+        for (const line of buf) if (line.trim()) chatRef.current.print(t('schedule.line', { id, line }), 'tool')
+      }
+      for (const [id, buf] of monitorPendingRef.current) {
+        if (buf.length === 0) continue
+        monitorPendingRef.current.delete(id)
+        chatRef.current.print(`[monitor wakeup ${id}]`, 'tool', { monitorId: id })
+        for (const line of buf) if (line.trim()) chatRef.current.print(t('monitor.line', { id, line }), 'tool')
+      }
+      // Tell any session subscribed to us (via the socket hub) that we just went
+      // idle — the inter-session equivalent of "finished a turn".
+      notifyIdle(Date.now())
+      if (getSetting(chat.config.settings, 'localNotifications') === false) return
+      if (focusedRef.current) return
+      notifyDesktop('MeowCode', translate(lang, 'notify.turnDone'))
+    }
   }, [streaming, chat.config.settings])
 
   // One-time session recap (the `sessionRecap` setting): when this instance was
@@ -1443,20 +1469,59 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume,
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [streaming, queued, goal, loop])
 
-  // Wire the agent-facing timers (lib/scheduler, lib/monitor) to the same
-  // type-ahead queue the `send` action uses: when a scheduled job fires or a
-  // monitored command emits a line, we enqueue it, and the idle driver above
-  // flushes it as a fresh turn (priority #1) so the model resumes on its own.
-  // Registered once on mount; the singletons outlive an App remount, so we just
-  // re-attach the sink and leave any in-flight jobs/monitors running.
+  // Wire the agent-facing timers (lib/scheduler, lib/monitor) to the transcript
+  // and the idle driver. A scheduled job or a monitored command no longer lands in
+  // the type-ahead queue as fake user input; instead it prints a `role: 'system'`
+  // notice while streaming, and at idle prints the buffered output as `role: 'tool'`
+  // results (tagged with the job/monitor id) followed by a wakeup line the idle
+  // driver picks up as a fresh turn — so the model is woken with the content as a
+  // tool result, never as if the user had typed it. Registered once on mount; the
+  // singletons outlive an App remount, so we just re-attach the sink and leave any
+  // in-flight jobs/monitors running.
   useEffect(() => {
     setScheduleSink((payload, meta) => {
       const tag = meta.kind === 'interval' ? `${meta.label} · fire ${meta.fires}` : meta.label
-      setQueued((q) => [...q, `[scheduled: ${tag}]\n${payload}`])
+      const lines = payload.split('\n')
+      if (chatRef.current.status === 'streaming') {
+        // Streaming: surface as a notice + per-line dim lines, never a queued user turn.
+        chatRef.current.print(t('schedule.wakeup', { label: tag }), 'system')
+        for (const line of lines) if (line.trim()) chatRef.current.print(t('schedule.line', { id: meta.jobId, line }), 'system')
+        const cur = schedulePendingRef.current.get(meta.jobId) ?? []
+        cur.push(...lines)
+        schedulePendingRef.current.set(meta.jobId, cur)
+        return
+      }
+      // Idle: flush as a tool result so the model sees the wakeup content, then wake.
+      const cur = schedulePendingRef.current.get(meta.jobId) ?? []
+      schedulePendingRef.current.delete(meta.jobId)
+      cur.push(...lines)
+      if (cur.length === 0) return
+      chatRef.current.print(`[scheduled: ${tag}]`, 'tool', { scheduledId: meta.jobId })
+      for (const line of cur) if (line.trim()) chatRef.current.print(t('schedule.line', { id: meta.jobId, line }), 'tool')
+      chatRef.current.print(t('schedule.wakeup', { label: tag }), 'system')
     })
     setMonitorSink((lines, meta) => {
       const head = `[monitor · ${meta.description}${meta.done ? ' · ended' : ''}]`
-      setQueued((q) => [...q, `${head}\n${lines.join('\n')}`])
+      if (chatRef.current.status === 'streaming') {
+        // Streaming: surface as a notice + per-line dim lines, never a queued user turn.
+        chatRef.current.print(t('monitor.wakeup', { description: meta.description }), 'system')
+        for (const line of lines) if (line.trim()) chatRef.current.print(t('monitor.line', { id: meta.id, line }), 'system')
+        if (meta.done) chatRef.current.print(t('monitor.ended', { id: meta.id, note: meta.description }), 'system')
+        const cur = monitorPendingRef.current.get(meta.id) ?? []
+        cur.push(...lines)
+        if (meta.done) cur.push(`[monitor ended: ${meta.description}]`)
+        monitorPendingRef.current.set(meta.id, cur)
+        return
+      }
+      // Idle: flush as a tool result so the model sees the monitor output, then wake.
+      const cur = monitorPendingRef.current.get(meta.id) ?? []
+      monitorPendingRef.current.delete(meta.id)
+      cur.push(...lines)
+      if (meta.done) cur.push(`[monitor ended: ${meta.description}]`)
+      if (cur.length === 0) return
+      chatRef.current.print(head, 'tool', { monitorId: meta.id, monitorDone: meta.done })
+      for (const line of cur) if (line.trim()) chatRef.current.print(t('monitor.line', { id: meta.id, line }), 'tool')
+      chatRef.current.print(t('monitor.wakeup', { description: meta.description }), 'system')
     })
     return () => { setScheduleSink(null); setMonitorSink(null) }
   }, [])
