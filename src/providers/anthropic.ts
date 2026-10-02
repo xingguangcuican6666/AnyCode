@@ -6,7 +6,7 @@ import { loadHooks, runHooks } from '../lib/hooks'
 import { estimateTokens } from '../lib/tokens'
 import { contextLimit, AUTO_COMPACT_RATIO } from '../lib/usage'
 import { parseRetryCodes, sleep, backoffMs, parseRetryAfter } from './retry'
-import { type ApiBlock, type ApiMsg, type StreamUsage, emptyStreamUsage, toApiMessages, parseStream } from './wire'
+import { type ApiBlock, type ApiMsg, toApiMessages, parseStream } from './wire'
 import { t } from '../lib/i18n'
 
 const API_VERSION = '2023-06-01'

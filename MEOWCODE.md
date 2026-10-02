@@ -25,16 +25,20 @@ relay, or a user-defined Anthropic-protocol endpoint.
 npm run dev         # interactive session; tsx src/cli.tsx (mock provider, no key)
 npm run build       # tsup → dist/cli.js (ESM, shebang)
 node dist/cli.js    # run the bundle (or: npm link → `meowcode`)
-npm run typecheck   # tsc --noEmit  ← the closest thing to a linter; there is none
+npm run typecheck   # tsc --noEmit
+npm run lint        # eslint src (flat config: eslint.config.mjs; react-hooks rules on)
+npm run test        # vitest run (unit tests live next to sources as *.test.ts)
 npm run clean       # rm -rf dist
 npm run start       # node dist/cli.js
 ```
 
-- **There are no tests and no lint tool.** `typecheck` + `build` is the whole
-  verification story. Always run both before finishing.
-- **CI** (`.github/workflows/build.yml`) installs with **Bun** and runs `bun run
-  typecheck` + `bun run build`. The repo is `"type": "module"` (ESM, `ESNext`/
-  `Bundler` resolution); imported local modules use extensionless paths.
+- Verification story: `typecheck` + `lint` + `test` + `build`. Lint errors are
+  blocking; non-null assertions and react-hooks/exhaustive-deps are warnings.
+  Always run all four before finishing.
+- **CI** (`.github/workflows/build.yml`) installs with **Bun** and runs
+  `bun run typecheck` + `bun run lint` + `bun run test` + `bun run build`. The
+  repo is `"type": "module"` (ESM, `ESNext`/`Bundler` resolution); imported
+  local modules use extensionless paths.
 - `.gitignore` excludes `dist/`, `node_modules/`, and `.anycode/` (the user's
   config/sessions/memory live in `~/.anycode`, **not** in the repo).
 

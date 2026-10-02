@@ -170,7 +170,6 @@ async function runInteractive(initial: AppConfig, resume?: { snapshot: SessionSn
   try {
     for (;;) {
       let again = false
-      let instance: ReturnType<typeof render> | undefined
       const remount = (next: AppConfig, snap: SessionSnapshot | null): void => {
         config = next
         snapshot = snap
@@ -206,7 +205,7 @@ async function runInteractive(initial: AppConfig, resume?: { snapshot: SessionSn
       const onSnapshot = (snap: SessionSnapshot): void => { last = snap; scheduleSave() }
       // App owns ctrl+c (interrupt / press-twice-to-exit), so keep Ink from
       // exiting on the first ctrl+c itself.
-      instance = render(
+      const instance = render(
         <App config={config} initial={snapshot} resumed={resumed} sessionId={sessionId} onClear={onClear} onRepaint={onRepaint} onSnapshot={onSnapshot} onResume={onResume} onFork={onFork} />,
         { exitOnCtrlC: false, stdin: wrapped as unknown as NodeJS.ReadStream },
       )

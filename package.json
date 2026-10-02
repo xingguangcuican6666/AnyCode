@@ -20,7 +20,9 @@
     "typecheck": "tsc --noEmit",
     "clean": "rm -rf dist",
     "version:check": "node scripts/sync-version.mjs check",
-    "version:write": "node scripts/sync-version.mjs write"
+    "version:write": "node scripts/sync-version.mjs write",
+    "test": "vitest run",
+    "lint": "eslint src"
   },
   "keywords": [
     "cli",
@@ -46,11 +48,16 @@
     "string-width": "^7.2.0"
   },
   "devDependencies": {
+    "@eslint/js": "^10.0.1",
     "@types/node": "^22.10.0",
     "@types/react": "^18.3.12",
+    "eslint": "^10.11.0",
+    "eslint-plugin-react-hooks": "^7.1.1",
     "tsup": "^8.3.5",
     "tsx": "^4.19.2",
-    "typescript": "^5.7.2"
+    "typescript": "^5.7.2",
+    "typescript-eslint": "^8.71.0",
+    "vitest": "^5.0.3"
   },
   "allowScripts": {
     "esbuild@0.27.7": true,

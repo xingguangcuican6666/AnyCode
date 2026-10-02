@@ -78,7 +78,7 @@ export function AskUserDialog({ questions, width, onSubmit, onCancel }: Props): 
     if (key.upArrow) { setIndex((i) => Math.max(0, i - 1)); return }
     if (key.downArrow) { setIndex((i) => Math.min(rowCount - 1, i + 1)); return }
     if (ch === ' ' && multi && index !== otherIndex) {
-      setSelected((s) => { const n = new Set(s); n.has(index) ? n.delete(index) : n.add(index); return n })
+      setSelected((s) => { const n = new Set(s); if (n.has(index)) { n.delete(index) } else { n.add(index) } return n })
       return
     }
     if (key.return) { confirmOptions(); return }

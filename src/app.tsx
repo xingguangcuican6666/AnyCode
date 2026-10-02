@@ -53,7 +53,7 @@ import { clearBgShells } from './lib/bgshell'
 import { restoreToTimestamp, clearCheckpoints } from './lib/checkpoints'
 import { startMcpServers, stopMcpServers } from './lib/mcp'
 import { judgeGoal } from './lib/goalJudge'
-import { formatInterval, formatLoop, formatGoal, type ActiveLoop, type ActiveGoal } from './app-helpers'
+import { formatLoop, formatGoal, type ActiveLoop, type ActiveGoal } from './app-helpers'
 
 // Re-exported so existing importers (cli.tsx, lib/sessions) keep resolving these
 // from './app'; the definitions now live in ./app-helpers.
@@ -103,7 +103,7 @@ interface Props {
   sessionId?: string
 }
 
-export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume, onFork, resumed, sessionId }: Props): React.ReactElement {
+export function App({ config, initial, onClear, onSnapshot, onResume, onFork, resumed, sessionId }: Props): React.ReactElement {
   const { exit } = useApp()
   const { stdout } = useStdout()
   const { stdin, setRawMode } = useStdin()
@@ -780,7 +780,6 @@ export function App({ config, initial, onClear, onRepaint, onSnapshot, onResume,
   // ansi-aware wrap="truncate" clips an over-long row at render).
   const padFull = (s: string): string => { const w = displayWidth(s); return w < width ? s + ' '.repeat(width - w) : s }
   const visible = lines.slice(cur, cur + viewportH)
-  const below = Math.max(0, total - (cur + viewportH))
   // Fresh / short session → banner sits at the TOP, input at the BOTTOM, an empty
   // middle between them (exactly what real Claude Code shows — see #52). Once the
   // transcript overflows, the tail pins just above the input instead.

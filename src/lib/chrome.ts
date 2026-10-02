@@ -1,6 +1,5 @@
 import fs from 'node:fs'
 import path from 'node:path'
-import os from 'node:os'
 
 // Best-effort Chrome detection for the `chromeEnabled` setting ("Claude in
 // Chrome"). The full browser integration needs a companion extension (not built
