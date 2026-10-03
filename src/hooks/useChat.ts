@@ -66,6 +66,12 @@ export interface ChatActions {
   // the idle flush) and removes them from the queue. Called from useChat's provider
   // opts after each tool batch. Absent = no interjection support.
   takePending?: () => string[]
+  // Drain the async-event queue for a MID-TURN event injection: returns already-
+  // formatted strings (already framed as background events) that fired while the
+  // turn was streaming (monitor/schedule output, peer messages/idle notices).
+  // Absent = no mid-turn event injection; events will be delivered on the next
+  // idle wakeup instead.
+  takeEvents?: () => string[]
   compact?: () => number | Promise<number>
   openPanel?: (tab: PanelTab) => void
   openLogin?: () => void
@@ -130,7 +136,7 @@ export interface Chat {
   // tail. No remount, no screen clear (unlike the old onRepaint path). Returns the
   // number actually folded (0 = nothing to do). Drives /compact + auto-compaction.
   foldContext: (summary: string, foldCount: number) => number
-  submit: (raw: string, actions: ChatActions) => Promise<void>
+  submit: (raw: string, actions: ChatActions, wakeOpts?: { wakeup?: boolean }) => Promise<void>
   interrupt: () => void
   // Destroy a finished workflow / switchable sub-agent snapshot once it loses UI
   // focus, so completed instances stop lingering at the bottom (see app.tsx).
@@ -263,6 +269,9 @@ export function useChat(initialConfig: AppConfig, initialMessages?: Message[], i
   const interrupt = useCallback(() => {
     // Streaming turn: abort the in-flight request (its controller). Background
     // work has its OWN controller, so a streaming interrupt leaves it running.
+    // Queued interjections are preserved — they'll be injected mid-turn if the
+    // turn continues, or become the next turn once idle (Claude Code behavior:
+    // Esc aborts the streaming reply but typed text survives).
     if (abortRef.current) { abortRef.current.abort(); return }
     // Idle with background work pending: a second Esc cancels the background run.
     // Flag the drain so it drops the (aborted) results instead of feeding them
@@ -273,19 +282,26 @@ export function useChat(initialConfig: AppConfig, initialMessages?: Message[], i
     }
   }, [])
 
-  const submit = useCallback(async (raw: string, actions: ChatActions) => {
+  const submit = useCallback(async (raw: string, actions: ChatActions, wakeOpts?: { wakeup?: boolean }) => {
     const text = raw.trim()
     if (!text || status === 'streaming') return
 
     const prior = messagesRef.current
-    const cmd = isCommand(text)
+    // An async-event wakeup (monitor/schedule output or a peer message, injected by
+    // the idle driver) is never a slash command and must skip image/mention
+    // expansion and the UserPromptSubmit hooks — it is a machine event, not typed
+    // input. It still commits as a role:'user' message (so toApiMessages carries it
+    // to the model) but tagged meta.wakeup so it reaches the API framed as an event
+    // and renders as a dim "▸ …" line, not a "> " prompt.
+    const wakeup = wakeOpts?.wakeup === true
+    const cmd = !wakeup && isCommand(text)
     // Non-command prompts: pull out any image references (dropped/typed image
     // paths, or clipboard images stashed to a temp file by ctrl+v) into
     // attachments, leaving "[Image #N]" placeholders in the visible text, and
     // inject the contents of any @path mentions (kept visible as-is) so the
     // model sees the referenced files without a read_file round-trip.
-    const { text: shownText, attachments } = cmd ? { text, attachments: [] } : processImagePrompt(text, process.cwd())
-    const injectedContext = cmd ? '' : expandMentions(shownText, process.cwd())
+    const { text: shownText, attachments } = (cmd || wakeup) ? { text, attachments: [] } : processImagePrompt(text, process.cwd())
+    const injectedContext = (cmd || wakeup) ? '' : expandMentions(shownText, process.cwd())
     // Stamp every user turn with its submit time so the Rewind menu can pair it
     // with the file checkpoints captured during the turn.
     const meta: MessageMeta = {
@@ -293,9 +309,10 @@ export function useChat(initialConfig: AppConfig, initialMessages?: Message[], i
       ...(injectedContext ? { injectedContext } : {}),
       // A local slash command: tag it so it stays visible in the transcript but is
       // excluded from the model context and token accounting (see toApiMessages /
-      // contextTokens), like meta.folded. Otherwise the model would later try to
+      // contextTokens). Otherwise the model would later try to
       // interpret e.g. a prior "/config" turn as a real request.
       ...(cmd ? { command: text } : {}),
+      ...(wakeup ? { wakeup: true } : {}),
       ts: Date.now(),
     }
     const userMsg: Message = { id: nextId(), role: 'user', content: shownText, meta }
@@ -339,7 +356,7 @@ export function useChat(initialConfig: AppConfig, initialMessages?: Message[], i
     // then UserPromptSubmit on this prompt. A UserPromptSubmit hook may BLOCK the
     // prompt (show the reason, don't run the turn) or inject extra context.
     let hookContext = ''
-    if (hasHooks(process.cwd())) {
+    if (!wakeup && hasHooks(process.cwd())) {
       if (sessionHookCtxRef.current === undefined) {
         const ss = await runHooks('SessionStart', { source: 'startup' }, process.cwd())
         sessionHookCtxRef.current = ss.context || ''

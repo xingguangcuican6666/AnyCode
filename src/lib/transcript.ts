@@ -233,6 +233,15 @@ function emitMsg(m: Message, out: FlatLine[], contentW: number): void {
   // Per-turn completion footer ("✻ <word> for <elapsed> · done <clock>"): a faint
   // system line, rendered verbatim (no markdown) so the ✻ / · glyphs stay intact.
   if (m.meta?.turnDone) { m.content.split('\n').forEach((l) => push(`  ${l}`, 'system')); spacer(); return }
+  if (m.role === 'user' && m.meta?.wakeup) {
+    // An async-event wakeup turn (monitor/schedule output or a peer message). It is
+    // a role:'user' message so the model sees it, but it is NOT user input — render
+    // it as a dim event line (▸ …), never as a "> " prompt, so the user reads it as
+    // "the watcher / a peer said X", not "I typed X". No markdown (keep [brackets]).
+    m.content.split('\n').forEach((l, i) => push(i === 0 ? `  ${symbols.event} ${l}` : `    ${l}`, 'system'))
+    spacer()
+    return
+  }
   if (m.role === 'user') {
     m.content.split('\n').forEach((l, i) => push(i === 0 ? `${symbols.userPrompt} ${l}` : `  ${l}`, 'user'))
   } else if (m.role === 'system') {

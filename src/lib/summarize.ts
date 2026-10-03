@@ -37,6 +37,40 @@ function renderTranscript(messages: Message[], perMsg = 2000): string {
 }
 
 // Summarize the older slice via an independent model call. Resolves to the
+// System prompt for the one-line session TITLE used by /resume and the peer
+// mailbox. Deliberately much shorter and lighter than the compaction summary:
+// this is a label, not a memory aid.
+const TITLE_SYSTEM =
+  'You write the one-line title for a coding-assistant session, shown in a session picker and to peer sessions. ' +
+  'Read the transcript and answer with ONLY the title — a short phrase (ideally 4-10 words, under 60 characters) capturing what the USER is trying to accomplish. ' +
+  'Name the project/feature concretely (e.g. "Fix login redirect loop", "Add dark mode toggle"), never generic ("Coding session", "Chat"). ' +
+  'Never title the session after a slash command ("/resume", "/config"), a tool, or a system event — those are mechanics, not the task. ' +
+  'No preamble or quotes.'
+
+// Distill a session to a single title line via an independent model call.
+// Resolves to the title text, or null when the provider can't summarize or the
+// call fails (the caller then falls back to the first user message).
+export async function summarizeTitle(
+  messages: Message[],
+  config: AppConfig,
+  signal?: AbortSignal,
+): Promise<string | null> {
+  const provider = getProvider(config)
+  if (!provider.complete) return null
+  const prompt = 'Title this coding-assistant session:\n\n' + renderTranscript(messages, 800)
+  try {
+    const raw = await provider.complete([{ id: 'session-title', role: 'user', content: prompt }], {
+      model: config.model,
+      system: TITLE_SYSTEM,
+      signal,
+    })
+    const s = raw.trim().replace(/^["']|["']$/g, '')
+    return s || null
+  } catch {
+    return null
+  }
+}
+
 // summary text, or null when no summarizer is available or the call fails (the
 // caller then falls back to the offline heuristic).
 export async function summarizeConversation(

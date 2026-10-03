@@ -12,6 +12,7 @@ import path from 'node:path'
 import fs from 'node:fs'
 import { CONFIG_DIR, loadConfig } from '../config'
 import { getSetting } from './settings'
+import { summarizeTitle } from './summarize'
 import type { SessionSnapshot } from '../app'
 
 export const SESSIONS_DIR = path.join(CONFIG_DIR, 'sessions')
@@ -47,11 +48,20 @@ export function newSessionId(): string {
 const fileFor = (id: string): string => path.join(SESSIONS_DIR, `${id}.json`)
 
 // A short one-line title from the first real user message (commands/blank skipped).
+// Kept as the synchronous fallback when the model summarizer is unavailable.
 function deriveTitle(snap: SessionSnapshot): string {
-  const first = snap.messages.find((m) => m.role === 'user' && m.content.trim() && !m.content.startsWith('/'))
+  const first = titleSource(snap.messages).find((m) => m.role === 'user' && !m.content.startsWith('/'))
   const text = (first?.content ?? '').replace(/\s+/g, ' ').trim()
   if (!text) return '(empty session)'
   return text.length > 60 ? text.slice(0, 59) + '…' : text
+}
+
+// The messages a title may be derived from: slash-command turns (meta.command)
+// and async-event wakeup turns (meta.wakeup) are machine input, not user intent,
+// so neither the model summarizer nor the fallback should title a session after
+// a "/resume" or a monitor flush. Content-bearing messages only.
+function titleSource(messages: SessionSnapshot['messages']): SessionSnapshot['messages'] {
+  return messages.filter((m) => m.content !== '__banner__' && m.content.trim() && !m.meta?.command && !m.meta?.wakeup)
 }
 
 // Messages that actually carry content (skip the banner marker and blanks).
@@ -62,24 +72,68 @@ function realCount(snap: SessionSnapshot): number {
 // Write (or overwrite) a session under `id`. No-op for an empty transcript, so
 // quitting a just-opened session never litters the list. The API key is stripped
 // from the stored config, exactly like saveConfig.
+// The title is a model-written one-line summary of the conversation (falls back
+// to the first user message when the summarizer is unavailable, so saving never
+// blocks on the network). Called on every debounced autosave, so it must be
+// cheap: only re-summarize when the message count crosses a threshold.
 export function saveSession(id: string, snap: SessionSnapshot): void {
   try {
     if (realCount(snap) === 0) return
     fs.mkdirSync(SESSIONS_DIR, { recursive: true })
     const { apiKey: _omit, ...config } = snap.config
-    const rec: SavedSession = {
-      id,
-      savedAt: Date.now(),
-      cwd: process.cwd(),
-      title: deriveTitle(snap),
-      messageCount: realCount(snap),
-      snapshot: { ...snap, config: config as SessionSnapshot['config'] },
-    }
-    fs.writeFileSync(fileFor(id), JSON.stringify(rec))
-    prune()
+    void persistSession(id, snap, config as SessionSnapshot['config'])
   } catch {
     // best-effort; session persistence is non-critical
   }
+}
+
+// How often to re-summarize the title: only when the message count grows by at
+// least this many since the last model-written title (so a burst of streaming
+// autosaves doesn't fire an API call each time). The first title is written at
+// the very first save so the picker has a readable name immediately.
+const TITLE_REFRESH_EVERY = 10
+
+// Last message count we wrote a model title for, per session id, so successive
+// autosaves know whether to refresh. In-memory only; a fresh process just
+// re-titles on its first save.
+const lastTitleCount = new Map<string, number>()
+
+async function persistSession(id: string, snap: SessionSnapshot, config: SessionSnapshot['config']): Promise<void> {
+  const count = realCount(snap)
+  const prevCount = lastTitleCount.get(id) ?? 0
+  const shouldTitle = prevCount === 0 || count - prevCount >= TITLE_REFRESH_EVERY
+  let title = deriveTitle(snap)
+  if (shouldTitle) {
+    const summarized = await summarizeTitle(titleSource(snap.messages), config)
+    if (summarized) {
+      title = summarized.replace(/\s+/g, ' ').trim()
+      if (title.length > 80) title = title.slice(0, 79) + '…'
+      lastTitleCount.set(id, count)
+    } else {
+      // Summarizer unavailable/failed: remember the count anyway so we don't
+      // hammer the API on every autosave while it stays down.
+      lastTitleCount.set(id, count)
+    }
+  } else {
+    // Keep the previously-saved title for this refresh cycle: re-read it so a
+    // burst of autosaves doesn't clobber a good model title with the fallback.
+    const existing = readFile(id)
+    if (existing?.title) title = existing.title
+    // Repair titles written before commands were excluded from title
+    // derivation: a stored title beginning with "/" can only have come from a
+    // slash-command turn, so regenerate it now rather than leaving it forever.
+    if (title.startsWith('/')) title = deriveTitle(snap)
+  }
+  const rec: SavedSession = {
+    id,
+    savedAt: Date.now(),
+    cwd: process.cwd(),
+    title,
+    messageCount: count,
+    snapshot: { ...snap, config },
+  }
+  fs.writeFileSync(fileFor(id), JSON.stringify(rec))
+  prune()
 }
 
 // Read one raw session file, or null if missing/corrupt. Treats the file as

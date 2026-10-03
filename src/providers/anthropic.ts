@@ -643,9 +643,12 @@ async function* agent(messages: Message[], opts: StreamOpts, cfg: AnthropicOpts,
     // after the next tool call instead of waiting for the turn to end. Top level
     // only: a sub-agent's opts carries no takePending (see subOpts).
     const pending = !sub ? (opts.takePending?.() ?? []) : []
-    const content: ApiBlock[] = pending.length > 0
-      ? [...results, ...pending.map((text) => ({ type: 'text' as const, text }))]
-      : results
+    // Background async events (monitor/schedule output, peer messages) that fired
+    // while this turn was running: merge them the same way as interjections so the
+    // model reacts without waiting for full idle. Top level only.
+    const eventTexts = !sub ? (opts.takeEvents?.() ?? []) : []
+    const eventBlocks = eventTexts.map((text) => ({ type: 'text' as const, text }))
+    const content: ApiBlock[] = [...results, ...pending.map((text) => ({ type: 'text' as const, text })), ...eventBlocks]
     convo.push({ role: 'user', content })
   }
   yield { type: 'error', message: `stopped after ${MAX_STEPS} tool steps (safety cap)` }

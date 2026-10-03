@@ -360,6 +360,7 @@ export const messages = {
   'cmd.compactDesc': { zh: '总结较早的消息以释放上下文窗口', en: 'Summarize older messages to free up the context window' },
   'cmd.compactNothing': { zh: '暂无可压缩内容 —— 对话记录还很短。', en: 'Nothing to compact yet — the transcript is still short.' },
   'compact.collapsed': { zh: '上下文已压缩 · 折叠 {n} 条消息（点击展开摘要）', en: 'Context compacted · {n} messages folded (click to expand summary)' },
+  'compact.done': { zh: '⎗ 已压缩上下文 —— 折叠了 {n} 条较早消息，摘要已生成。', en: '⎗ Context compacted — folded {n} older message(s), summary generated.' },
   'cmd.autocompactDesc': { zh: '设置自动压缩触发窗口 —— /autocompact（打开选择器）、/autocompact auto|off|<tokens>', en: 'Set the auto-compact trigger window — /autocompact (picker), /autocompact auto|off|<tokens>' },
   'cmd.autocompactSet': { zh: '自动压缩窗口已设为 {value}。', en: 'Auto-compact window set to {value}.' },
   'cmd.autocompactOff': { zh: '自动压缩已关闭 —— 上下文填满也不会自动压缩（仍可手动 /compact）。', en: 'Auto-compact turned off — the context will not compact on its own (you can still run /compact).' },
@@ -594,6 +595,15 @@ export const messages = {
   'monitor.ended': { zh: '[监视 {id} 已结束] {note}', en: '[monitor {id} ended] {note}' },
   'schedule.wakeup': { zh: '▸ 定时任务「{label}」触发 —— 等待空闲时唤醒。', en: '▸ Schedule “{label}” fired — will wake up idle.' },
   'schedule.line': { zh: '[定时 {id}] {line}', en: '[scheduled {id}] {line}' },
+  // Async-event WAKEUP turns (idle driver): the dim progress ping printed while a
+  // turn is still streaming (output is buffered, delivered once the turn ends), and
+  // the headers of the coalesced wakeup turn that actually wakes an idle session.
+  'wake.progress': { zh: '▸ {source} 有 {n} 行新输出，空闲后送达。', en: '▸ {source}: {n} new line(s), delivered when idle.' },
+  'wake.monitor': { zh: '监视器「{description}」输出：', en: 'Monitor “{description}” output:' },
+  'wake.schedule': { zh: '定时任务「{label}」触发：', en: 'Schedule “{label}” fired:' },
+  'wake.message': { zh: '来自会话「{from}」（{id}）的消息：', en: 'Message from session “{from}” ({id}):' },
+  'wake.peerIdle': { zh: '你订阅的会话「{from}」（{id}）已完成一轮并空闲。', en: 'Subscribed session “{from}” ({id}) finished a turn and is idle.' },
+  'wake.monitorEnded': { zh: '监视器「{description}」已结束，最后输出：', en: 'Monitor “{description}” ended; final output:' },
   // PermissionDialog (permissionMode / autoModeInPlan)
   'perm.title': { zh: '允许运行此工具？', en: 'Allow this tool to run?' },
   'perm.optOnce': { zh: '允许一次', en: 'Allow once' },

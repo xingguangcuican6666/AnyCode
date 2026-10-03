@@ -207,10 +207,26 @@ export function App({ config, initial, onClear, onSnapshot, onResume, onFork, re
   const judgingRef = useRef(false)
   // Lines the user submitted while a response was streaming; flushed when idle.
   const [queued, setQueued] = useState<string[]>([])
-  // Buffered scheduled-job payloads / monitor output accumulated while streaming,
-  // flushed as `role: 'tool'` results at idle (see the sink wiring below).
-  const schedulePendingRef = useRef<Map<string, string[]>>(new Map())
-  const monitorPendingRef = useRef<Map<string, string[]>>(new Map())
+  // Buffered async events, delivered Claude-Code-style: ONE event = one wakeup turn,
+  // drained FIFO by the idle driver (not merged across the whole idle gap). An
+  // "event" is a monitor burst (already coalesced to ~250ms by lib/monitor, like
+  // Claude Code's 200ms line-batching), a scheduled-job fire, a cross-session peer
+  // message, or a peer's idle notice. Same-source bursts that pile up during a busy
+  // turn coalesce into their queued entry (so a chatty monitor is one turn, not ten),
+  // but distinct sources stay distinct turns so the model reacts to each. Each is
+  // submitted as role:'user' + meta.wakeup → reaches the API framed as a background
+  // event (wire.ts), renders as a dim ▸ line (transcript.ts), never as user input.
+  const pendingRef = useRef<Array<
+    | { kind: 'monitor'; id: string; description: string; lines: string[]; done: boolean }
+    | { kind: 'schedule'; id: string; label: string; lines: string[] }
+    | { kind: 'message'; from: string; sid: string; text: string }
+    | { kind: 'peerIdle'; from: string; sid: string }
+  >>([])
+  // Bumped whenever a new async event is buffered, so the idle driver re-runs and
+  // delivers it even when it arrived while the session was already idle (a ref
+  // mutation alone wouldn't re-render / re-fire the effect).
+  const [wakeTick, setWakeTick] = useState(0)
+  const bumpWake = (): void => setWakeTick((n) => n + 1)
   const exitTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   // Timestamp of the last idle Esc, so a second Esc within 500ms opens Rewind.
   const lastEscRef = useRef(0)
@@ -345,7 +361,9 @@ export function App({ config, initial, onClear, onSnapshot, onResume, onFork, re
     setCompacting({ pct: 1 })
     try {
       const summary = (await summarizeConversation(plan.older, chatRef.current.config)) ?? heuristicSummary(plan.older)
-      return chatRef.current.foldContext(summary, plan.older.length)
+      const n = chatRef.current.foldContext(summary, plan.older.length)
+      if (n > 0) chatRef.current.print(t('compact.done', { n }), 'system')
+      return n
     } finally {
       compactingRef.current = false
       setCompacting(null)
@@ -578,6 +596,18 @@ export function App({ config, initial, onClear, onSnapshot, onResume, onFork, re
   // Ids already surfaced, so a message arriving over BOTH the socket (real-time)
   // and the file mailbox (durable fallback) — they share one id — surfaces once.
   const seenMail = useRef<Set<string>>(new Set())
+  // Route an inbound peer message to the right surface for the current mode. In
+  // 'deliver' mode it is queued as an async event (the idle driver wakes the model
+  // with it so the session can actually RESPOND to a peer); in 'notify' mode it is
+  // just a dim notice and never wakes. Deduped across the socket + file-mailbox
+  // twins by their shared id.
+  const deliverPeerMessage = (from: string, fromId: string, id: string, text: string, ts: number, mode: string): void => {
+    if (seenMail.current.has(id)) return
+    seenMail.current.add(id)
+    mailCursor.current = Math.max(mailCursor.current, ts)
+    if (mode === 'deliver') { pendingRef.current.push({ kind: 'message', from, sid: fromId, text }); bumpWake() }
+    else chatRef.current.print(translate(lang, 'mail.notice', { from, text }), 'system')
+  }
   useEffect(() => {
     if (!sessionId) return
     if (mailCursor.current === 0) mailCursor.current = Date.now()
@@ -594,16 +624,8 @@ export function App({ config, initial, onClear, onSnapshot, onResume, onFork, re
       setSelfTitle(tt)
       const now = Date.now()
       announce(now)
-      // Don't splice a delivered turn into a streaming reply — wait until idle.
-      if (chatRef.current.streaming) return
-      for (const m of pollMail(mailCursor.current, now)) {
-        mailCursor.current = Math.max(mailCursor.current, m.ts)
-        if (seenMail.current.has(m.id)) continue
-        seenMail.current.add(m.id)
-        const from = m.fromTitle || m.from
-        if (mode === 'deliver') chatRef.current.print(translate(lang, 'mail.delivered', { from, text: m.text }), 'user')
-        else chatRef.current.print(translate(lang, 'mail.notice', { from, text: m.text }), 'system')
-      }
+      for (const m of pollMail(mailCursor.current, now))
+        deliverPeerMessage(m.fromTitle || m.from, m.from, m.id, m.text, m.ts, mode)
     }
     tick()
     const iv = setInterval(tick, 5000)
@@ -614,26 +636,32 @@ export function App({ config, initial, onClear, onSnapshot, onResume, onFork, re
   // mailbox above with instant delivery + idle-subscription notices. Started while
   // visible (mode !== 'off'), torn down on unmount or when the mode flips to 'off'.
   // Messages arriving here AND via the file poll share an id → surfaced once
-  // (seenMail). While streaming we defer to the idle-time file poll (the durable
-  // mail twin still lands), so nothing splices into a running reply.
+  // (seenMail). Delivery is buffered (deliverPeerMessage), never spliced into a
+  // running reply — the idle driver flushes it as one wakeup turn once idle.
   useEffect(() => {
     if (!sessionId || otherSessions === 'off') return
     const onFrame = (f: SockFrame): void => {
       const mode = String(getSetting(chatRef.current.config.settings, 'otherSessionMessages') || 'notify')
       if (mode === 'off') return
       const from = f.fromTitle || f.from
-      if (f.kind === 'idle') { chatRef.current.print(translate(lang, 'mail.peerIdle', { from }), 'system'); return }
+      if (f.kind === 'idle') {
+        // A peer we subscribed to finished a turn. In 'deliver' mode wake us so we
+        // can react to its completion (the point of subscribing); else dim notice.
+        // Dedupe repeated idle pings from the same peer still waiting in the queue.
+        if (mode === 'deliver') {
+          if (!pendingRef.current.some((e) => e.kind === 'peerIdle' && e.sid === f.from)) {
+            pendingRef.current.push({ kind: 'peerIdle', from, sid: f.from }); bumpWake()
+          }
+        } else chatRef.current.print(translate(lang, 'mail.peerIdle', { from }), 'system')
+        return
+      }
       if (f.kind === 'sub') { chatRef.current.print(translate(lang, 'mail.peerSubbed', { from }), 'system'); return }
       if (f.kind !== 'msg' || !f.text) return
-      if (chatRef.current.streaming) return // defer to the idle-time file poll
-      if (seenMail.current.has(f.id)) return
-      seenMail.current.add(f.id)
-      mailCursor.current = Math.max(mailCursor.current, f.ts)
-      if (mode === 'deliver') chatRef.current.print(translate(lang, 'mail.delivered', { from, text: f.text }), 'user')
-      else chatRef.current.print(translate(lang, 'mail.notice', { from, text: f.text }), 'system')
+      deliverPeerMessage(from, f.from, f.id, f.text, f.ts, mode)
     }
     const stop = startHub(sessionId, t('mail.untitled'), onFrame)
     return stop
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId, lang, otherSessions])
 
   // Startup integration notices for `autoConnectIde` / `chromeEnabled`. One-shot
@@ -925,31 +953,15 @@ export function App({ config, initial, onClear, onSnapshot, onResume, onFork, re
   // (the `localNotifications` setting). We fire on the streaming true→false edge
   // and only when focus reporting says the user has switched away, so an active
   // watcher isn't pinged. Best-effort escapes (see lib/notify); no-op off-TTY.
-  // Also flushes any monitor/schedule output buffered while the turn streamed:
-  // the SAME streaming→idle edge is the safe moment to print those buffered
-  // `role: 'tool'` results + wakeup line (the sink itself buffers rather than
-  // enqueue, so nothing splices into a running reply). Firing here (rather than
-  // in the sink, which only knows its own event) also coalesces all of them into
-  // one idle flush.
+  // We also notify any peer session subscribed to us that we just went idle; the
+  // actual flush of buffered monitor/schedule/peer events is left to the idle
+  // driver (it submits them as ONE wakeup turn — see below), since the sinks
+  // already bumpWake() and the streaming→idle edge re-runs that driver.
   useEffect(() => {
     if (streaming) { wasStreamingRef.current = true; return }
     const wasStreaming = wasStreamingRef.current
     wasStreamingRef.current = false
     if (wasStreaming) {
-      // Buffered monitor/schedule output (sink ran while streaming): flush as
-      // `role: 'tool'` results now that the turn is idle, then wake the driver.
-      for (const [id, buf] of schedulePendingRef.current) {
-        if (buf.length === 0) continue
-        schedulePendingRef.current.delete(id)
-        chatRef.current.print(`[scheduled wakeup ${id}]`, 'tool', { scheduledId: id })
-        for (const line of buf) if (line.trim()) chatRef.current.print(t('schedule.line', { id, line }), 'tool')
-      }
-      for (const [id, buf] of monitorPendingRef.current) {
-        if (buf.length === 0) continue
-        monitorPendingRef.current.delete(id)
-        chatRef.current.print(`[monitor wakeup ${id}]`, 'tool', { monitorId: id })
-        for (const line of buf) if (line.trim()) chatRef.current.print(t('monitor.line', { id, line }), 'tool')
-      }
       // Tell any session subscribed to us (via the socket hub) that we just went
       // idle — the inter-session equivalent of "finished a turn".
       notifyIdle(Date.now())
@@ -1237,6 +1249,18 @@ export function App({ config, initial, onClear, onSnapshot, onResume, onFork, re
       // repeat), so returning from the view never doubles as interrupting.
       if (Date.now() - wfClosedAtRef.current < 250) return
       chat.interrupt()
+      // Esc during streaming with queued interjections: flush them immediately so
+      // they become the next turn (Claude Code behavior — Esc + typed text means
+      // "say this next", not "cancel and forget").
+      const pending = queuedRef.current.filter((s) => !isCommand(s.trim()))
+      if (pending.length > 0) {
+        setQueued((q) => {
+          const rest = [...q]
+          for (const p of pending) { const i = rest.indexOf(p); if (i >= 0) rest.splice(i, 1) }
+          return rest
+        })
+        void chatRef.current.submit(pending.join('\n'), makeActions(), { wakeup: false })
+      }
       return
     }
     // Idle with background sub-agents still running: esc cancels them (interrupt
@@ -1325,6 +1349,24 @@ export function App({ config, initial, onClear, onSnapshot, onResume, onFork, re
       })
       return drained
     },
+    // Mid-turn async-event drain (see StreamOpts.takeEvents): after a tool batch,
+    // hand the provider any buffered monitor/schedule output, peer messages/idle
+    // notices that fired during this turn so they can be merged into the next
+    // model request, Claude-Code-style — without waiting for full idle. Drains
+    // everything pending, so the model gets the full picture of what happened.
+    takeEvents: (): string[] => {
+      const events = pendingRef.current.map((e) => {
+        if (e.kind === 'monitor') {
+          const head = e.done ? t('wake.monitorEnded', { description: e.description }) : t('wake.monitor', { description: e.description })
+          return e.lines.length ? `${head}\n${e.lines.join('\n')}` : head
+        }
+        if (e.kind === 'schedule') return `${t('wake.schedule', { label: e.label })}\n${e.lines.join('\n')}`
+        if (e.kind === 'peerIdle') return t('wake.peerIdle', { from: e.from, id: e.sid })
+        return `${t('wake.message', { from: e.from, id: e.sid })}\n${e.text}`
+      })
+      if (events.length > 0) pendingRef.current = []
+      return events
+    },
     compact: () => doCompact(true),
     openPanel: (tab) => setPanel(tab),
     openLogin: () => setLoginOpen(true),
@@ -1388,12 +1430,32 @@ export function App({ config, initial, onClear, onSnapshot, onResume, onFork, re
     else void chatRef.current.submit(v, makeActions())
   }
 
+  // Pop the OLDEST buffered async event and format it as one wakeup payload, or
+  // null when the queue is empty. One event per call → one wakeup turn (the idle
+  // driver re-fires to drain the next), so the model reacts to each monitor burst /
+  // peer message individually, Claude-Code-style, instead of one giant merged turn.
+  // Submitted via submit(..., { wakeup: true }): reaches the API framed as a
+  // background event (wire.ts) and renders dim (▸, transcript.ts), never a user turn.
+  const nextWakeup = (): string | null => {
+    const e = pendingRef.current.shift()
+    if (!e) return null
+    if (e.kind === 'monitor') {
+      const head = e.done ? t('wake.monitorEnded', { description: e.description }) : t('wake.monitor', { description: e.description })
+      return e.lines.length ? `${head}\n${e.lines.join('\n')}` : head
+    }
+    if (e.kind === 'schedule') return `${t('wake.schedule', { label: e.label })}\n${e.lines.join('\n')}`
+    if (e.kind === 'peerIdle') return t('wake.peerIdle', { from: e.from, id: e.sid })
+    return `${t('wake.message', { from: e.from, id: e.sid })}\n${e.text}`
+  }
+
   // Idle driver: whenever nothing is streaming, pick the SINGLE next action, in
-  // priority order, so type-ahead / goal / loop never race to start a turn:
+  // priority order, so type-ahead / events / goal / loop never race to start a turn:
   //   1. flush the user's type-ahead queue,
-  //   2. drive the active goal (stop if the model signalled completion, else
+  //   2. deliver the oldest buffered async event (monitor/schedule output, peer
+  //      message) as its own wakeup turn — one event per turn, Claude-Code-style,
+  //   3. drive the active goal (stop if the model signalled completion, else
   //      keep working — the first turn fires immediately, later ones after a gap),
-  //   3. tick the recurring/self-paced loop.
+  //   4. tick the recurring/self-paced loop.
   // The cleanup clears any pending timer, so exactly one run is ever queued.
   useEffect(() => {
     if (streaming) return
@@ -1402,6 +1464,16 @@ export function App({ config, initial, onClear, onSnapshot, onResume, onFork, re
       const [next, ...rest] = queued
       setQueued(rest)
       void chatRef.current.submit(next, makeActions())
+      return
+    }
+
+    // Buffered async events (monitor/schedule output, peer messages/idle notices):
+    // deliver the OLDEST as its own wakeup turn so the model reacts to each one, then
+    // return — the next idle cycle drains the following event. Takes priority over
+    // goal/loop work so a peer gets a timely reply and monitor output is acted on.
+    const wake = nextWakeup()
+    if (wake) {
+      void chatRef.current.submit(wake, makeActions(), { wakeup: true })
       return
     }
 
@@ -1466,61 +1538,39 @@ export function App({ config, initial, onClear, onSnapshot, onResume, onFork, re
       return () => clearTimeout(t)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [streaming, queued, goal, loop])
+  }, [streaming, queued, goal, loop, wakeTick])
 
-  // Wire the agent-facing timers (lib/scheduler, lib/monitor) to the transcript
-  // and the idle driver. A scheduled job or a monitored command no longer lands in
-  // the type-ahead queue as fake user input; instead it prints a `role: 'system'`
-  // notice while streaming, and at idle prints the buffered output as `role: 'tool'`
-  // results (tagged with the job/monitor id) followed by a wakeup line the idle
-  // driver picks up as a fresh turn — so the model is woken with the content as a
-  // tool result, never as if the user had typed it. Registered once on mount; the
-  // singletons outlive an App remount, so we just re-attach the sink and leave any
-  // in-flight jobs/monitors running.
+  // Wire the agent-facing timers (lib/scheduler, lib/monitor) to the pending-event
+  // queue + idle driver. A scheduled job or a monitored command no longer lands in
+  // the type-ahead queue as fake user input, and no longer tries to splice a
+  // `role:'tool'` row into a running reply. Instead every sink fire ENQUEUES an event
+  // (coalescing into the same-source entry already waiting, so a burst that lands
+  // during a busy turn stays one event) and bumpWake()s; the idle driver delivers
+  // each as its own wakeup turn, Claude-Code-style. While a turn is streaming we also
+  // print a dim progress ping (never per line — lib/monitor already batches bursts
+  // within 250ms) so the user sees output accruing without a turn firing mid-stream.
+  // Registered once on mount; the singletons outlive an App remount, so we re-attach.
   useEffect(() => {
     setScheduleSink((payload, meta) => {
       const tag = meta.kind === 'interval' ? `${meta.label} · fire ${meta.fires}` : meta.label
-      const lines = payload.split('\n')
-      if (chatRef.current.status === 'streaming') {
-        // Streaming: surface as a notice + per-line dim lines, never a queued user turn.
-        chatRef.current.print(t('schedule.wakeup', { label: tag }), 'system')
-        for (const line of lines) if (line.trim()) chatRef.current.print(t('schedule.line', { id: meta.jobId, line }), 'system')
-        const cur = schedulePendingRef.current.get(meta.jobId) ?? []
-        cur.push(...lines)
-        schedulePendingRef.current.set(meta.jobId, cur)
-        return
-      }
-      // Idle: flush as a tool result so the model sees the wakeup content, then wake.
-      const cur = schedulePendingRef.current.get(meta.jobId) ?? []
-      schedulePendingRef.current.delete(meta.jobId)
-      cur.push(...lines)
-      if (cur.length === 0) return
-      chatRef.current.print(`[scheduled: ${tag}]`, 'tool', { scheduledId: meta.jobId })
-      for (const line of cur) if (line.trim()) chatRef.current.print(t('schedule.line', { id: meta.jobId, line }), 'tool')
-      chatRef.current.print(t('schedule.wakeup', { label: tag }), 'system')
+      const lines = payload.split('\n').filter((l) => l.trim())
+      const cur = pendingRef.current.find((e) => e.kind === 'schedule' && e.id === meta.jobId) as
+        | { kind: 'schedule'; id: string; label: string; lines: string[] } | undefined
+      if (cur) { cur.label = tag; cur.lines.push(...lines) }
+      else pendingRef.current.push({ kind: 'schedule', id: meta.jobId, label: tag, lines })
+      if (chatRef.current.status === 'streaming')
+        chatRef.current.print(t('wake.progress', { source: tag, n: lines.length }), 'system')
+      bumpWake()
     })
     setMonitorSink((lines, meta) => {
-      const head = `[monitor · ${meta.description}${meta.done ? ' · ended' : ''}]`
-      if (chatRef.current.status === 'streaming') {
-        // Streaming: surface as a notice + per-line dim lines, never a queued user turn.
-        chatRef.current.print(t('monitor.wakeup', { description: meta.description }), 'system')
-        for (const line of lines) if (line.trim()) chatRef.current.print(t('monitor.line', { id: meta.id, line }), 'system')
-        if (meta.done) chatRef.current.print(t('monitor.ended', { id: meta.id, note: meta.description }), 'system')
-        const cur = monitorPendingRef.current.get(meta.id) ?? []
-        cur.push(...lines)
-        if (meta.done) cur.push(`[monitor ended: ${meta.description}]`)
-        monitorPendingRef.current.set(meta.id, cur)
-        return
-      }
-      // Idle: flush as a tool result so the model sees the monitor output, then wake.
-      const cur = monitorPendingRef.current.get(meta.id) ?? []
-      monitorPendingRef.current.delete(meta.id)
-      cur.push(...lines)
-      if (meta.done) cur.push(`[monitor ended: ${meta.description}]`)
-      if (cur.length === 0) return
-      chatRef.current.print(head, 'tool', { monitorId: meta.id, monitorDone: meta.done })
-      for (const line of cur) if (line.trim()) chatRef.current.print(t('monitor.line', { id: meta.id, line }), 'tool')
-      chatRef.current.print(t('monitor.wakeup', { description: meta.description }), 'system')
+      const kept = lines.filter((l) => l.trim())
+      const cur = pendingRef.current.find((e) => e.kind === 'monitor' && e.id === meta.id) as
+        | { kind: 'monitor'; id: string; description: string; lines: string[]; done: boolean } | undefined
+      if (cur) { cur.description = meta.description; cur.lines.push(...kept); if (meta.done) cur.done = true }
+      else pendingRef.current.push({ kind: 'monitor', id: meta.id, description: meta.description, lines: kept, done: !!meta.done })
+      if (chatRef.current.status === 'streaming' && (kept.length > 0 || meta.done))
+        chatRef.current.print(t('wake.progress', { source: meta.description, n: kept.length }), 'system')
+      bumpWake()
     })
     return () => { setScheduleSink(null); setMonitorSink(null) }
   }, [])

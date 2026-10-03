@@ -233,6 +233,9 @@ export const symbols = {
   bullet: '•',
   arrowUp: '↑',
   arrowDown: '↓',
+  // Fronts an async-event wakeup line (monitor/schedule output, peer message) so it
+  // reads as an event the session reacted to, not as something the user typed.
+  event: '▸',
 } as const
 
 export type ColorName = keyof ThemeColors

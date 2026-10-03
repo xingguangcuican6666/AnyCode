@@ -89,6 +89,13 @@ export interface MessageMeta {
   // Identifies a `schedule` tool result (the job's id) so the transcript can track
   // which scheduled job produced the wakeup. UI-only; filtered from the API by role.
   scheduledId?: string
+  // An ASYNC-EVENT wakeup turn (monitor/scheduler output, or a cross-session peer
+  // message) injected by the idle driver. It is a role:'user' message so it REACHES
+  // the model (role:'tool' is filtered by toApiMessages), but it is NOT user input:
+  // toApiMessages wraps it in a system-event frame and the transcript renders it as a
+  // dim event line (▸ …), never as a "> " prompt. This is what actually wakes an idle
+  // session to react — displaying alone never did (see app.tsx idle driver).
+  wakeup?: boolean
 }
 
 export interface Message {
@@ -139,6 +146,13 @@ export interface StreamOpts {
   // top-level agent gets this (sub-agents never drain interjections). See app.tsx's
   // `queued` state and useChat's opts wiring.
   takePending?: () => string[]
+  // Mid-turn event drain: called by the top-level agent loop right after a tool
+  // batch, it returns any buffered async events (monitor/schedule output, peer
+  // messages/idle notices) that fired WHILE this turn was streaming so they can
+  // be merged into the very next model request, Claude-Code-style. Each event is
+  // already a self-contained framed string; returning non-empty makes the model
+  // react without waiting for full idle. Only the top-level agent gets this.
+  takeEvents?: () => string[]
   // When false (the `dynamicWorkflows` setting turned off), the `workflow` tool is
   // withheld from the top-level agent so it can still run one-off `task` sub-agents
   // but not orchestrate multi-step workflows. Absent/true = workflows allowed.
